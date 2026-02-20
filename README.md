@@ -175,3 +175,4 @@ MIT License. See [LICENSE](LICENSE).
 - The INAV development team and community
 - QuadMeUp (Paweł Spychalski) for filter and RPM analysis research
 - The INAV Fixed Wing Group for modes documentation
+- UAV Tech for the spark that gave me the idea to create this
