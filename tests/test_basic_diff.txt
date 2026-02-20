@@ -1,0 +1,59 @@
+# INAV/IFLIGHT_BLITZ_F722 9.0.1 Feb  1 2025 / 12:00:00 (abcdef12)
+# GCC-13.2.1 20231009
+
+batch start
+defaults noreboot
+
+feature GPS
+feature PWM_OUTPUT_ENABLE
+
+serial 0 64 115200 57600 0 115200
+serial 2 2 115200 57600 0 115200
+
+aux 0 0 0 1700 2100
+aux 1 11 1 1700 2100
+
+set gyro_main_lpf_hz = 65
+set gyro_dyn_lpf_min_hz = 50
+set dynamic_gyro_notch_min_hz = 50
+set motor_pwm_protocol = DSHOT300
+set failsafe_procedure = RTH
+set acc_hardware = ICM42605
+set mag_hardware = QMC5883
+set baro_hardware = SPL06
+set gps_ublox_use_galileo = ON
+set blackbox_rate_denom = 2
+set name = TEST_QUAD
+
+control_profile 1
+
+set mc_p_pitch = 28
+set mc_i_pitch = 65
+set mc_d_pitch = 18
+set mc_p_roll = 25
+set mc_i_roll = 60
+set mc_d_roll = 16
+set mc_p_yaw = 30
+set mc_i_yaw = 70
+set d_boost_min = 1.000
+set d_boost_max = 1.000
+set antigravity_gain = 2.000
+
+mixer_profile 1
+
+set platform_type = MULTIROTOR
+
+mmix 0 1.000  -1.000  1.000 -1.000
+mmix 1 1.000  -1.000 -1.000  1.000
+mmix 2 1.000   1.000  1.000  1.000
+mmix 3 1.000   1.000 -1.000 -1.000
+
+battery_profile 1
+
+set battery_capacity = 5000
+
+control_profile 1
+mixer_profile 1
+battery_profile 1
+
+save

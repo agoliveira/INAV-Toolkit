@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+
+# Analysis outputs
+*.html
+*.json
+!package.json
+
+# Blackbox logs (large binary files)
+*.bbl
+*.bfl
+*.bbl.gz
+
+# INAV config exports (may contain personal data)
+# *.txt  — not excluded since test diffs are .txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

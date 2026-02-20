@@ -1,0 +1,76 @@
+# INAV/MATEK_F405_WING 9.0.1 Feb  1 2025 / 12:00:00 (abcdef12)
+# GIT #abcdef12
+
+# name: VTOL Tricopter Test
+
+# resources
+resource MOTOR 1 PA0
+resource MOTOR 2 PA1
+resource MOTOR 3 PA2
+resource SERVO 1 PB0
+resource SERVO 2 PB1
+resource SERVO 3 PB4
+resource SERVO 4 PB5
+
+# features
+feature GPS
+
+# serial
+serial 0 64 115200 57600 0 115200
+serial 2 2 115200 57600 0 115200
+
+# aux - MIXER PROFILE 2 on channel 4 high, MIXER TRANSITION on channel 4 mid
+aux 0 62 4 1700 2100
+aux 1 63 4 1300 1700
+aux 2 0 1 1700 2100
+
+set mag_hardware = QMC5883
+set name = VTOL_TRI
+
+# master settings
+set gyro_main_lpf_hz = 90
+
+# mixer_profile 1 = Tricopter (hover)
+mixer_profile 1
+
+set platform_type = TRICOPTER
+set mixer_automated_switch = ON
+set mixer_switch_trans_timer = 30
+
+mmix 0 1.000 0.000 1.000 0.000
+mmix 1 1.000 -0.866 -0.500 0.000
+mmix 2 1.000 0.866 -0.500 0.000
+
+# servo 3 = left tilt, servo 4 = right tilt
+# Yaw via tilt servos
+smix 0 3 2 100 0 -1
+smix 1 4 2 -100 0 -1
+# Tilt during transition (source 38)
+smix 2 3 38 45 150 -1
+smix 3 4 38 45 150 -1
+
+# mixer_profile 2 = Airplane (forward flight)
+mixer_profile 2
+
+set platform_type = AIRPLANE
+
+mmix 0 1.000 0.000 0.000 0.500
+mmix 1 -1.000 0.000 0.000 0.000
+mmix 2 1.000 0.000 0.000 -0.500
+
+# Ailerons and elevator
+smix 0 1 0 100 0 0
+smix 1 2 0 -100 0 0
+smix 2 1 1 50 0 0
+smix 3 2 1 50 0 0
+
+# control profiles
+control_profile 1
+
+set mc_p_pitch = 28
+set mc_i_pitch = 65
+set mc_d_pitch = 18
+
+battery_profile 1
+
+set battery_capacity = 4000
