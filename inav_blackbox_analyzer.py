@@ -1546,6 +1546,130 @@ def measure_tracking_delay_xcorr(sp, gy, sr, max_delay_ms=200):
     return float(np.median(delays))
 
 
+def detect_hover_oscillation(data, sr):
+    """Detect oscillation during hover (no/minimal stick input).
+
+    Finds segments where setpoint is near zero, then measures gyro
+    oscillation amplitude and dominant frequency. This catches the most
+    dangerous tuning problem: a quad that can't hold still.
+
+    Returns list of per-axis dicts:
+        axis, gyro_rms, gyro_p2p, dominant_freq_hz, severity, cause, hover_seconds
+    Or empty list if no hover segments found.
+    """
+    results = []
+    min_hover_samples = int(sr * 0.5)  # At least 0.5s of hover
+
+    for axis_idx, axis in enumerate(AXIS_NAMES):
+        sp_key = f"setpoint_{axis.lower()}"
+        gy_key = f"gyro_{axis.lower()}"
+        if sp_key not in data or gy_key not in data:
+            continue
+
+        sp = data[sp_key].copy()
+        gy = data[gy_key].copy()
+        mask = ~(np.isnan(sp) | np.isnan(gy))
+        sp, gy = sp[mask], gy[mask]
+        if len(sp) < min_hover_samples:
+            continue
+
+        # Find hover segments: setpoint near zero (stick centered)
+        # Use a threshold relative to the setpoint range
+        sp_range = np.percentile(np.abs(sp), 99) if len(sp) > 0 else 1
+        hover_threshold = max(5.0, sp_range * 0.05)  # 5 deg/s minimum or 5% of range
+        is_hover = np.abs(sp) < hover_threshold
+
+        # Find contiguous hover segments of at least min_hover_samples
+        hover_segments = []
+        in_hover = False
+        seg_start = 0
+        for i in range(len(is_hover)):
+            if is_hover[i] and not in_hover:
+                seg_start = i
+                in_hover = True
+            elif not is_hover[i] and in_hover:
+                if i - seg_start >= min_hover_samples:
+                    hover_segments.append((seg_start, i))
+                in_hover = False
+        if in_hover and len(is_hover) - seg_start >= min_hover_samples:
+            hover_segments.append((seg_start, len(is_hover)))
+
+        if not hover_segments:
+            continue
+
+        # Concatenate all hover gyro data
+        hover_gyro = np.concatenate([gy[s:e] for s, e in hover_segments])
+        total_hover_seconds = len(hover_gyro) / sr
+
+        if len(hover_gyro) < min_hover_samples:
+            continue
+
+        # Remove DC offset (mean) — we care about oscillation, not steady drift
+        hover_gyro = hover_gyro - np.mean(hover_gyro)
+
+        # Amplitude metrics
+        gyro_rms = float(np.sqrt(np.mean(hover_gyro ** 2)))
+        gyro_p2p = float(np.max(hover_gyro) - np.min(hover_gyro))
+
+        # Dominant frequency via FFT
+        dominant_freq = None
+        if len(hover_gyro) >= int(sr * 0.25):  # Need at least 0.25s for FFT
+            freqs = rfftfreq(len(hover_gyro), 1.0 / sr)
+            spectrum = np.abs(rfft(hover_gyro))
+            # Only look at 1-100 Hz (ignore DC and above Nyquist/2)
+            freq_mask = (freqs >= 1) & (freqs <= 100)
+            if np.any(freq_mask):
+                masked_spectrum = spectrum[freq_mask]
+                masked_freqs = freqs[freq_mask]
+                peak_idx = np.argmax(masked_spectrum)
+                dominant_freq = float(masked_freqs[peak_idx])
+                peak_power = masked_spectrum[peak_idx]
+                mean_power = np.mean(masked_spectrum)
+                # Only report if peak is significantly above noise floor
+                if peak_power < mean_power * 3:
+                    dominant_freq = None  # No clear dominant frequency
+
+        # Classify severity
+        # For a well-tuned hover: gyro_rms < 2, p2p < 10
+        # Mild wobble: rms 2-8, p2p 10-30
+        # Serious oscillation: rms 8-20, p2p 30-80
+        # Dangerous: rms > 20, p2p > 80
+        if gyro_rms < 2:
+            severity = "none"
+        elif gyro_rms < 5:
+            severity = "mild"
+        elif gyro_rms < 15:
+            severity = "moderate"
+        else:
+            severity = "severe"
+
+        # Classify cause from dominant frequency
+        cause = None
+        if severity != "none" and dominant_freq is not None:
+            if dominant_freq < 10:
+                cause = "P_too_high"        # Low-freq: P-term overshoot
+            elif dominant_freq < 25:
+                cause = "PD_interaction"     # Mid-freq: P/D fighting
+            elif dominant_freq < 50:
+                cause = "D_noise"            # D-term amplifying noise
+            else:
+                cause = "filter_gap"         # High-freq noise leaking through
+        elif severity != "none":
+            cause = "unknown"
+
+        results.append({
+            "axis": axis,
+            "gyro_rms": gyro_rms,
+            "gyro_p2p": gyro_p2p,
+            "dominant_freq_hz": dominant_freq,
+            "severity": severity,
+            "cause": cause,
+            "hover_seconds": total_hover_seconds,
+        })
+
+    return results
+
+
 def analyze_pid_response(data, axis_idx, sr):
     axis = AXIS_NAMES[axis_idx]
     sp_key, gyro_key = f"setpoint_{axis.lower()}", f"gyro_{axis.lower()}"
@@ -1802,7 +1926,7 @@ def compute_recommended_pid(pid_result, current_p, current_i, current_d, profile
 
 def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_results,
                           config, data, profile=None, phase_lag=None, motor_response=None,
-                          rpm_range=None, prop_harmonics=None):
+                          rpm_range=None, prop_harmonics=None, hover_osc=None):
     actions = []
     if profile is None:
         profile = get_frame_profile(5)
@@ -1814,6 +1938,108 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
     bad_dl = profile["bad_delay_ms"]
     ok_noise = profile["ok_noise_db"]
     bad_noise = profile["bad_noise_db"]
+
+    # ── Hover oscillation (highest priority — can't tune if quad won't hold still) ──
+    if hover_osc:
+        for osc in hover_osc:
+            if osc["severity"] == "none":
+                continue
+            axis = osc["axis"]
+            axis_l = axis.lower()
+            rms = osc["gyro_rms"]
+            p2p = osc["gyro_p2p"]
+            freq = osc["dominant_freq_hz"]
+            cause = osc["cause"]
+            sev = osc["severity"]
+
+            urg = "CRITICAL" if sev == "severe" else "IMPORTANT" if sev == "moderate" else "RECOMMENDED"
+            prio = 0 if sev == "severe" else 1  # Priority 0 = above everything else
+
+            freq_str = f" at ~{freq:.0f}Hz" if freq else ""
+            amp_str = f"gyro RMS {rms:.1f}°/s, peak-to-peak {p2p:.0f}°/s{freq_str}"
+
+            if cause == "P_too_high":
+                current_p = config.get(f"{axis_l}_p")
+                if current_p:
+                    new_p = max(10, int(current_p * 0.70))  # Aggressive 30% cut
+                    actions.append({"priority": prio, "urgency": urg, "category": "Oscillation",
+                        "action": f"{axis}: Hover oscillation — reduce P from {current_p} to {new_p}",
+                        "reason": f"Low-frequency oscillation detected during hover ({amp_str}). "
+                                  f"P-term is driving the oscillation — reduce P aggressively to stabilize.",
+                        "sub_actions": [{"param": f"{axis_l}_p", "new": new_p}]})
+                else:
+                    actions.append({"priority": prio, "urgency": urg, "category": "Oscillation",
+                        "action": f"{axis}: Hover oscillation — reduce P significantly",
+                        "reason": f"Low-frequency oscillation detected during hover ({amp_str}). "
+                                  f"P-term is driving the oscillation."})
+
+            elif cause == "PD_interaction":
+                current_p = config.get(f"{axis_l}_p")
+                current_d = config.get(f"{axis_l}_d")
+                sub = []
+                parts = []
+                if current_p:
+                    new_p = max(10, int(current_p * 0.75))
+                    sub.append({"param": f"{axis_l}_p", "new": new_p})
+                    parts.append(f"P from {current_p} to {new_p}")
+                if current_d:
+                    new_d = max(0, int(current_d * 0.70))
+                    sub.append({"param": f"{axis_l}_d", "new": new_d})
+                    parts.append(f"D from {current_d} to {new_d}")
+                act_str = f"{axis}: Hover oscillation — reduce {', '.join(parts)}" if parts else f"{axis}: Reduce P and D to stop hover oscillation"
+                actions.append({"priority": prio, "urgency": urg, "category": "Oscillation",
+                    "action": act_str,
+                    "reason": f"Mid-frequency oscillation detected during hover ({amp_str}). "
+                              f"P and D terms are fighting each other — reduce both.",
+                    "sub_actions": sub if sub else None})
+
+            elif cause == "D_noise":
+                current_dlpf = config.get("dterm_lpf_hz")
+                current_d = config.get(f"{axis_l}_d")
+                sub = []
+                parts = []
+                if current_dlpf and current_dlpf > 40:
+                    new_dlpf = max(25, int(current_dlpf * 0.6))
+                    sub.append({"param": "dterm_lpf_hz", "new": new_dlpf})
+                    parts.append(f"D-term LPF from {current_dlpf}Hz to {new_dlpf}Hz")
+                if current_d:
+                    new_d = max(0, int(current_d * 0.70))
+                    sub.append({"param": f"{axis_l}_d", "new": new_d})
+                    parts.append(f"D from {current_d} to {new_d}")
+                act_str = f"{axis}: Hover oscillation — reduce {', '.join(parts)}" if parts else f"{axis}: Lower D-term LPF and reduce D gain"
+                actions.append({"priority": prio, "urgency": urg, "category": "Oscillation",
+                    "action": act_str,
+                    "reason": f"D-term noise amplification causing oscillation during hover ({amp_str}). "
+                              f"D-term is amplifying noise into the motors.",
+                    "sub_actions": sub if sub else None})
+
+            elif cause == "filter_gap":
+                current_glpf = config.get("gyro_lpf_hz")
+                sub = []
+                parts = []
+                if current_glpf and current_glpf > 30:
+                    new_glpf = max(20, int(current_glpf * 0.6))
+                    sub.append({"param": "gyro_lpf_hz", "new": new_glpf})
+                    parts.append(f"Gyro LPF from {current_glpf}Hz to {new_glpf}Hz")
+                act_str = f"{axis}: Hover oscillation — tighten {', '.join(parts)}" if parts else f"{axis}: Lower Gyro LPF to stop high-frequency oscillation"
+                actions.append({"priority": prio, "urgency": urg, "category": "Oscillation",
+                    "action": act_str,
+                    "reason": f"High-frequency noise leaking through filters causing oscillation during hover ({amp_str}). "
+                              f"Filters need tightening.",
+                    "sub_actions": sub if sub else None})
+
+            else:
+                # Unknown cause but oscillation is real
+                current_p = config.get(f"{axis_l}_p")
+                sub = []
+                if current_p:
+                    new_p = max(10, int(current_p * 0.75))
+                    sub.append({"param": f"{axis_l}_p", "new": new_p})
+                actions.append({"priority": prio, "urgency": urg, "category": "Oscillation",
+                    "action": f"{axis}: Hover oscillation detected — reduce P by 25%",
+                    "reason": f"Oscillation detected during hover ({amp_str}). "
+                              f"Start by reducing P-term as the most common cause.",
+                    "sub_actions": sub if sub else None})
 
     # ═══ 0. PHASE LAG WARNING (large quad critical) ═══
     if phase_lag and phase_lag["total_degrees"] > 45:
@@ -2006,6 +2232,32 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
 
     actions.sort(key=lambda a: a["priority"])
 
+    # ═══ OSCILLATION-FIRST ENFORCEMENT ═══
+    # When hover oscillation is detected, the oscillation actions already include
+    # the right P/D reductions. Defer regular PID actions to avoid duplicates.
+    osc_actions = [a for a in actions if a.get("category") == "Oscillation"
+                   and a.get("urgency") in ("CRITICAL", "IMPORTANT")]
+    if osc_actions:
+        # Get axes that have oscillation actions
+        osc_axes = set()
+        for a in osc_actions:
+            for axis in AXIS_NAMES:
+                if a["action"].startswith(axis + ":"):
+                    osc_axes.add(axis.lower())
+        # Defer PID actions on those axes
+        for a in actions:
+            if a.get("category") == "PID" and not a.get("deferred"):
+                # Check if this PID action is for an oscillating axis
+                action_axis = a["action"].split(":")[0].strip().lower() if ":" in a["action"] else ""
+                if action_axis in osc_axes:
+                    a["deferred"] = True
+                    a["urgency"] = None
+                    a["original_action"] = a["action"]
+                    a["action"] = f"[DEFERRED] {a['action']}"
+                    a["reason"] = (
+                        "PID changes deferred — fix hover oscillation first. The oscillation "
+                        "actions above address the same axis with more aggressive corrections.")
+
     # ═══ FILTER-FIRST ENFORCEMENT ═══
     # When filter changes are recommended, PID measurements are unreliable because
     # noise bleeds into the PID loop and inflates overshoot/delay readings.
@@ -2064,29 +2316,27 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
                 pid_scores.append(np.mean(components))
                 pid_measurable = True
 
-    # ── Oscillation detection from gyro (works even without stick inputs) ──
-    # High gyro variance during hover = wobble/oscillation that step response missed
+    # ── Oscillation score from hover detection ──
+    # Uses the structured hover_osc results from detect_hover_oscillation()
     gyro_oscillation_score = None
-    for axis_name in ["roll", "pitch", "yaw"]:
-        gy_key = f"gyro_{axis_name}"
-        sp_key = f"setpoint_{axis_name}"
-        if gy_key in data and sp_key in data:
-            gy = data[gy_key]
-            sp = data[sp_key]
-            mask = ~(np.isnan(gy) | np.isnan(sp))
-            gy, sp = gy[mask], sp[mask]
-            if len(gy) > 100:
-                # RMS of (gyro - setpoint) captures oscillation even in hover
-                err_rms = float(np.sqrt(np.mean((sp - gy) ** 2)))
-                # Gyro std captures oscillation amplitude
-                gyro_std = float(np.std(gy))
-                # For a stable hover: err_rms < 5, gyro_std < 10
-                # For wobbling: err_rms > 20, gyro_std > 30
-                osc_score = 100 - np.clip((gyro_std - 5) / (50 - 5) * 100, 0, 100)
-                if gyro_oscillation_score is None:
-                    gyro_oscillation_score = osc_score
-                else:
-                    gyro_oscillation_score = min(gyro_oscillation_score, osc_score)
+    has_oscillation = False
+    if hover_osc:
+        osc_scores = []
+        for osc in hover_osc:
+            rms = osc["gyro_rms"]
+            sev = osc["severity"]
+            if sev == "none":
+                osc_scores.append(100)
+            elif sev == "mild":
+                osc_scores.append(100 - np.clip((rms - 2) / (5 - 2) * 40, 0, 40))  # 60-100
+            elif sev == "moderate":
+                osc_scores.append(100 - np.clip((rms - 5) / (15 - 5) * 50 + 40, 40, 90))  # 10-60
+                has_oscillation = True
+            else:  # severe
+                osc_scores.append(max(0, 10 - rms))  # 0-10
+                has_oscillation = True
+        if osc_scores:
+            gyro_oscillation_score = float(min(osc_scores))  # Worst axis drives the score
 
     motor_score = 100
     if motor_analysis:
@@ -2095,22 +2345,34 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
         motor_score = (np.mean(sat_s) + bal_s) / 2
 
     # Build overall score
+    # Four components: noise, PID (or oscillation proxy), motors, and oscillation penalty
+    noise_component = np.mean(noise_scores) if noise_scores else 50
+
     if pid_measurable:
-        overall = float(np.mean([np.mean(noise_scores) if noise_scores else 50,
-                                  np.mean(pid_scores), motor_score]))
+        pid_component = np.mean(pid_scores)
+    elif gyro_oscillation_score is not None:
+        pid_component = gyro_oscillation_score
     else:
-        # PID not measurable — use oscillation score if available, otherwise
-        # cap at 65 max (can't verify tune quality without PID data)
-        pid_proxy = gyro_oscillation_score if gyro_oscillation_score is not None else 50
-        raw = float(np.mean([np.mean(noise_scores) if noise_scores else 50,
-                              pid_proxy, motor_score]))
-        overall = min(raw, 65)  # hard cap: can't score higher than 65 without PID data
+        pid_component = 50
+
+    # Oscillation penalty: severe hover oscillation drags down overall score directly
+    osc_penalty = 0
+    if has_oscillation and gyro_oscillation_score is not None:
+        osc_penalty = max(0, (50 - gyro_oscillation_score) * 0.5)  # Up to 25 point penalty
+
+    overall = float(np.mean([noise_component, pid_component, motor_score])) - osc_penalty
+
+    if not pid_measurable:
+        overall = min(overall, 65)  # Can't score higher than 65 without PID data
+
+    overall = max(0, min(100, overall))
 
     scores = {"overall": overall,
               "noise": float(np.mean(noise_scores)) if noise_scores else None,
               "pid": float(np.mean(pid_scores)) if pid_scores else None,
               "pid_measurable": pid_measurable,
-              "gyro_oscillation": float(gyro_oscillation_score) if gyro_oscillation_score is not None else None,
+              "gyro_oscillation": gyro_oscillation_score,
+              "hover_osc": hover_osc,
               "motor": float(motor_score)}
 
     critical_actions = [a for a in actions if a["urgency"] in ("CRITICAL", "IMPORTANT")]
@@ -2259,7 +2521,8 @@ INAV_CLI_MAP = {
     "roll_p": "mc_p_roll", "roll_i": "mc_i_roll", "roll_d": "mc_d_roll",
     "pitch_p": "mc_p_pitch", "pitch_i": "mc_i_pitch", "pitch_d": "mc_d_pitch",
     "yaw_p": "mc_p_yaw", "yaw_i": "mc_i_yaw", "yaw_d": "mc_d_yaw",
-    "gyro_lowpass_hz": "gyro_main_lpf_hz", "gyro_lowpass2_hz": "gyro_main_lpf2_hz",
+    "gyro_lowpass_hz": "gyro_main_lpf_hz", "gyro_lpf_hz": "gyro_main_lpf_hz",
+    "gyro_lowpass2_hz": "gyro_main_lpf2_hz",
     "dterm_lpf_hz": "dterm_lpf_hz", "dterm_lpf2_hz": "dterm_lpf2_hz",
     "dyn_notch_min_hz": "dynamic_gyro_notch_min_hz",
     "dyn_notch_q": "dynamic_gyro_notch_q",
@@ -2283,21 +2546,22 @@ INAV_GUI_MAP = {
 
 def generate_cli_commands(actions):
     """Generate INAV CLI commands from action plan."""
-    cmds = []
+    # Use ordered dict to deduplicate — last value wins per param
+    cmd_map = {}
 
     for a in actions:
         # Skip deferred actions (e.g., PID changes when filters need fixing first)
         if a.get("deferred"):
             continue
-        # Handle merged PID actions with sub_actions
-        if "sub_actions" in a:
+        # Handle merged PID/oscillation actions with sub_actions
+        if "sub_actions" in a and a["sub_actions"]:
             for sa in a["sub_actions"]:
                 param = sa.get("param", "")
                 new_val = sa.get("new")
                 if param in INAV_CLI_MAP and new_val is not None:
                     try:
                         cli_name = INAV_CLI_MAP[param]
-                        cmds.append(f"set {cli_name} = {int(new_val)}")
+                        cmd_map[cli_name] = int(new_val)
                     except (ValueError, TypeError):
                         pass
         else:
@@ -2306,10 +2570,11 @@ def generate_cli_commands(actions):
             if param in INAV_CLI_MAP and new_val is not None and new_val not in ("see action",):
                 try:
                     cli_name = INAV_CLI_MAP[param]
-                    cmds.append(f"set {cli_name} = {int(new_val)}")
+                    cmd_map[cli_name] = int(new_val)
                 except (ValueError, TypeError):
                     pass
 
+    cmds = [f"set {k} = {v}" for k, v in cmd_map.items()]
     if cmds:
         cmds.append("save")
     return cmds
@@ -2335,6 +2600,33 @@ def generate_narrative(plan, pid_results, motor_analysis, noise_results, config,
         parts.append(f"{craft} needs significant tuning work (quality score: {overall:.0f}/100).")
 
     parts.append(f"This analysis is based on {duration:.0f} seconds of flight data at {sr:.0f}Hz.")
+
+    # Hover oscillation (most critical — mention first)
+    hover_osc_data = plan["scores"].get("hover_osc", [])
+    osc_axes = [o for o in hover_osc_data if o["severity"] in ("moderate", "severe")] if hover_osc_data else []
+    if osc_axes:
+        axis_names = [o["axis"] for o in osc_axes]
+        worst = max(osc_axes, key=lambda o: o["gyro_rms"])
+        if worst["severity"] == "severe":
+            parts.append(
+                f"CRITICAL: The quad is oscillating during hover on {'/'.join(axis_names)} "
+                f"(worst: {worst['axis']} at {worst['gyro_rms']:.1f}°/s RMS). "
+                f"This must be fixed before any other tuning — the quad is fighting itself just to stay in the air.")
+        else:
+            parts.append(
+                f"The quad shows oscillation during hover on {'/'.join(axis_names)} "
+                f"(worst: {worst['axis']} at {worst['gyro_rms']:.1f}°/s RMS). "
+                f"This should be addressed first as it affects all other measurements.")
+        if worst.get("dominant_freq_hz"):
+            freq = worst["dominant_freq_hz"]
+            if freq < 10:
+                parts.append(f"The oscillation frequency (~{freq:.0f}Hz) points to P-term being too high.")
+            elif freq < 25:
+                parts.append(f"The oscillation frequency (~{freq:.0f}Hz) suggests P and D terms are fighting each other.")
+            elif freq < 50:
+                parts.append(f"The oscillation frequency (~{freq:.0f}Hz) indicates D-term is amplifying noise into the motors.")
+            else:
+                parts.append(f"The oscillation frequency (~{freq:.0f}Hz) suggests noise is leaking through the filters.")
 
     # PID behavior per axis
     ok_os = profile["ok_overshoot"]
@@ -2520,6 +2812,34 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
 
     print(f"\n{B}{C}{'─'*70}{R}")
     print(f"  {B}MEASUREMENTS:{R}")
+
+    # Hover oscillation (show first — most critical)
+    hover_osc_data = plan["scores"].get("hover_osc", [])
+    any_osc = any(o["severity"] != "none" for o in hover_osc_data) if hover_osc_data else False
+    if hover_osc_data:
+        for osc in hover_osc_data:
+            sev = osc["severity"]
+            rms = osc["gyro_rms"]
+            p2p = osc["gyro_p2p"]
+            freq = osc["dominant_freq_hz"]
+            freq_str = f"  @{freq:.0f}Hz" if freq else ""
+            if sev == "severe":
+                sc2 = RED
+                sev_str = f"{RED}{B}SEVERE{R}"
+            elif sev == "moderate":
+                sc2 = Y
+                sev_str = f"{Y}MODERATE{R}"
+            elif sev == "mild":
+                sc2 = Y
+                sev_str = f"{Y}mild{R}"
+            else:
+                sc2 = G
+                sev_str = f"{G}stable{R}"
+            print(f"    {osc['axis']:6s}  Hover: {sev_str}  RMS:{sc2}{rms:5.1f}°/s{R}  P2P:{sc2}{p2p:5.0f}°/s{R}{freq_str}")
+        if any_osc:
+            print(f"    {DIM}(hover oscillation measured during {hover_osc_data[0]['hover_seconds']:.1f}s of centered stick){R}")
+        print()
+
     for pid in pid_results:
         if pid is None: continue
         _os = pid["avg_overshoot_pct"]
@@ -2664,11 +2984,11 @@ def save_state(filepath, plan, config, data):
     deferred = [a for a in plan["actions"] if a.get("deferred")]
     state = {"version": REPORT_VERSION, "timestamp": datetime.now().isoformat(),
              "scores": plan["scores"], "verdict": plan["verdict"],
-             "actions": [{"action": a["action"], "param": a["param"],
-                           "current": str(a["current"]), "new": str(a["new"])} for a in active],
+             "actions": [{"action": a["action"], "param": a.get("param", ""),
+                           "current": str(a.get("current", "")), "new": str(a.get("new", ""))} for a in active],
              "deferred_actions": [{"action": a.get("original_action", a["action"]),
-                                    "param": a["param"],
-                                    "current": str(a["current"]), "new": str(a["new"]),
+                                    "param": a.get("param", ""),
+                                    "current": str(a.get("current", "")), "new": str(a.get("new", "")),
                                     "reason": "Fix filters first, then re-fly"} for a in deferred],
              "config": {k: v for k, v in config.items() if k != "raw" and not isinstance(v, np.ndarray)}}
     sp = filepath.rsplit(".", 1)[0] + "_state.json"
@@ -3039,6 +3359,7 @@ def main():
             print(f"  Filter phase lag: {phase_lag['total_degrees']:.0f}° ({phase_lag['total_ms']:.1f}ms) at {sig_freq:.0f}Hz")
 
     print("  Analyzing...")
+    hover_osc = detect_hover_oscillation(data, sr)
     noise_results = [analyze_noise(data, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
     pid_results = [analyze_pid_response(data, i, sr) for i in range(3)]
     motor_analysis = analyze_motors(data, sr)
@@ -3051,7 +3372,7 @@ def main():
 
     plan = generate_action_plan(noise_results, pid_results, motor_analysis, dterm_results,
                                  config, data, profile, phase_lag, motor_response,
-                                 rpm_range, prop_harmonics)
+                                 rpm_range, prop_harmonics, hover_osc)
 
     if not args.no_terminal:
         print_terminal_report(plan, noise_results, pid_results, motor_analysis, config, data,
