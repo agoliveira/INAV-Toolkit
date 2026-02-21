@@ -2220,14 +2220,6 @@ INAV_CLI_MAP = {
     "dyn_notch_q": "dynamic_gyro_notch_q",
 }
 
-# Parameters that live inside a control profile (not master/global)
-INAV_PROFILE_PARAMS = {
-    "mc_p_roll", "mc_i_roll", "mc_d_roll",
-    "mc_p_pitch", "mc_i_pitch", "mc_d_pitch",
-    "mc_p_yaw", "mc_i_yaw", "mc_d_yaw",
-    "dterm_lpf_hz", "dterm_lpf2_hz",
-}
-
 # Map for GUI (INAV Configurator) tab references
 INAV_GUI_MAP = {
     "roll_p": ("PID Tuning", "Roll → P"),
@@ -2245,13 +2237,8 @@ INAV_GUI_MAP = {
 
 
 def generate_cli_commands(actions):
-    """Generate INAV CLI commands from action plan.
-
-    Profile-scoped parameters (PIDs, dterm filters) are grouped under
-    a 'profile 1' header. Global parameters come first.
-    """
-    global_cmds = []
-    profile_cmds = []
+    """Generate INAV CLI commands from action plan."""
+    cmds = []
 
     for a in actions:
         # Skip deferred actions (e.g., PID changes when filters need fixing first)
@@ -2265,11 +2252,7 @@ def generate_cli_commands(actions):
                 if param in INAV_CLI_MAP and new_val is not None:
                     try:
                         cli_name = INAV_CLI_MAP[param]
-                        cmd = f"set {cli_name} = {int(new_val)}"
-                        if cli_name in INAV_PROFILE_PARAMS:
-                            profile_cmds.append(cmd)
-                        else:
-                            global_cmds.append(cmd)
+                        cmds.append(f"set {cli_name} = {int(new_val)}")
                     except (ValueError, TypeError):
                         pass
         else:
@@ -2278,20 +2261,10 @@ def generate_cli_commands(actions):
             if param in INAV_CLI_MAP and new_val is not None and new_val not in ("see action",):
                 try:
                     cli_name = INAV_CLI_MAP[param]
-                    cmd = f"set {cli_name} = {int(new_val)}"
-                    if cli_name in INAV_PROFILE_PARAMS:
-                        profile_cmds.append(cmd)
-                    else:
-                        global_cmds.append(cmd)
+                    cmds.append(f"set {cli_name} = {int(new_val)}")
                 except (ValueError, TypeError):
                     pass
 
-    cmds = []
-    if global_cmds:
-        cmds.extend(global_cmds)
-    if profile_cmds:
-        cmds.append("profile 1")
-        cmds.extend(profile_cmds)
     if cmds:
         cmds.append("save")
     return cmds

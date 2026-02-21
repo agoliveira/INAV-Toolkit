@@ -1,4 +1,4 @@
-# INAV Toolbox
+# INAV Toolkit
 
 A suite of Python tools for analyzing, validating, and tuning INAV flight controller configurations. Built for the INAV long-range community — 7" to 15" multirotors with GPS navigation.
 
@@ -154,7 +154,7 @@ Developed and tested against **INAV 9.0.x**. The blackbox binary decoder handles
 ## Project Structure
 
 ```
-inav-toolbox/
+inav-toolkit/
 ├── README.md                        # This file
 ├── CHANGELOG.md                     # Version history
 ├── requirements.txt                 # Python dependencies
