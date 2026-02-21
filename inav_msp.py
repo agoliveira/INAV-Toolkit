@@ -146,7 +146,7 @@ def auto_detect_fc(baudrate=115200, timeout=2.0):
     """Scan serial ports and return the first one that responds as INAV.
 
     Returns:
-        (port_path, info_dict) on success
+        (INAVDevice, info_dict) on success — device is open, caller must close
         (None, None) if no FC found
     """
     ports = find_serial_ports()
@@ -154,16 +154,18 @@ def auto_detect_fc(baudrate=115200, timeout=2.0):
         return None, None
 
     for port in ports:
+        dev = None
         try:
             dev = INAVDevice(port, baudrate=baudrate, timeout=timeout)
             dev.open()
             info = dev.get_info()
             if info and info.get("fc_variant") == "INAV":
-                return port, info
+                return dev, info
             dev.close()
         except Exception:
             try:
-                dev.close()
+                if dev:
+                    dev.close()
             except Exception:
                 pass
             continue
@@ -221,6 +223,9 @@ class INAVDevice:
 
     def _send(self, cmd, payload=b""):
         """Send an MSP v2 request."""
+        # Flush any stale response data from previous commands
+        if self._ser.in_waiting:
+            self._ser.read(self._ser.in_waiting)
         frame = msp_v2_encode(cmd, payload)
         self._ser.write(frame)
 
@@ -228,6 +233,7 @@ class INAVDevice:
         """Receive and decode an MSP v2 response.
 
         Reads bytes until a complete valid frame is found or timeout.
+        Handles false $X matches inside binary payload data.
         Returns (cmd, payload) or None.
         """
         if timeout is None:
@@ -242,21 +248,23 @@ class INAVDevice:
                 buf += self._ser.read(waiting)
             else:
                 # Small sleep to avoid busy-wait
-                time.sleep(0.001)
+                time.sleep(0.002)
                 continue
 
-            # Try to decode from buffer
-            result = msp_v2_decode(buf)
-            if result is not None:
-                cmd, payload = result
-                if expected_cmd is None or cmd == expected_cmd:
-                    return result
-                # Wrong command — keep reading
-                idx = buf.find(b"$X", 1)
-                if idx > 0:
-                    buf = buf[idx:]
-                else:
-                    buf = b""
+            # Try to decode — may need to skip false $X in binary data
+            search_start = 0
+            while True:
+                idx = buf.find(b"$X", search_start)
+                if idx < 0:
+                    break
+
+                result = msp_v2_decode(buf[idx:])
+                if result is not None:
+                    cmd, payload = result
+                    if expected_cmd is None or cmd == expected_cmd:
+                        return result
+                # This $X was a false match or wrong cmd — try next one
+                search_start = idx + 1
 
         return None
 
@@ -337,26 +345,35 @@ class INAVDevice:
 
         Returns dict with:
             ready (bool): Flash ready for read
-            supported (bool): Dataflash supported on this board
+            supported (bool): Dataflash present (inferred from total_size > 0)
             sectors (int): Number of flash sectors
             total_size (int): Total flash size in bytes
             used_size (int): Used flash size in bytes
         """
-        payload = self._request(MSP_DATAFLASH_SUMMARY)
-        if not payload or len(payload) < 13:
+        # Retry up to 3 times — first attempt after get_info() can
+        # hit stale serial data on some FCs
+        for attempt in range(3):
+            payload = self._request(MSP_DATAFLASH_SUMMARY)
+            if payload and len(payload) >= 13:
+                break
+            time.sleep(0.1)
+        else:
             return None
 
         flags, sectors, total_size, used_size = struct.unpack_from("<BIII", payload, 0)
 
+        # INAV uses flags byte as a simple ready boolean (0x01 = ready).
+        # Unlike Betaflight, INAV does NOT set bit 1 for "supported".
+        # Detect support from total_size > 0 instead.
         return {
             "ready": bool(flags & 0x01),
-            "supported": bool(flags & 0x02),
+            "supported": total_size > 0,
             "sectors": sectors,
             "total_size": total_size,
             "used_size": used_size,
         }
 
-    def read_dataflash_chunk(self, address, size=4096):
+    def read_dataflash_chunk(self, address, size=1024):
         """Read a chunk of dataflash at the given address.
 
         Args:
@@ -366,26 +383,19 @@ class INAVDevice:
         Returns:
             (actual_address, data_bytes) or None on error
         """
-        # MSP v2 dataflash read: address(u32) + requestedSize(u16) + allowCompression(u8)
-        req = struct.pack("<IHB", address, size, 0)  # no compression
+        # MSP_DATAFLASH_READ request: address(u32) + requestedSize(u16)
+        # Note: INAV does NOT require the compression flag byte
+        req = struct.pack("<IH", address, size)
         payload = self._request(MSP_DATAFLASH_READ, req, timeout=5.0)
 
-        if not payload or len(payload) < 7:
+        if not payload or len(payload) < 5:
             return None
 
-        # Response: address(u32) + dataSize(u16) + compressedSize(u16) + data
         resp_addr = struct.unpack_from("<I", payload, 0)[0]
 
-        # INAV response format varies slightly — handle both cases
-        if len(payload) >= 8:
-            # Full v2 format: addr(4) + dataSize(2) + compressedSize(2) + data
-            data_size = struct.unpack_from("<H", payload, 4)[0]
-            compressed_size = struct.unpack_from("<H", payload, 6)[0]
-            data = payload[8:8 + compressed_size]
-        else:
-            # Simpler format: addr(4) + data
-            data = payload[4:]
-            data_size = len(data)
+        # INAV response format: address(u32) + data
+        # (Betaflight v2 adds dataSize + compressedSize, but INAV doesn't)
+        data = payload[4:]
 
         if len(data) == 0:
             return None
@@ -439,12 +449,12 @@ class INAVDevice:
         os.makedirs(output_dir, exist_ok=True)
         filepath = os.path.join(output_dir, filename)
 
-        # Download in chunks
-        chunk_size = 4096
+        # Download in chunks — 2048 bytes works reliably over MSP serial at 115200
+        chunk_size = 2048
         address = 0
         data_buf = bytearray()
         retries = 0
-        max_retries = 5
+        max_retries = 10
         start_time = time.monotonic()
 
         print(f"  Downloading {used / 1024:.0f}KB of blackbox data...")
@@ -457,7 +467,11 @@ class INAVDevice:
                 if retries > max_retries:
                     print(f"\n  ERROR: Too many read errors at offset {address}")
                     return None
-                time.sleep(0.1)
+                # Increasing backoff on retries
+                time.sleep(0.05 * retries)
+                # Flush and resync
+                if self._ser.in_waiting:
+                    self._ser.read(self._ser.in_waiting)
                 continue
 
             retries = 0
@@ -550,10 +564,11 @@ def main():
     print(f"\n  ▲ INAV MSP v{VERSION}")
 
     # Connect
+    fc = None
     if args.device == "auto":
         print("  Scanning for INAV flight controller...")
-        port, info = auto_detect_fc(baudrate=args.baud)
-        if not port:
+        fc, info = auto_detect_fc(baudrate=args.baud)
+        if not fc:
             print("  ERROR: No INAV flight controller found.")
             ports = find_serial_ports()
             if ports:
@@ -562,53 +577,54 @@ def main():
             else:
                 print("    No serial ports detected. Is the FC connected via USB?")
             sys.exit(1)
-        print(f"  Found: {port}")
+        print(f"  Found: {fc.port_path}")
     else:
         port = args.device
         if not os.path.exists(port):
             print(f"  ERROR: Port not found: {port}")
             sys.exit(1)
         print(f"  Connecting: {port}")
+        fc = INAVDevice(port, baudrate=args.baud)
+        fc.open()
+        info = fc.get_info()
 
     try:
-        with INAVDevice(port, baudrate=args.baud) as fc:
-            info = fc.get_info()
-            if not info:
-                print("  ERROR: No response from FC. Check connection and baud rate.")
-                sys.exit(1)
+        if not info:
+            print("  ERROR: No response from FC. Check connection and baud rate.")
+            sys.exit(1)
 
-            print(f"\n  {'─' * 50}")
-            print(f"  Firmware:   {info['firmware']}")
-            print(f"  Craft:      {info['craft_name'] or '(not set)'}")
-            print(f"  Board:      {info['board'] or '?'}")
+        print(f"\n  {'─' * 50}")
+        print(f"  Firmware:   {info['firmware']}")
+        print(f"  Craft:      {info['craft_name'] or '(not set)'}")
+        print(f"  Board:      {info['board'] or '?'}")
 
-            summary = fc.get_dataflash_summary()
-            if summary:
-                used_kb = summary['used_size'] / 1024
-                total_kb = summary['total_size'] / 1024
-                pct = summary['used_size'] * 100 // summary['total_size'] if summary['total_size'] > 0 else 0
-                print(f"  Dataflash:  {used_kb:.0f}KB / {total_kb:.0f}KB ({pct}% used)")
-                print(f"  {'─' * 50}")
+        summary = fc.get_dataflash_summary()
+        if summary:
+            used_kb = summary['used_size'] / 1024
+            total_kb = summary['total_size'] / 1024
+            pct = summary['used_size'] * 100 // summary['total_size'] if summary['total_size'] > 0 else 0
+            print(f"  Dataflash:  {used_kb:.0f}KB / {total_kb:.0f}KB ({pct}% used)")
+            print(f"  {'─' * 50}")
 
-                if args.info_only:
-                    return
+            if args.info_only:
+                return
 
-                if summary['used_size'] == 0:
-                    print("\n  No blackbox data to download.")
-                    return
+            if summary['used_size'] == 0:
+                print("\n  No blackbox data to download.")
+                return
 
-                print()
-                filepath = fc.download_blackbox(
-                    output_dir=args.output_dir,
-                    erase_after=args.erase,
-                )
+            print()
+            filepath = fc.download_blackbox(
+                output_dir=args.output_dir,
+                erase_after=args.erase,
+            )
 
-                if filepath:
-                    print(f"\n  Ready to analyze:")
-                    print(f"    python3 inav_blackbox_analyzer.py {filepath}")
-            else:
-                print("  Dataflash:  not available")
-                print(f"  {'─' * 50}")
+            if filepath:
+                print(f"\n  Ready to analyze:")
+                print(f"    python3 inav_blackbox_analyzer.py {filepath}")
+        else:
+            print("  Dataflash:  not available")
+            print(f"  {'─' * 50}")
 
     except KeyboardInterrupt:
         print("\n  Interrupted.")
@@ -616,6 +632,9 @@ def main():
     except Exception as e:
         print(f"  ERROR: {e}")
         sys.exit(1)
+    finally:
+        if fc:
+            fc.close()
 
 
 if __name__ == "__main__":

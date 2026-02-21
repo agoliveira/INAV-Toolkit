@@ -2048,6 +2048,7 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
             s = np.clip((nr["rms_high"] - bad_noise) / (good_noise - bad_noise) * 100, 0, 100)
             noise_scores.append(s)
     pid_scores = []
+    pid_measurable = False
     for pid in pid_results:
         if pid:
             _os = pid["avg_overshoot_pct"]
@@ -2061,21 +2062,65 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
                 components.append(dl_s)
             if components:
                 pid_scores.append(np.mean(components))
+                pid_measurable = True
+
+    # ── Oscillation detection from gyro (works even without stick inputs) ──
+    # High gyro variance during hover = wobble/oscillation that step response missed
+    gyro_oscillation_score = None
+    for axis_name in ["roll", "pitch", "yaw"]:
+        gy_key = f"gyro_{axis_name}"
+        sp_key = f"setpoint_{axis_name}"
+        if gy_key in data and sp_key in data:
+            gy = data[gy_key]
+            sp = data[sp_key]
+            mask = ~(np.isnan(gy) | np.isnan(sp))
+            gy, sp = gy[mask], sp[mask]
+            if len(gy) > 100:
+                # RMS of (gyro - setpoint) captures oscillation even in hover
+                err_rms = float(np.sqrt(np.mean((sp - gy) ** 2)))
+                # Gyro std captures oscillation amplitude
+                gyro_std = float(np.std(gy))
+                # For a stable hover: err_rms < 5, gyro_std < 10
+                # For wobbling: err_rms > 20, gyro_std > 30
+                osc_score = 100 - np.clip((gyro_std - 5) / (50 - 5) * 100, 0, 100)
+                if gyro_oscillation_score is None:
+                    gyro_oscillation_score = osc_score
+                else:
+                    gyro_oscillation_score = min(gyro_oscillation_score, osc_score)
+
     motor_score = 100
     if motor_analysis:
         sat_s = [max(0, 100 - m["saturation_pct"] * 10) for m in motor_analysis["motors"]]
         bal_s = max(0, 100 - motor_analysis["balance_spread_pct"] * 8)
         motor_score = (np.mean(sat_s) + bal_s) / 2
 
-    overall = float(np.mean([np.mean(noise_scores) if noise_scores else 50,
-                              np.mean(pid_scores) if pid_scores else 50, motor_score]))
+    # Build overall score
+    if pid_measurable:
+        overall = float(np.mean([np.mean(noise_scores) if noise_scores else 50,
+                                  np.mean(pid_scores), motor_score]))
+    else:
+        # PID not measurable — use oscillation score if available, otherwise
+        # cap at 65 max (can't verify tune quality without PID data)
+        pid_proxy = gyro_oscillation_score if gyro_oscillation_score is not None else 50
+        raw = float(np.mean([np.mean(noise_scores) if noise_scores else 50,
+                              pid_proxy, motor_score]))
+        overall = min(raw, 65)  # hard cap: can't score higher than 65 without PID data
+
     scores = {"overall": overall,
               "noise": float(np.mean(noise_scores)) if noise_scores else None,
               "pid": float(np.mean(pid_scores)) if pid_scores else None,
+              "pid_measurable": pid_measurable,
+              "gyro_oscillation": float(gyro_oscillation_score) if gyro_oscillation_score is not None else None,
               "motor": float(motor_score)}
 
     critical_actions = [a for a in actions if a["urgency"] in ("CRITICAL", "IMPORTANT")]
-    if overall >= 85 and len(critical_actions) == 0:
+    if not pid_measurable:
+        # Can't verify tune — need more stick data
+        if overall >= 50:
+            verdict, vtext = "NEED_DATA", "Noise and motors look good, but PID performance could not be measured. Fly with stick inputs (rolls, pitches, yaw sweeps) for tuning data."
+        else:
+            verdict, vtext = "NEED_DATA", "PID performance could not be measured. Fly with deliberate stick inputs for tuning data."
+    elif overall >= 85 and len(critical_actions) == 0:
         verdict, vtext = "DIALED_IN", "This tune is dialed in. You're done — go fly!"
     elif overall >= 75 and len(critical_actions) == 0:
         verdict, vtext = "NEARLY_THERE", "Almost there — just minor tweaks left."
@@ -2377,11 +2422,14 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
     print(f"\n  {B}TUNE QUALITY: {sc}{'█'*int(overall/5)}{'░'*(20-int(overall/5))} {overall:.0f}/100{R}")
     parts = []
     if scores["noise"] is not None: parts.append(f"Noise:{scores['noise']:.0f}")
-    if scores["pid"] is not None: parts.append(f"PID:{scores['pid']:.0f}")
+    if scores["pid"] is not None:
+        parts.append(f"PID:{scores['pid']:.0f}")
+    elif not scores.get("pid_measurable", True):
+        parts.append(f"PID:N/A")
     parts.append(f"Motors:{scores['motor']:.0f}")
     print(f"  {DIM}  {' | '.join(parts)}{R}")
 
-    vc = {"DIALED_IN": G, "NEARLY_THERE": G, "GETTING_BETTER": Y, "NEEDS_WORK": Y, "ROUGH": RED}
+    vc = {"DIALED_IN": G, "NEARLY_THERE": G, "GETTING_BETTER": Y, "NEEDS_WORK": Y, "ROUGH": RED, "NEED_DATA": Y}
     print(f"\n  {B}{vc.get(plan['verdict'],C)}▸ {plan['verdict_text']}{R}")
 
     # Narrative (on by default)
@@ -2464,7 +2512,11 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
         print(f"  measurements. Fix filters, fly one pack, then re-analyze.{R}")
 
     if not active_actions and not deferred_actions:
-        print(f"\n  {G}{B}  ✓ No changes needed — go fly!{R}")
+        if plan["scores"].get("pid_measurable", True):
+            print(f"\n  {G}{B}  ✓ No changes needed — go fly!{R}")
+        else:
+            print(f"\n  {Y}{B}  ⚠ Need flight data with stick inputs to measure PID response.{R}")
+            print(f"  {DIM}  Fly with deliberate roll/pitch/yaw moves, then re-analyze.{R}")
 
     print(f"\n{B}{C}{'─'*70}{R}")
     print(f"  {B}MEASUREMENTS:{R}")
@@ -2672,6 +2724,7 @@ def main():
     if args.device:
         try:
             from inav_msp import INAVDevice, auto_detect_fc, find_serial_ports
+            import time as _time
         except ImportError:
             print("  ERROR: inav_msp.py module not found.")
             print("    Make sure inav_msp.py is in the same directory as the analyzer.")
@@ -2679,10 +2732,11 @@ def main():
 
         print(f"\n  ▲ INAV Blackbox Analyzer v{REPORT_VERSION}")
 
+        fc = None
         if args.device == "auto":
             print("  Scanning for INAV flight controller...")
-            port, info = auto_detect_fc()
-            if not port:
+            fc, info = auto_detect_fc()
+            if not fc:
                 print("  ERROR: No INAV flight controller found.")
                 ports = find_serial_ports()
                 if ports:
@@ -2691,57 +2745,66 @@ def main():
                 else:
                     print("    No serial ports detected. Is the FC connected via USB?")
                 sys.exit(1)
-            print(f"  Found: {port}")
+            print(f"  Found: {fc.port_path}")
         else:
             port = args.device
             if not os.path.exists(port):
                 print(f"  ERROR: Port not found: {port}")
                 sys.exit(1)
             print(f"  Connecting: {port}")
+            fc = INAVDevice(port)
+            fc.open()
+            info = fc.get_info()
 
         try:
-            with INAVDevice(port) as fc:
-                info = fc.get_info()
-                if not info:
-                    print("  ERROR: No response from FC. Check connection and baud rate.")
-                    sys.exit(1)
+            if not info:
+                print("  ERROR: No response from FC. Check connection and baud rate.")
+                sys.exit(1)
 
-                if info.get("fc_variant") != "INAV":
-                    print(f"  ERROR: Not an INAV FC (got: {info.get('fc_variant', '?')})")
-                    sys.exit(1)
+            if info.get("fc_variant") != "INAV":
+                print(f"  ERROR: Not an INAV FC (got: {info.get('fc_variant', '?')})")
+                sys.exit(1)
 
-                print(f"  Connected: {info['craft_name'] or '(unnamed)'} — {info['firmware']}")
+            print(f"  Connected: {info['craft_name'] or '(unnamed)'} — {info['firmware']}")
 
-                summary = fc.get_dataflash_summary()
-                if not summary or not summary["supported"]:
-                    print("  ERROR: Dataflash not available on this board.")
-                    sys.exit(1)
+            # Allow serial to settle after identification handshake
+            _time.sleep(0.2)
+            fc._ser.reset_input_buffer()
 
-                used_kb = summary['used_size'] / 1024
-                total_kb = summary['total_size'] / 1024
-                pct = summary['used_size'] * 100 // summary['total_size'] if summary['total_size'] > 0 else 0
-                print(f"  Dataflash: {used_kb:.0f}KB / {total_kb:.0f}KB ({pct}% used)")
+            summary = fc.get_dataflash_summary()
+            if not summary:
+                print("  ERROR: Dataflash not responding (no MSP response).")
+                print("    Try disconnecting and reconnecting USB.")
+                sys.exit(1)
+            if not summary["supported"]:
+                print(f"  ERROR: Dataflash not supported (flags={summary}).")
+                sys.exit(1)
 
-                if summary['used_size'] == 0:
-                    print("  No blackbox data to download.")
-                    sys.exit(0)
+            used_kb = summary['used_size'] / 1024
+            total_kb = summary['total_size'] / 1024
+            pct = summary['used_size'] * 100 // summary['total_size'] if summary['total_size'] > 0 else 0
+            print(f"  Dataflash: {used_kb:.0f}KB / {total_kb:.0f}KB ({pct}% used)")
 
-                print()
-                filepath = fc.download_blackbox(
-                    output_dir=args.blackbox_dir,
-                    erase_after=args.erase,
-                )
+            if summary['used_size'] == 0:
+                print("  No blackbox data to download.")
+                sys.exit(0)
 
-                if not filepath:
-                    print("  ERROR: Download failed.")
-                    sys.exit(1)
+            print()
+            filepath = fc.download_blackbox(
+                output_dir=args.blackbox_dir,
+                erase_after=args.erase,
+            )
 
-                if args.download_only:
-                    print(f"\n  To analyze:\n    python3 {sys.argv[0]} {filepath}")
-                    sys.exit(0)
+            if not filepath:
+                print("  ERROR: Download failed.")
+                sys.exit(1)
 
-                logfile = filepath
-                print()  # visual separator before analysis
+            if args.download_only:
+                print(f"\n  To analyze:\n    python3 {sys.argv[0]} {filepath}")
+                sys.exit(0)
+
+            logfile = filepath
+            print()  # visual separator before analysis
 
         except KeyboardInterrupt:
             print("\n  Interrupted.")
@@ -2749,6 +2812,9 @@ def main():
         except Exception as e:
             print(f"  ERROR: {e}")
             sys.exit(1)
+        finally:
+            if fc:
+                fc.close()
 
     if not logfile:
         parser.error("logfile is required when --device is not specified")
