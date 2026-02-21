@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer — Multirotor Tuning Tool v2.0
+INAV Blackbox Analyzer — Multirotor Tuning Tool v2.12.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -38,7 +38,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.11.0"
+REPORT_VERSION = "2.12.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -671,6 +671,181 @@ def config_has_pid(config):
 
 def config_has_filters(config):
     return isinstance(config.get("gyro_lowpass_hz"), (int, float))
+
+
+# ── CLI diff → config merge ──────────────────────────────────────────────────
+
+# Reverse map: INAV CLI setting name → our internal config key
+# This is comprehensive — covers PID, filters, rates, nav, motors, and more
+CLI_TO_CONFIG = {
+    # PID gains (multicopter)
+    "mc_p_roll": "roll_p", "mc_i_roll": "roll_i", "mc_d_roll": "roll_d",
+    "mc_p_pitch": "pitch_p", "mc_i_pitch": "pitch_i", "mc_d_pitch": "pitch_d",
+    "mc_p_yaw": "yaw_p", "mc_i_yaw": "yaw_i", "mc_d_yaw": "yaw_d",
+    "mc_cd_roll": "roll_ff", "mc_cd_pitch": "pitch_ff", "mc_cd_yaw": "yaw_ff",
+
+    # Gyro filters
+    "gyro_main_lpf_hz": "gyro_lowpass_hz",
+    "gyro_main_lpf_type": "gyro_lowpass_type",
+    "gyro_main_lpf2_hz": "gyro_lowpass2_hz",
+
+    # D-term filters
+    "dterm_lpf_hz": "dterm_lpf_hz",
+    "dterm_lpf_type": "dterm_lpf_type",
+    "dterm_lpf2_hz": "dterm_lpf2_hz",
+    "dterm_lpf2_type": "dterm_lpf2_type",
+
+    # Dynamic notch
+    "dynamic_gyro_notch_enabled": "dyn_notch_enabled",
+    "dynamic_gyro_notch_q": "dyn_notch_q",
+    "dynamic_gyro_notch_min_hz": "dyn_notch_min_hz",
+    "dynamic_gyro_notch_count": "dyn_notch_count",
+
+    # RPM filter
+    "rpm_gyro_filter_enabled": "rpm_filter_enabled",
+    "rpm_gyro_filter_harmonics": "rpm_filter_harmonics",
+    "rpm_gyro_filter_min_hz": "rpm_filter_min_hz",
+    "rpm_gyro_filter_q": "rpm_filter_q",
+
+    # Motor
+    "motor_pwm_protocol": "motor_protocol",
+    "motor_pwm_rate": "motor_pwm_rate",
+    "motor_poles": "motor_poles",
+    "throttle_idle": "motor_idle",
+    "3d_deadband_throttle": "deadband_3d",
+
+    # Rates
+    "rc_expo": "rc_expo",
+    "rc_yaw_expo": "rc_yaw_expo",
+    "roll_rate": "roll_rate",
+    "pitch_rate": "pitch_rate",
+    "yaw_rate": "yaw_rate",
+
+    # Navigation (position hold, altitude)
+    "nav_mc_pos_z_p": "nav_alt_p",
+    "nav_mc_vel_z_p": "nav_vel_z_p",
+    "nav_mc_vel_z_i": "nav_vel_z_i",
+    "nav_mc_vel_z_d": "nav_vel_z_d",
+    "nav_mc_pos_xy_p": "nav_pos_p",
+    "nav_mc_vel_xy_p": "nav_vel_xy_p",
+    "nav_mc_vel_xy_i": "nav_vel_xy_i",
+    "nav_mc_vel_xy_d": "nav_vel_xy_d",
+
+    # Level mode / angle
+    "mc_p_level": "level_p",
+    "mc_i_level": "level_i",
+    "mc_d_level": "level_d",
+
+    # Anti-gravity
+    "antigravity_gain": "antigravity_gain",
+    "antigravity_cutoff": "antigravity_cutoff",
+
+    # Misc
+    "looptime": "looptime",
+    "gyro_sync": "gyro_sync",
+    "blackbox_rate_num": "bb_rate_num",
+    "blackbox_rate_denom": "bb_rate_denom",
+    "blackbox_device": "bb_device",
+    "name": "craft_name",
+}
+
+# Settings that should be interpreted as integers
+CLI_INT_KEYS = {
+    "roll_p", "roll_i", "roll_d", "roll_ff",
+    "pitch_p", "pitch_i", "pitch_d", "pitch_ff",
+    "yaw_p", "yaw_i", "yaw_d", "yaw_ff",
+    "gyro_lowpass_hz", "gyro_lowpass2_hz",
+    "dterm_lpf_hz", "dterm_lpf2_hz",
+    "dyn_notch_q", "dyn_notch_min_hz", "dyn_notch_count",
+    "rpm_filter_harmonics", "rpm_filter_min_hz", "rpm_filter_q",
+    "motor_pwm_rate", "motor_poles", "motor_idle",
+    "looptime", "bb_rate_num", "bb_rate_denom",
+    "nav_alt_p", "nav_vel_z_p", "nav_vel_z_i", "nav_vel_z_d",
+    "nav_pos_p", "nav_vel_xy_p", "nav_vel_xy_i", "nav_vel_xy_d",
+    "level_p", "level_i", "level_d",
+    "roll_rate", "pitch_rate", "yaw_rate",
+    "rc_expo", "rc_yaw_expo",
+    "antigravity_gain", "antigravity_cutoff",
+}
+
+# Settings that are boolean ON/OFF flags
+CLI_BOOL_KEYS = {
+    "dyn_notch_enabled", "rpm_filter_enabled", "gyro_sync",
+}
+
+
+def merge_diff_into_config(config, diff_raw):
+    """Merge INAV CLI 'diff all' output into the analysis config dict.
+
+    Strategy:
+    - Settings MISSING from blackbox headers: add from diff (nav PIDs,
+      motor poles, rates, anti-gravity, etc.)
+    - Settings PRESENT in blackbox headers: keep blackbox values (they
+      represent what was actually flying), but store diff values as
+      _diff_<key> for mismatch detection
+    - All diff settings stored as cli_<name> for database reference
+
+    Args:
+        config: Existing config dict from extract_fc_config()
+        diff_raw: Raw 'diff all' output string
+
+    Returns:
+        Number of settings merged
+    """
+    if not diff_raw:
+        return 0
+
+    from inav_flight_db import parse_diff_output
+    diff_settings = parse_diff_output(diff_raw)
+
+    merged = 0
+    mismatches = []
+
+    for cli_name, cli_value in diff_settings.items():
+        config_key = CLI_TO_CONFIG.get(cli_name)
+
+        # Store all diff settings with cli_ prefix for database
+        config[f"cli_{cli_name}"] = cli_value
+
+        if config_key is None:
+            continue
+
+        # Convert to appropriate type
+        if config_key in CLI_BOOL_KEYS:
+            val = 1 if cli_value.upper() in ("ON", "1", "TRUE", "YES") else 0
+        elif config_key in CLI_INT_KEYS:
+            try:
+                val = int(cli_value)
+            except ValueError:
+                try:
+                    val = float(cli_value)
+                except ValueError:
+                    val = cli_value
+        else:
+            val = cli_value
+
+        existing = config.get(config_key)
+        if existing is not None:
+            # Blackbox header has this value — keep it, store diff as reference
+            config[f"_diff_{config_key}"] = val
+            # Detect mismatch (compare numerically if possible)
+            try:
+                if int(existing) != int(val):
+                    mismatches.append((config_key, existing, val))
+            except (ValueError, TypeError):
+                if str(existing) != str(val):
+                    mismatches.append((config_key, existing, val))
+        else:
+            # New setting not in blackbox headers — add it
+            config[config_key] = val
+            merged += 1
+
+    config["_diff_merged"] = True
+    config["_diff_settings_count"] = merged
+    config["_diff_unmapped_count"] = len([k for k in diff_settings if CLI_TO_CONFIG.get(k) is None])
+    config["_diff_mismatches"] = mismatches
+
+    return merged
 
 
 # ─── Blackbox Decode ──────────────────────────────────────────────────────────
@@ -2739,6 +2914,14 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
         if config_has_filters(config):
             print(f"    Gyro LPF: {config.get('gyro_lowpass_hz','?')}Hz  D-term LPF: {config.get('dterm_lpf_hz','?')}Hz")
 
+    # Show diff mismatches (FC config differs from what was flying)
+    mismatches = config.get("_diff_mismatches", [])
+    if mismatches:
+        print(f"\n  {Y}⚠ FC config differs from blackbox (changed after flight?):{R}")
+        for key, bb_val, diff_val in mismatches:
+            label = key.replace("_", " ").title()
+            print(f"    {DIM}{label}: {bb_val} (in flight) → {diff_val} (on FC now){R}")
+
     # Informational items (not actions)
     info_items = plan.get("info", [])
     if info_items:
@@ -2997,10 +3180,100 @@ def save_state(filepath, plan, config, data):
     return sp
 
 
+# ─── Log Splitter ─────────────────────────────────────────────────────────────
+
+def split_blackbox_logs(filepath, output_dir=None):
+    """Split a multi-log blackbox file into individual log segments.
+
+    Blackbox files from dataflash dumps contain multiple flights concatenated,
+    each starting with 'H Product:Blackbox' header lines.
+
+    Args:
+        filepath: Path to the .bbl/.TXT file
+        output_dir: Directory to write split files (default: same as source,
+                    or /tmp if source is read-only)
+
+    Returns:
+        List of file paths (original if single log, split files if multiple).
+        Split files are saved as {basename}_log1.bbl, _log2.bbl, etc.
+    """
+    with open(filepath, "rb") as f:
+        raw = f.read()
+
+    # Find all log boundaries
+    marker = b"H Product:Blackbox"
+    positions = []
+    start = 0
+    while True:
+        idx = raw.find(marker, start)
+        if idx < 0:
+            break
+        positions.append(idx)
+        start = idx + len(marker)
+
+    if len(positions) <= 1:
+        # Single log — return as-is
+        return [filepath]
+
+    # Determine output directory
+    if output_dir is None:
+        output_dir = os.path.dirname(filepath) or "."
+    # Ensure directory exists, test writability
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        test_file = os.path.join(output_dir, ".split_test")
+        with open(test_file, "w") as f:
+            f.write("")
+        os.remove(test_file)
+    except OSError:
+        output_dir = "/tmp"
+
+    basename = os.path.splitext(os.path.basename(filepath))[0]
+    ext = os.path.splitext(filepath)[1] or ".bbl"
+
+    # Split into separate files
+    split_files = []
+    for i, pos in enumerate(positions):
+        end = positions[i + 1] if i + 1 < len(positions) else len(raw)
+        segment = raw[pos:end]
+
+        # Skip tiny segments (< 1KB) — likely just headers without data
+        if len(segment) < 1024:
+            continue
+
+        split_path = os.path.join(output_dir, f"{basename}_log{i + 1}{ext}")
+        with open(split_path, "wb") as f:
+            f.write(segment)
+        split_files.append(split_path)
+
+    return split_files
+
+
+def count_blackbox_logs(filepath):
+    """Count how many separate logs are in a blackbox file.
+
+    Returns count without splitting the file.
+    """
+    with open(filepath, "rb") as f:
+        raw = f.read()
+
+    marker = b"H Product:Blackbox"
+    count = 0
+    start = 0
+    while True:
+        idx = raw.find(marker, start)
+        if idx < 0:
+            break
+        count += 1
+        start = idx + len(marker)
+
+    return max(1, count)
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.1 — Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.12.0 — Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("logfile", nargs="?", default=None,
                         help="Blackbox log (.bbl/.bfl/.bbs/.txt or decoded .csv). "
@@ -3037,10 +3310,19 @@ def main():
                              "Used with --cells to predict where prop noise will be.")
     parser.add_argument("--no-narrative", action="store_true",
                         help="Omit the plain-English description of the quad's behavior.")
+    parser.add_argument("--diff", action="store_true",
+                        help="Pull 'diff all' config from FC via CLI (requires --device).")
+    parser.add_argument("--no-db", action="store_true",
+                        help="Skip storing results in flight database.")
+    parser.add_argument("--db-path", default="./inav_flights.db",
+                        help="Path to flight database (default: ./inav_flights.db)")
+    parser.add_argument("--history", action="store_true",
+                        help="Show flight history and progression for the craft, then exit.")
     args = parser.parse_args()
 
     # ── Device mode: download blackbox from FC ──
     logfile = args.logfile
+    diff_raw = None
     if args.device:
         try:
             from inav_msp import INAVDevice, auto_detect_fc, find_serial_ports
@@ -3105,6 +3387,23 @@ def main():
             pct = summary['used_size'] * 100 // summary['total_size'] if summary['total_size'] > 0 else 0
             print(f"  Dataflash: {used_kb:.0f}KB / {total_kb:.0f}KB ({pct}% used)")
 
+            # Pull CLI diff if requested
+            diff_raw = None
+            if args.diff:
+                print("  Pulling configuration (diff all)...", end="", flush=True)
+                diff_raw = fc.get_diff_all(timeout=10.0)
+                if diff_raw:
+                    n_settings = len([l for l in diff_raw.splitlines() if l.strip().startswith("set ")])
+                    print(f" {n_settings} settings")
+                    # Save diff to file alongside blackbox
+                    diff_path = os.path.join(args.blackbox_dir, f"{info['craft_name'] or 'fc'}_diff.txt")
+                    os.makedirs(args.blackbox_dir, exist_ok=True)
+                    with open(diff_path, "w") as f:
+                        f.write(diff_raw)
+                    print(f"  ✓ Saved: {diff_path}")
+                else:
+                    print(" no response (FC may not support CLI over MSP)")
+
             if summary['used_size'] == 0:
                 print("  No blackbox data to download.")
                 sys.exit(0)
@@ -3142,6 +3441,99 @@ def main():
     if not os.path.isfile(logfile):
         print(f"ERROR: File not found: {logfile}"); sys.exit(1)
 
+    # ── History mode: show progression and exit ──
+    if args.history:
+        from inav_flight_db import FlightDB
+        db = FlightDB(args.db_path)
+        # Need to peek at craft name from headers
+        rp = parse_headers_from_bbl(logfile) if os.path.isfile(logfile) else {}
+        cfg = extract_fc_config(rp)
+        craft = cfg.get("craft_name", "unknown")
+        _print_flight_history(db, craft)
+        db.close()
+        sys.exit(0)
+
+    # ── Multi-log detection and splitting ──
+    n_logs = count_blackbox_logs(logfile)
+    log_files = [logfile]
+    if n_logs > 1:
+        print(f"\n  Found {n_logs} flights in {os.path.basename(logfile)}")
+        log_files = split_blackbox_logs(logfile, output_dir=args.blackbox_dir)
+        print(f"  Split into {len(log_files)} files:")
+        for lf in log_files:
+            print(f"    {os.path.basename(lf)}")
+        print()
+
+    # ── Process each log ──
+    for log_idx, logfile in enumerate(log_files):
+        if len(log_files) > 1:
+            print(f"\n{'═' * 70}")
+            print(f"  Flight {log_idx + 1} of {len(log_files)}: {os.path.basename(logfile)}")
+            print(f"{'═' * 70}")
+
+        _analyze_single_log(logfile, args, diff_raw)
+
+    # ── Show progression after multi-log analysis ──
+    if not args.no_db and len(log_files) > 1:
+        from inav_flight_db import FlightDB
+        db = FlightDB(args.db_path)
+        # Peek at craft name
+        rp = parse_headers_from_bbl(log_files[0])
+        cfg = extract_fc_config(rp)
+        craft = cfg.get("craft_name", "unknown")
+        prog = db.get_progression(craft)
+        if prog["changes"]:
+            R, B, C, G, Y, DIM = "\033[0m", "\033[1m", "\033[96m", "\033[92m", "\033[93m", "\033[2m"
+            print(f"\n{B}{C}{'═' * 70}{R}")
+            print(f"  {B}FLIGHT PROGRESSION ({craft}):{R}")
+            trend_icon = {"improving": f"{G}↗ Improving", "degrading": f"\033[91m↘ Degrading",
+                          "stable": f"{Y}→ Stable"}.get(prog["trend"], f"{DIM}? Insufficient data")
+            print(f"  Trend: {trend_icon}{R}")
+            for ch in prog["changes"]:
+                print(f"    {ch}")
+            print(f"{B}{C}{'═' * 70}{R}\n")
+        db.close()
+
+
+def _print_flight_history(db, craft):
+    """Print flight history table for a craft."""
+    R, B, C, G, Y, RED, DIM = "\033[0m", "\033[1m", "\033[96m", "\033[92m", "\033[93m", "\033[91m", "\033[2m"
+    history = db.get_craft_history(craft, limit=20)
+    if not history:
+        print(f"  No flight history for '{craft}'")
+        return
+
+    print(f"\n{B}{C}{'═' * 70}{R}")
+    print(f"  {B}FLIGHT HISTORY: {craft}{R}  ({len(history)} flights)")
+    print(f"{B}{C}{'─' * 70}{R}")
+    print(f"  {'#':>3}  {'Date':16}  {'Dur':>5}  {'Score':>5}  {'Noise':>5}  {'PID':>5}  {'Osc':>5}  {'Verdict'}")
+    print(f"  {'─'*3}  {'─'*16}  {'─'*5}  {'─'*5}  {'─'*5}  {'─'*5}  {'─'*5}  {'─'*16}")
+
+    for i, f in enumerate(reversed(history)):  # Chronological order
+        ts = f["timestamp"][:16].replace("T", " ")
+        dur = f"{f['duration_s']:.0f}s" if f["duration_s"] else "?"
+        sc = f["overall_score"]
+        sc_str = f"{sc:.0f}" if sc is not None else "?"
+        ns = f"{f['noise_score']:.0f}" if f["noise_score"] is not None else "?"
+        ps = f"{f['pid_score']:.0f}" if f["pid_score"] is not None else "N/A"
+        osc = f"{f['osc_score']:.0f}" if f["osc_score"] is not None else "?"
+        v = f["verdict"] or "?"
+
+        sc_c = G if (sc or 0) >= 85 else Y if (sc or 0) >= 60 else RED
+        print(f"  {i+1:3}  {ts}  {dur:>5}  {sc_c}{sc_str:>5}{R}  {ns:>5}  {ps:>5}  {osc:>5}  {DIM}{v}{R}")
+
+    # Show progression
+    prog = db.get_progression(craft)
+    if prog["changes"]:
+        print(f"\n  {B}Latest changes:{R}")
+        for ch in prog["changes"]:
+            print(f"    {ch}")
+
+    print(f"{B}{C}{'═' * 70}{R}\n")
+
+
+def _analyze_single_log(logfile, args, diff_raw=None):
+
     # ── Parse headers FIRST (needed for auto-detection) ──
     raw_params = {}
     ext = os.path.splitext(logfile)[1].lower()
@@ -3171,6 +3563,16 @@ def main():
             pass
 
     config = extract_fc_config(raw_params)
+
+    # ── Merge CLI diff if available ──
+    if diff_raw:
+        n_merged = merge_diff_into_config(config, diff_raw)
+        mismatches = config.get("_diff_mismatches", [])
+        if n_merged > 0 or mismatches:
+            parts = [f"{n_merged} new settings from CLI diff"]
+            if mismatches:
+                parts.append(f"{len(mismatches)} changed since flight")
+            print(f"  Merged: {', '.join(parts)}")
 
     # ── Auto-detect platform from field names ──
     field_names_str = raw_params.get("Field I name", "")
@@ -3339,6 +3741,24 @@ def main():
         if filt_parts:
             print(f"  Filters: {', '.join(filt_parts)}")
 
+    # Show diff-enriched config extras
+    if config.get("_diff_merged"):
+        diff_extras = []
+        if config.get("motor_poles"):
+            diff_extras.append(f"MotorPoles={config['motor_poles']}")
+        if config.get("motor_idle") is not None:
+            diff_extras.append(f"Idle={config['motor_idle']}")
+        if config.get("antigravity_gain") is not None:
+            diff_extras.append(f"AntiGrav={config['antigravity_gain']}")
+        if config.get("nav_alt_p") is not None:
+            diff_extras.append(f"NavAltP={config['nav_alt_p']}")
+        if config.get("level_p") is not None:
+            diff_extras.append(f"LevelP={config['level_p']}")
+        if diff_extras:
+            print(f"  Diff extras: {', '.join(diff_extras)}")
+        print(f"  {config['_diff_settings_count']} settings from CLI diff "
+              f"({config.get('_diff_unmapped_count', 0)} additional stored)")
+
     # ── RPM prediction ──
     rpm_range = estimate_rpm_range(args.kv, detected_cells or args.cells)
     prop_harmonics = None
@@ -3406,6 +3826,34 @@ def main():
 
     sp = save_state(logfile, plan, config, data)
     print(f"  ✓ State: {sp} (use --previous on next run)")
+
+    # ── Store in flight database ──
+    if not args.no_db:
+        try:
+            from inav_flight_db import FlightDB
+            db = FlightDB(args.db_path)
+            flight_id = db.store_flight(
+                plan, config, data, hover_osc, motor_analysis,
+                pid_results, noise_results, log_file=logfile, diff_raw=diff_raw)
+            craft = config.get("craft_name", "unknown")
+            n_flights = db.get_flight_count(craft)
+            print(f"  ✓ Database: flight #{flight_id} for {craft} ({n_flights} total)")
+
+            # Show progression if we have history
+            if n_flights >= 2:
+                prog = db.get_progression(craft)
+                if prog["changes"]:
+                    R, B, C, G, Y, DIM = "\033[0m", "\033[1m", "\033[96m", "\033[92m", "\033[93m", "\033[2m"
+                    trend_icon = {"improving": f"{G}↗ Improving", "degrading": f"\033[91m↘ Degrading",
+                                  "stable": f"{Y}→ Stable"}.get(prog["trend"], "")
+                    print(f"\n  {B}Progression:{R} {trend_icon}{R}")
+                    for ch in prog["changes"]:
+                        print(f"    {ch}")
+
+            db.close()
+        except Exception as e:
+            print(f"  ⚠ Database: {e}")
+
     print()
 
 if __name__ == "__main__":

@@ -2,6 +2,16 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-02-21] — Blackbox Analyzer v2.12.0
+
+### Added
+- **Flight history database** (`inav_flight_db.py`): SQLite database stores analysis results from every flight — scores, per-axis oscillation data, PID values, filter config, motor balance, and actions. Enables progression tracking across tuning sessions. Zero external dependencies (Python stdlib sqlite3).
+- **Multi-log splitter**: Dataflash dumps containing multiple arm/disarm cycles are automatically detected and split into individual flights. Each is analyzed separately with per-flight progression tracking.
+- **Flight progression tracking**: After each analysis, the database compares with the previous flight for the same craft and shows score deltas, oscillation changes, and PID value changes. Trend detection (improving/stable/degrading).
+- **MSP CLI diff merge**: New `--diff` flag pulls the full `diff all` configuration from the FC before downloading blackbox data. Settings missing from blackbox headers (motor_poles, nav PIDs, rates, level mode, antigravity) are enriched from the diff. Mismatches between blackbox and current FC config are detected and displayed.
+- **`--history` flag**: Shows a tabular flight history for the craft with scores, verdicts, and progression summary.
+- **`--db-path` / `--no-db` flags**: Custom database path or skip storage entirely.
+
 ## [2026-02-21] — Blackbox Analyzer v2.11.0
 
 ### Fixed

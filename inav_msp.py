@@ -540,6 +540,91 @@ class INAVDevice:
         print(" timeout (flash may still be erasing)")
         return False
 
+    # ── CLI Mode (for diff all) ───────────────────────────────────────────
+
+    def cli_command(self, command, timeout=5.0):
+        """Send a CLI command and capture the response.
+
+        INAV enters CLI mode when it receives '#' character.
+        Commands are sent as plain text, responses end with '# ' prompt.
+
+        Args:
+            command: CLI command string (e.g., 'diff all')
+            timeout: Max seconds to wait for response
+
+        Returns:
+            Response string (without prompt), or None on error
+        """
+        ser = self._ser
+
+        # Flush any pending data
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+
+        # Enter CLI mode by sending '#'
+        ser.write(b"#")
+        time.sleep(0.3)
+
+        # Read and discard the CLI banner
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+
+        # Send the command
+        ser.write((command + "\n").encode("ascii"))
+        time.sleep(0.1)
+
+        # Read response until we get '# ' prompt
+        buf = b""
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            if ser.in_waiting:
+                buf += ser.read(ser.in_waiting)
+                # Look for the CLI prompt at the end
+                # INAV CLI prompt is "\r\n# " at the end of output
+                if buf.rstrip().endswith(b"#") or buf.endswith(b"# "):
+                    break
+            else:
+                time.sleep(0.01)
+
+        # Exit CLI mode
+        ser.write(b"exit\n")
+        time.sleep(0.3)
+        # Flush the exit response
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+
+        if not buf:
+            return None
+
+        # Decode and clean up
+        try:
+            text = buf.decode("ascii", errors="replace")
+        except Exception:
+            return None
+
+        # Remove the command echo and trailing prompt
+        lines = text.splitlines()
+        # Skip echo of our command and trailing prompt
+        result_lines = []
+        for line in lines:
+            line = line.rstrip()
+            if line == command:
+                continue  # Skip command echo
+            if line == "#" or line == "# ":
+                continue  # Skip prompt
+            result_lines.append(line)
+
+        return "\n".join(result_lines).strip()
+
+    def get_diff_all(self, timeout=10.0):
+        """Pull the full 'diff all' configuration from the FC.
+
+        Returns:
+            Raw diff output string, or None on error
+        """
+        return self.cli_command("diff all", timeout=timeout)
+
 
 # ─── CLI Entrypoint ──────────────────────────────────────────────────────────
 
