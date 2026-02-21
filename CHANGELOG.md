@@ -1,6 +1,31 @@
 # Changelog
 
-All notable changes to the INAV Flight Analyzer Toolkit.
+All notable changes to INAV Toolkit.
+
+## [2026-02-21] — Blackbox Analyzer v2.11.0
+
+### Added
+- **Auto-detect frame size from craft name**: Parses the craft name header (e.g., "NAZGUL 10") to automatically determine frame size. No more silent 5" defaults when the log clearly says otherwise.
+- **Frame size conflict warning**: When `--frame` is specified but contradicts the craft name (e.g., `--frame 5` on a "NAZGUL 10" log), the analyzer prints a clear ⚠ warning explaining the mismatch and which value is being used.
+- **Auto-detect battery cells from vbatref**: If `--cells` is not specified, battery cell count is inferred from the blackbox `vbatref` header voltage.
+- **Platform detection from field names**: Motor count and servo count are read from the `Field I name` header to determine platform type (Quadcopter, Hexacopter, Tricopter, etc.).
+- **Comprehensive pre-analysis banner**: Before decoding begins, the analyzer now displays a structured identification block showing: aircraft name, firmware version and build date, platform type (quad/hex/tri + motor/servo count), frame size with source (user/auto-detected/conflict), prop configuration, battery cell count, motor KV, and the analysis profile with thresholds.
+
+### Changed
+- Headers are now parsed before building the frame profile, enabling auto-detection to inform profile selection.
+- RPM prediction now uses auto-detected cell count when `--cells` is not explicitly provided.
+
+## [2025-02-21] — Blackbox Analyzer v2.10.0
+
+### Fixed
+- **Filter-first enforcement**: When filter changes are needed, PID recommendations are now deferred until after filters are fixed and a re-fly. Previously, the analyzer would recommend both filter and PID changes simultaneously, leading users to raise D-term gains into wide-open filters, amplifying noise and creating a downward tuning spiral.
+- **CLI parameter naming**: `gyro_lpf_hz` corrected to `gyro_main_lpf_hz` (renamed in INAV 3.0+).
+- **Profile-scoped CLI commands**: Parameters like `dterm_lpf_hz`, `mc_p_roll`, etc. now correctly emit a `profile 1` line before profile-scoped settings. Previously, pasting CLI output at the master level would fail with "invalid setting".
+
+### Changed
+- CLI output now separates global parameters (gyro filters, dynamic notch) from profile-scoped parameters (PIDs, dterm filters) with proper context switching.
+- State JSON now includes a `deferred_actions` array alongside `actions`, making it clear which recommendations require a re-fly first.
+- HTML report shows deferred PID changes in a distinct visual section rather than mixing them with actionable filter fixes.
 
 ## [2025-02-20] — Project Restructure
 

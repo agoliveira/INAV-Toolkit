@@ -38,7 +38,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.9.0"
+REPORT_VERSION = "2.11.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -2006,6 +2006,37 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
 
     actions.sort(key=lambda a: a["priority"])
 
+    # ═══ FILTER-FIRST ENFORCEMENT ═══
+    # When filter changes are recommended, PID measurements are unreliable because
+    # noise bleeds into the PID loop and inflates overshoot/delay readings.
+    # Raising D with a wide-open dterm LPF amplifies noise and makes things worse.
+    # Strategy: only output filter changes, tell user to re-fly for PID tuning.
+    filter_actions = [a for a in actions if a.get("category") == "Filter"
+                      and a.get("urgency") in ("CRITICAL", "IMPORTANT")]
+    pid_actions = [a for a in actions if a.get("category") == "PID"]
+
+    if filter_actions and pid_actions:
+        # Mark PID actions as deferred — they'll show as informational, not actionable
+        for a in pid_actions:
+            a["deferred"] = True
+            a["urgency"] = None
+            a["original_action"] = a["action"]
+            a["action"] = f"[DEFERRED] {a['action']}"
+            a["reason"] = (
+                "PID changes deferred until filters are fixed. Current overshoot/delay readings "
+                "are inflated by noise passing through the filter stack. Fix filters first, "
+                "re-fly, then the analyzer will give accurate PID recommendations.")
+
+        # Add explicit guidance
+        actions.append({
+            "priority": 2, "urgency": "IMPORTANT", "category": "Workflow",
+            "action": "Fix filters first, then re-fly for PID tuning",
+            "param": "workflow", "current": "N/A", "new": "N/A",
+            "reason": "Noise is corrupting PID measurements. Apply the filter changes above, "
+                      "fly one pack, then run the analyzer again for accurate PID recommendations. "
+                      "Do NOT change PIDs and filters at the same time."})
+        actions.sort(key=lambda a: a["priority"])
+
     # ═══ QUALITY SCORE ═══
     good_noise = profile["good_noise_db"]
     good_os = profile["good_overshoot"]
@@ -2183,10 +2214,18 @@ INAV_CLI_MAP = {
     "roll_p": "mc_p_roll", "roll_i": "mc_i_roll", "roll_d": "mc_d_roll",
     "pitch_p": "mc_p_pitch", "pitch_i": "mc_i_pitch", "pitch_d": "mc_d_pitch",
     "yaw_p": "mc_p_yaw", "yaw_i": "mc_i_yaw", "yaw_d": "mc_d_yaw",
-    "gyro_lowpass_hz": "gyro_lpf_hz", "gyro_lowpass2_hz": "gyro_lpf2_hz",
+    "gyro_lowpass_hz": "gyro_main_lpf_hz", "gyro_lowpass2_hz": "gyro_main_lpf2_hz",
     "dterm_lpf_hz": "dterm_lpf_hz", "dterm_lpf2_hz": "dterm_lpf2_hz",
     "dyn_notch_min_hz": "dynamic_gyro_notch_min_hz",
     "dyn_notch_q": "dynamic_gyro_notch_q",
+}
+
+# Parameters that live inside a control profile (not master/global)
+INAV_PROFILE_PARAMS = {
+    "mc_p_roll", "mc_i_roll", "mc_d_roll",
+    "mc_p_pitch", "mc_i_pitch", "mc_d_pitch",
+    "mc_p_yaw", "mc_i_yaw", "mc_d_yaw",
+    "dterm_lpf_hz", "dterm_lpf2_hz",
 }
 
 # Map for GUI (INAV Configurator) tab references
@@ -2206,9 +2245,18 @@ INAV_GUI_MAP = {
 
 
 def generate_cli_commands(actions):
-    """Generate INAV CLI commands from action plan."""
-    cmds = []
+    """Generate INAV CLI commands from action plan.
+
+    Profile-scoped parameters (PIDs, dterm filters) are grouped under
+    a 'profile 1' header. Global parameters come first.
+    """
+    global_cmds = []
+    profile_cmds = []
+
     for a in actions:
+        # Skip deferred actions (e.g., PID changes when filters need fixing first)
+        if a.get("deferred"):
+            continue
         # Handle merged PID actions with sub_actions
         if "sub_actions" in a:
             for sa in a["sub_actions"]:
@@ -2216,7 +2264,12 @@ def generate_cli_commands(actions):
                 new_val = sa.get("new")
                 if param in INAV_CLI_MAP and new_val is not None:
                     try:
-                        cmds.append(f"set {INAV_CLI_MAP[param]} = {int(new_val)}")
+                        cli_name = INAV_CLI_MAP[param]
+                        cmd = f"set {cli_name} = {int(new_val)}"
+                        if cli_name in INAV_PROFILE_PARAMS:
+                            profile_cmds.append(cmd)
+                        else:
+                            global_cmds.append(cmd)
                     except (ValueError, TypeError):
                         pass
         else:
@@ -2224,9 +2277,21 @@ def generate_cli_commands(actions):
             new_val = a.get("new")
             if param in INAV_CLI_MAP and new_val is not None and new_val not in ("see action",):
                 try:
-                    cmds.append(f"set {INAV_CLI_MAP[param]} = {int(new_val)}")
+                    cli_name = INAV_CLI_MAP[param]
+                    cmd = f"set {cli_name} = {int(new_val)}"
+                    if cli_name in INAV_PROFILE_PARAMS:
+                        profile_cmds.append(cmd)
+                    else:
+                        global_cmds.append(cmd)
                 except (ValueError, TypeError):
                     pass
+
+    cmds = []
+    if global_cmds:
+        cmds.extend(global_cmds)
+    if profile_cmds:
+        cmds.append("profile 1")
+        cmds.extend(profile_cmds)
     if cmds:
         cmds.append("save")
     return cmds
@@ -2371,19 +2436,22 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
             print(f"    {DIM}{item['detail']}{R}")
 
     actions = plan["actions"]
-    if actions:
+    active_actions = [a for a in actions if not a.get("deferred")]
+    deferred_actions = [a for a in actions if a.get("deferred")]
+
+    if active_actions:
         print(f"\n{B}{C}{'─'*70}{R}")
-        print(f"  {B}DO THIS — {len(actions)} change{'s' if len(actions)!=1 else ''}:{R}")
+        print(f"  {B}DO THIS — {len(active_actions)} change{'s' if len(active_actions)!=1 else ''}:{R}")
         print(f"{B}{C}{'─'*70}{R}")
-        for i, a in enumerate(actions, 1):
+        for i, a in enumerate(active_actions, 1):
             us = ""
             if a["urgency"] == "CRITICAL": us = f" {RED}{B}[!!]{R}"
             elif a["urgency"] == "IMPORTANT": us = f" {Y}{B}[!]{R}"
             print(f"\n  {B}{C}{i}.{R} {B}{a['action']}{R}{us}")
             print(f"     {DIM}{a['reason']}{R}")
 
-        # CLI commands
-        cli_cmds = generate_cli_commands(actions)
+        # CLI commands (only from active actions)
+        cli_cmds = generate_cli_commands(active_actions)
         if cli_cmds:
             print(f"\n{B}{C}{'─'*70}{R}")
             print(f"  {B}INAV CLI — paste into Configurator CLI tab:{R}")
@@ -2391,9 +2459,9 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
             for cmd in cli_cmds:
                 print(f"    {G}{cmd}{R}")
             print()
-            # GUI hints from all actions (including sub_actions)
+            # GUI hints from active actions (including sub_actions)
             gui_hints = []
-            for a in actions:
+            for a in active_actions:
                 if "sub_actions" in a:
                     for sa in a["sub_actions"]:
                         param = sa.get("param", "")
@@ -2411,7 +2479,18 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
                 print(f"  {DIM}Or apply manually in Configurator:{R}")
                 for h in gui_hints:
                     print(f"    {DIM}{h}{R}")
-    else:
+
+    if deferred_actions:
+        print(f"\n{B}{C}{'─'*70}{R}")
+        print(f"  {B}{Y}DEFERRED (apply after filter changes + re-fly):{R}")
+        print(f"{B}{C}{'─'*70}{R}")
+        for a in deferred_actions:
+            orig = a.get("original_action", a["action"])
+            print(f"    {DIM}⏸ {orig}{R}")
+        print(f"\n  {DIM}These PID changes are on hold because noise is distorting the")
+        print(f"  measurements. Fix filters, fly one pack, then re-analyze.{R}")
+
+    if not active_actions and not deferred_actions:
         print(f"\n  {G}{B}  ✓ No changes needed — go fly!{R}")
 
     print(f"\n{B}{C}{'─'*70}{R}")
@@ -2448,12 +2527,21 @@ def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm
     sg = "linear-gradient(90deg, #9ece6a, #73daca)" if overall >= 85 else "linear-gradient(90deg, #e0af68, #ff9e64)" if overall >= 60 else "linear-gradient(90deg, #f7768e, #ff6b6b)"
 
     ah = ""
-    for i, a in enumerate(plan["actions"], 1):
+    active_actions = [a for a in plan["actions"] if not a.get("deferred")]
+    deferred_actions = [a for a in plan["actions"] if a.get("deferred")]
+
+    for i, a in enumerate(active_actions, 1):
         uc = (a["urgency"] or "normal").lower()
         ub = f'<span class="ub {uc}">{a["urgency"]}</span>' if a["urgency"] else ""
         ah += f'<div class="ac {uc}"><div class="an">{i}</div><div class="ab"><div class="am">{a["action"]} {ub}</div><div class="ar">{a["reason"]}</div></div></div>'
-    if not plan["actions"]:
-        ah = '<div class="ac ok"><div class="ab"><div class="am">✓ No changes needed — go fly!</div></div></div>'
+    if deferred_actions:
+        ah += '<div class="ac deferred"><div class="ab"><div class="am" style="color:#565f89">⏸ Deferred PID changes (fix filters first, then re-fly)</div>'
+        for a in deferred_actions:
+            orig = a.get("original_action", a["action"].replace("[DEFERRED] ", ""))
+            ah += f'<div class="ar" style="color:#565f89">{orig}</div>'
+        ah += '</div></div>'
+    if not active_actions and not deferred_actions:
+        ah = '<div class="ac ok"><div class="ab"><div class="am">✓ No changes needed, go fly!</div></div></div>'
 
     ch = ""
     if config_has_pid(config) or config_has_filters(config):
@@ -2547,10 +2635,16 @@ footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-
 # ─── State file ───────────────────────────────────────────────────────────────
 
 def save_state(filepath, plan, config, data):
+    active = [a for a in plan["actions"] if not a.get("deferred")]
+    deferred = [a for a in plan["actions"] if a.get("deferred")]
     state = {"version": REPORT_VERSION, "timestamp": datetime.now().isoformat(),
              "scores": plan["scores"], "verdict": plan["verdict"],
              "actions": [{"action": a["action"], "param": a["param"],
-                           "current": str(a["current"]), "new": str(a["new"])} for a in plan["actions"]],
+                           "current": str(a["current"]), "new": str(a["new"])} for a in active],
+             "deferred_actions": [{"action": a.get("original_action", a["action"]),
+                                    "param": a["param"],
+                                    "current": str(a["current"]), "new": str(a["new"]),
+                                    "reason": "Fix filters first, then re-fly"} for a in deferred],
              "config": {k: v for k, v in config.items() if k != "raw" and not isinstance(v, np.ndarray)}}
     sp = filepath.rsplit(".", 1)[0] + "_state.json"
     with open(sp, "w") as f:
@@ -2592,7 +2686,72 @@ def main():
     if not os.path.isfile(logfile):
         print(f"ERROR: File not found: {logfile}"); sys.exit(1)
 
-    # ── Build frame profile ──
+    # ── Parse headers FIRST (needed for auto-detection) ──
+    raw_params = {}
+    ext = os.path.splitext(logfile)[1].lower()
+
+    is_blackbox = ext in (".bbl", ".bfl", ".bbs")
+    if ext in (".txt", ".TXT") and not is_blackbox:
+        try:
+            with open(logfile, "rb") as f:
+                first_line = f.readline().decode("utf-8", errors="ignore").strip()
+                if first_line.startswith("H Product:Blackbox") or first_line.startswith("H Field I name:"):
+                    is_blackbox = True
+        except:
+            pass
+
+    if is_blackbox:
+        raw_params = parse_headers_from_bbl(logfile)
+    else:
+        try:
+            with open(logfile, "r", errors="ignore") as f:
+                for line in f:
+                    if line.strip().startswith("H "):
+                        raw_params = parse_headers_from_bbl(logfile)
+                        break
+                    elif line.strip() and not line.strip().startswith("#"):
+                        break
+        except:
+            pass
+
+    config = extract_fc_config(raw_params)
+
+    # ── Auto-detect platform from field names ──
+    field_names_str = raw_params.get("Field I name", "")
+    if field_names_str:
+        all_fields = [f.strip().lower() for f in field_names_str.split(",")]
+        motor_fields = [f for f in all_fields if re.match(r"motor\[\d+\]", f)]
+        servo_fields = [f for f in all_fields if re.match(r"servo\[\d+\]", f)]
+        n_motors = len(motor_fields)
+        n_servos = len(servo_fields)
+    else:
+        n_motors = 4  # assume quad
+        n_servos = 0
+
+    # Determine platform type
+    if n_motors == 3 or (n_motors == 4 and n_servos >= 1):
+        platform_type = "Tricopter"
+    elif n_motors == 4 and n_servos == 0:
+        platform_type = "Quadcopter"
+    elif n_motors == 6:
+        platform_type = "Hexacopter"
+    elif n_motors == 8:
+        platform_type = "Octocopter"
+    else:
+        platform_type = f"{n_motors}-motor"
+
+    # ── Auto-detect frame size from craft_name ──
+    craft = config.get("craft_name", "")
+    detected_frame = None
+    if craft:
+        # Look for number that could be frame/prop size (e.g., "NAZGUL 10", "Mark4 7", "Source One V5")
+        # Match patterns like "10", "7", "5" that are likely inches, not version numbers
+        m = re.search(r'\b(\d{1,2})(?:\s*(?:inch|in|"|' + r"'" + r'))?(?:\s|$)', craft, re.I)
+        if m:
+            candidate = int(m.group(1))
+            if 3 <= candidate <= 15:  # plausible frame size range
+                detected_frame = candidate
+
     frame_inches = args.frame
     prop_inches = args.props
     n_blades = args.blades
@@ -2603,69 +2762,96 @@ def main():
     elif prop_inches and not frame_inches:
         frame_inches = prop_inches
 
+    # Auto-detect logic
+    frame_source = "user"
+    if frame_inches is None and detected_frame is not None:
+        frame_inches = detected_frame
+        prop_inches = prop_inches or detected_frame
+        frame_source = "auto"
+    elif frame_inches is not None and detected_frame is not None and frame_inches != detected_frame:
+        frame_source = "conflict"
+
     profile = get_frame_profile(frame_inches, prop_inches, n_blades)
 
-    print(f"\n  ▲ INAV Blackbox Analyzer v{REPORT_VERSION}")
-    print(f"  Loading: {logfile}")
-    if frame_inches or prop_inches:
-        print(f"  Profile: {profile['name']}")
-        if (frame_inches or 5) >= 8:
-            print(f"  ⚠ Large quad mode: thresholds adjusted for {profile['class']} class")
-            print(f"    Acceptable delay: <{profile['ok_delay_ms']}ms | "
-                  f"Overshoot: <{profile['ok_overshoot']}% | "
-                  f"Filter range: {profile['gyro_lpf_range'][0]}-{profile['gyro_lpf_range'][1]}Hz")
-        if frame_inches and prop_inches and frame_inches != prop_inches:
-            print(f"    Frame: {frame_inches}\" (PID thresholds) | Props: {prop_inches}\"×{n_blades} (noise prediction)")
-    else:
-        print(f"  Profile: 5-inch (default — use --frame N --props N --blades N for your setup)")
-
-    raw_params = {}
-    ext = os.path.splitext(logfile)[1].lower()
-
-    # Auto-detect: .txt files might be blackbox binary logs with wrong extension
-    is_blackbox = ext in (".bbl", ".bfl", ".bbs")
-    if ext in (".txt", ".TXT") and not is_blackbox:
+    # ── Estimate battery from vbatref ──
+    vbatref = raw_params.get("vbatref", "")
+    detected_cells = args.cells
+    if not detected_cells and vbatref:
         try:
-            with open(logfile, "rb") as f:
-                first_line = f.readline().decode("utf-8", errors="ignore").strip()
-                if first_line.startswith("H Product:Blackbox") or first_line.startswith("H Field I name:"):
-                    is_blackbox = True
-                    print("  Detected .txt file as blackbox binary log")
+            vref_v = int(vbatref) / 100.0
+            if vref_v > 0:
+                detected_cells = round(vref_v / 4.2)
+                if detected_cells < 1 or detected_cells > 14:
+                    detected_cells = None
         except:
             pass
 
+    # ── Show comprehensive banner ──
+    print(f"\n  ▲ INAV Blackbox Analyzer v{REPORT_VERSION}")
+    print(f"  Loading: {logfile}")
+
+    fw_rev = config.get("firmware_revision", "")
+    fw_date = config.get("firmware_date", "")
+
+    # Aircraft identification banner
+    print(f"\n  {'─'*66}")
+    if craft:
+        print(f"  Aircraft:  {craft}")
+    if fw_rev:
+        fw_str = fw_rev
+        if fw_date:
+            fw_str += f" ({fw_date})"
+        print(f"  Firmware:  {fw_str}")
+    print(f"  Platform:  {platform_type} ({n_motors} motors{f', {n_servos} servos' if n_servos else ''})")
+
+    frame_str = f"{frame_inches}\"" if frame_inches else "5\" (default)"
+    prop_str = f"{prop_inches}\"×{n_blades}-blade" if prop_inches else f"5\"×{n_blades}-blade (default)"
+    if frame_source == "auto":
+        frame_str += f" (detected from craft name)"
+    elif frame_source == "conflict":
+        frame_str += f" (user override)"
+    print(f"  Frame:     {frame_str}")
+    print(f"  Props:     {prop_str}")
+
+    if detected_cells:
+        cell_str = f"{detected_cells}S"
+        if not args.cells and vbatref:
+            cell_str += f" (detected from vbatref={int(vbatref)/100:.1f}V)"
+        print(f"  Battery:   {cell_str}")
+
+    if args.kv:
+        print(f"  Motors:    {args.kv}KV")
+
+    # Profile and thresholds
+    print(f"  Profile:   {profile['name']} ({profile['class']} class)")
+    if (frame_inches or 5) >= 8:
+        print(f"    Delay: <{profile['ok_delay_ms']}ms | OS: <{profile['ok_overshoot']}% | "
+              f"Filters: {profile['gyro_lpf_range'][0]}-{profile['gyro_lpf_range'][1]}Hz")
+
+    # Warnings
+    if frame_source == "conflict":
+        print(f"\n  ⚠ FRAME SIZE CONFLICT: Craft name \"{craft}\" suggests {detected_frame}\" "
+              f"but --frame {args.frame} was specified.")
+        print(f"    Using {args.frame}\" as requested. If this is wrong, the analyzer will use "
+              f"incorrect thresholds.")
+    elif frame_source != "auto" and frame_inches is None:
+        if detected_frame is None and craft:
+            print(f"\n  ⚠ Could not detect frame size from craft name \"{craft}\".")
+            print(f"    Using 5\" defaults. Specify --frame N for accurate thresholds.")
+        elif not craft:
+            print(f"\n  ⚠ No craft name in log headers. Using 5\" defaults.")
+            print(f"    Specify --frame N for accurate thresholds.")
+
+    print(f"  {'─'*66}")
+
+    # ── Decode data ──
     if is_blackbox:
-        print("  Parsing headers...")
-        raw_params = parse_headers_from_bbl(logfile)
-        print(f"  Found {len(raw_params)} header parameters")
+        print(f"\n  Parsing {len(raw_params)} header parameters...")
         print("  Decoding binary log (native)...")
         data = decode_blackbox_native(logfile, raw_params)
     else:
-        # CSV file — check for embedded headers first
-        try:
-            with open(logfile, "r", errors="ignore") as f:
-                for line in f:
-                    if line.strip().startswith("H "):
-                        raw_params = parse_headers_from_bbl(logfile)
-                        if raw_params:
-                            print(f"  Found {len(raw_params)} header parameters in file")
-                        break
-                    elif line.strip() and not line.strip().startswith("#"):
-                        break
-        except:
-            pass
-        print("  Parsing CSV...")
+        print("\n  Parsing CSV...")
         data = parse_csv_log(logfile)
-
-    config = extract_fc_config(raw_params)
-
-    # Show firmware info if available
-    fw_rev = config.get("firmware_revision", "")
-    craft = config.get("craft_name", "")
-    if fw_rev:
-        print(f"  Firmware: {fw_rev}")
-    if craft:
-        print(f"  Craft: {craft}")
 
     sr = data["sample_rate"]
     print(f"  {data['n_rows']:,} rows | {sr:.0f}Hz | {data['time_s'][-1]:.1f}s")
@@ -2698,10 +2884,11 @@ def main():
             print(f"  Filters: {', '.join(filt_parts)}")
 
     # ── RPM prediction ──
-    rpm_range = estimate_rpm_range(args.kv, args.cells)
+    rpm_range = estimate_rpm_range(args.kv, detected_cells or args.cells)
     prop_harmonics = None
     if rpm_range:
-        print(f"  RPM estimate: {rpm_range[0]:,}–{rpm_range[1]:,} ({args.kv}KV × {args.cells}S)")
+        cells_used = detected_cells or args.cells
+        print(f"  RPM estimate: {rpm_range[0]:,}–{rpm_range[1]:,} ({args.kv}KV × {cells_used}S)")
         prop_harmonics = estimate_prop_harmonics(rpm_range, n_blades)
         for h in prop_harmonics:
             print(f"    {h['label']}: {h['min_hz']:.0f}–{h['max_hz']:.0f} Hz ({n_blades}-blade)")
@@ -2755,8 +2942,10 @@ def main():
     if frame_inches: config["_frame_inches"] = frame_inches
     if prop_inches: config["_prop_inches"] = prop_inches
     config["_n_blades"] = n_blades
-    if args.cells: config["_cell_count"] = args.cells
+    config["_cell_count"] = detected_cells or args.cells
     if args.kv: config["_motor_kv"] = args.kv
+    config["_n_motors"] = n_motors
+    config["_platform_type"] = platform_type
 
     sp = save_state(logfile, plan, config, data)
     print(f"  ✓ State: {sp} (use --previous on next run)")
