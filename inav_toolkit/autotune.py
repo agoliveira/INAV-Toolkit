@@ -284,6 +284,7 @@ Examples:
   python3 -m inav_toolkit.autotune --file flight.bbl --frame 7 --blades 2
         """)
 
+    parser.add_argument("--version", action="version", version=f"inav-autotune {REPORT_VERSION}")
     parser.add_argument("port", nargs="?", help="Serial port to FC (e.g., /dev/ttyACM0)")
     parser.add_argument("--file", help="Blackbox log file (.bbl or .csv) to analyze")
     parser.add_argument("--decoder", help="Path to blackbox_decode binary")

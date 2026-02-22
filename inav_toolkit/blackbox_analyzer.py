@@ -1815,6 +1815,379 @@ def analyze_noise(data, axis_name, gyro_key, sr):
     }
 
 
+# ─── Noise Source Fingerprinting ──────────────────────────────────────────────
+
+# Prescriptive remedies for each noise source type
+_NOISE_REMEDIES = {
+    "prop_harmonics": (
+        "Enable RPM filter if available (most effective for prop harmonics). "
+        "Otherwise, ensure dynamic_gyro_notch is enabled and covers the frequency range. "
+        "Check propeller balance, condition, and tightness."
+    ),
+    "motor_imbalance": (
+        "Check all propellers for damage, balance, and correct torque. "
+        "Swap props between motors to isolate the culprit. "
+        "Inspect motor shafts for bends. Soft-mount the FC if not already done."
+    ),
+    "structural": (
+        "Tighten all frame hardware — standoffs, arm bolts, and stack screws. "
+        "Check for cracked arms or loose components. "
+        "Add vibration dampening (soft-mount FC, use O-rings on standoffs)."
+    ),
+    "electrical": (
+        "Route motor wires away from the FC/gyro. "
+        "Add capacitors to the power bus (low-ESR 470μF–1000μF on the ESC pads). "
+        "Check for ESC desync — try increasing motor_pwm_protocol timing or switching to bidirectional DSHOT."
+    ),
+    "bearing_wear": (
+        "Spin each motor by hand — listen and feel for roughness or grinding. "
+        "Replace motors with worn bearings. "
+        "Lubricate if applicable (not for sealed bearings)."
+    ),
+    "propwash": (
+        "This is aerodynamic turbulence, not a hardware fault. "
+        "Reduce D-term LPF to let D respond faster, raise D gain slightly. "
+        "Fly smoother descent profiles or enable feed-forward."
+    ),
+    "motor_noise": (
+        "Enable dynamic_gyro_notch_count = 2 and ensure min_hz covers this range. "
+        "Consider enabling RPM filter for precise motor harmonic tracking. "
+        "Check for ESC timing issues — try bidirectional DSHOT."
+    ),
+    "mechanical": (
+        "Inspect all mechanical connections: camera mount, antenna mount, battery strap. "
+        "Loose items vibrate at mid-frequencies. "
+        "Soft-mount the FC if hard-mounted."
+    ),
+    "vibration": (
+        "Very low frequency — check the battery mounting and overall frame rigidity. "
+        "This is rarely filterable; fix the physical cause. "
+        "Ensure FC mounting is secure and uses vibration dampening."
+    ),
+    "high_freq_noise": (
+        "Likely electrical — add capacitors to the power bus. "
+        "Check for gyro aliasing — ensure gyro_main_lpf_hz is below Nyquist. "
+        "Route signal wires away from power/motor wires."
+    ),
+    "unknown": (
+        "Unable to classify this noise with high confidence. "
+        "Try: tighten all hardware, soft-mount FC, check prop balance, "
+        "add power bus capacitors. Re-analyze after each change to isolate the cause."
+    ),
+}
+
+
+def _noise_remedy(source, freq_hz, power_db, n_axes):
+    """Get prescriptive remedy for a noise source, with severity-specific advice."""
+    base = _NOISE_REMEDIES.get(source, _NOISE_REMEDIES["unknown"])
+
+    # Add severity context
+    if power_db > -5:
+        severity_prefix = "CRITICAL: This noise is severe and likely causing visible oscillation. "
+    elif power_db > -15:
+        severity_prefix = "This is moderate noise that should be addressed. "
+    else:
+        severity_prefix = ""
+
+    return severity_prefix + base
+
+
+def compute_filter_recommendations(noise_results, config, profile=None):
+    """Compute comprehensive filter settings from noise analysis.
+
+    Returns a dict with:
+      - gyro_lpf_hz: recommended gyro LPF cutoff
+      - dterm_lpf_hz: recommended D-term LPF cutoff
+      - dyn_notch_min_hz: recommended dynamic notch minimum
+      - dyn_notch_max_hz: recommended dynamic notch maximum
+      - dyn_notch_count: recommended number of dynamic notch filters
+      - notch_peaks: list of specific peaks that would benefit from notch filtering
+      - crossover_hz: the signal-to-noise crossover frequency per axis
+      - reasoning: human-readable explanation of the recommendations
+    """
+    valid = [nr for nr in noise_results if nr is not None]
+    if not valid:
+        return None
+    if profile is None:
+        profile = get_frame_profile(5)
+
+    n_motors = config.get("_n_motors", 4)
+
+    # Compute LPF recommendations
+    gyro_lpf = compute_recommended_filter(noise_results, 100, "gyro", profile)
+    dterm_lpf = compute_recommended_filter(noise_results, 65, "dterm", profile)
+
+    # Collect all strong peaks for notch recommendations
+    all_peaks = []
+    crossovers = {}
+    for nr in valid:
+        axis = nr["axis"]
+        for p in nr["peaks"]:
+            if p["power_db"] > -20 and p["prominence"] > 8:
+                all_peaks.append({"axis": axis, **p})
+
+        # Record signal-to-noise crossover per axis
+        crossovers[axis] = nr.get("noise_start_freq", 250.0)
+
+    # Sort peaks by prominence (most significant first)
+    all_peaks.sort(key=lambda p: p["prominence"], reverse=True)
+
+    # Dynamic notch range: should cover the strongest motor/prop peaks
+    notch_peaks = []
+    notch_freqs = []
+    for p in all_peaks[:6]:  # Top 6 peaks
+        freq = p["freq_hz"]
+        if 50 <= freq <= 400:  # Notch-filterable range
+            notch_peaks.append(p)
+            notch_freqs.append(freq)
+
+    dyn_notch_min = None
+    dyn_notch_max = None
+    dyn_notch_count = 1
+
+    if notch_freqs:
+        # Set range to cover all significant peaks with margin
+        dyn_notch_min = max(50, int(min(notch_freqs) * 0.7))
+        dyn_notch_max = min(500, int(max(notch_freqs) * 1.3))
+
+        # Number of notches based on number of distinct frequency clusters
+        # Cluster peaks within 30Hz of each other
+        clusters = []
+        for f in sorted(notch_freqs):
+            added = False
+            for c in clusters:
+                if abs(f - c[-1]) < 30:
+                    c.append(f)
+                    added = True
+                    break
+            if not added:
+                clusters.append([f])
+
+        dyn_notch_count = min(len(clusters), 3)  # INAV supports up to ~3
+
+        # Round to nearest 5
+        dyn_notch_min = round(dyn_notch_min / 5) * 5
+        dyn_notch_max = round(dyn_notch_max / 5) * 5
+
+    # Build reasoning
+    reasoning = []
+    if gyro_lpf:
+        reasoning.append(f"Gyro LPF → {gyro_lpf}Hz (signal-to-noise crossover "
+                         f"at {min(crossovers.values()):.0f}Hz with safety margin)")
+    if dterm_lpf:
+        reasoning.append(f"D-term LPF → {dterm_lpf}Hz")
+    if notch_peaks:
+        peak_desc = ", ".join(f"{p['freq_hz']:.0f}Hz" for p in notch_peaks[:3])
+        reasoning.append(f"Dynamic notch should cover peaks at {peak_desc}")
+        if dyn_notch_count > 1:
+            reasoning.append(f"{dyn_notch_count} notch filters recommended for distinct frequency clusters")
+
+    result = {
+        "gyro_lpf_hz": gyro_lpf,
+        "dterm_lpf_hz": dterm_lpf,
+        "notch_peaks": notch_peaks,
+        "crossover_hz": crossovers,
+        "reasoning": reasoning,
+    }
+
+    if dyn_notch_min is not None:
+        result["dyn_notch_min_hz"] = dyn_notch_min
+        result["dyn_notch_max_hz"] = dyn_notch_max
+        result["dyn_notch_count"] = dyn_notch_count
+
+    return result
+
+def fingerprint_noise(noise_results, config, prop_harmonics=None):
+    """Identify the likely source of each noise peak across all axes.
+
+    Classifies peaks as: prop_harmonics, motor_imbalance, structural,
+    electrical, bearing_wear, propwash, or unknown.
+
+    Returns a dict with:
+      - peaks: list of classified peaks (freq, power, source, confidence, detail)
+      - dominant_source: the primary noise issue
+      - summary: human-readable diagnosis
+    """
+    if not any(nr for nr in noise_results if nr is not None):
+        return {"peaks": [], "dominant_source": "none", "summary": "No noise data available."}
+
+    n_motors = config.get("_n_motors", 4)
+
+    # Collect all significant peaks across axes with cross-axis correlation
+    axis_peaks = {}  # freq_bucket -> list of (axis, peak_dict)
+    for nr in noise_results:
+        if nr is None:
+            continue
+        for p in nr["peaks"]:
+            if p["power_db"] < -30:
+                continue
+            # Bucket to nearest 10Hz for cross-axis matching
+            bucket = int(round(p["freq_hz"] / 10) * 10)
+            axis_peaks.setdefault(bucket, []).append((nr["axis"], p))
+
+    classified = []
+
+    for bucket, axis_hits in sorted(axis_peaks.items()):
+        freq = np.mean([p["freq_hz"] for _, p in axis_hits])
+        power = max(p["power_db"] for _, p in axis_hits)
+        prominence = max(p["prominence"] for _, p in axis_hits)
+        axes_affected = list(set(a for a, _ in axis_hits))
+        n_axes = len(axes_affected)
+
+        source = "unknown"
+        confidence = "low"
+        detail = ""
+
+        # 1. Match against predicted prop harmonics (most reliable when available)
+        if prop_harmonics:
+            for h in prop_harmonics:
+                if h["min_hz"] * 0.85 <= freq <= h["max_hz"] * 1.15:
+                    source = "prop_harmonics"
+                    confidence = "high"
+                    detail = (f"{h['label']} (predicted {h['min_hz']:.0f}-{h['max_hz']:.0f}Hz "
+                              f"from motor KV and blade count)")
+                    break
+
+        # 2. Motor imbalance: low frequency, scales with motor count
+        #    One-per-rev vibration at motor RPM/60, shows as broad hump
+        if source == "unknown" and 15 <= freq <= 80:
+            if n_axes >= 2:
+                source = "motor_imbalance"
+                confidence = "medium"
+                detail = (f"Low-frequency vibration ({freq:.0f}Hz) on {n_axes} axes - "
+                          f"consistent with prop/motor imbalance or bent shaft")
+            else:
+                source = "propwash"
+                confidence = "medium"
+                detail = (f"Low-frequency energy ({freq:.0f}Hz) on {axes_affected[0]} axis - "
+                          f"likely propwash turbulence during throttle changes")
+
+        # 3. Structural resonance: 40-150Hz, equal amplitude across all 3 axes
+        if source == "unknown" and 40 <= freq <= 150 and n_axes >= 3:
+            source = "structural"
+            confidence = "medium"
+            detail = (f"Resonance at {freq:.0f}Hz present on all axes equally - "
+                      f"frame, standoff, or stack vibration")
+
+        # 4. Electrical noise: sharp narrow peaks, often at fixed frequencies
+        #    High prominence relative to power = very narrow spike
+        if source == "unknown" and freq > 150 and prominence > 12:
+            source = "electrical"
+            confidence = "medium"
+            detail = (f"Sharp spike at {freq:.0f}Hz (prominence={prominence:.0f}dB) - "
+                      f"likely ESC switching noise, gyro sampling alias, or power supply ripple")
+
+        # 5. Bearing wear: broad energy hump, moderate prominence, 100-500Hz
+        if source == "unknown" and 100 <= freq <= 500 and prominence < 8 and power > -20:
+            if n_axes >= 2:
+                source = "bearing_wear"
+                confidence = "low"
+                detail = (f"Broad noise around {freq:.0f}Hz on {n_axes} axes - "
+                          f"possible motor bearing wear or loose hardware")
+
+        # 6. Frequency-range fallback classification
+        if source == "unknown":
+            if freq < 20:
+                source = "vibration"
+                detail = f"Very low frequency ({freq:.0f}Hz) - frame flex or mounting vibration"
+            elif freq < 100:
+                source = "mechanical"
+                detail = f"Mid-low frequency ({freq:.0f}Hz) - mechanical vibration source"
+            elif freq < 300:
+                source = "motor_noise"
+                detail = f"Motor frequency range ({freq:.0f}Hz) - motor or prop related noise"
+            else:
+                source = "high_freq_noise"
+                detail = f"High frequency ({freq:.0f}Hz) - electrical or resonance artifact"
+            confidence = "low"
+
+        classified.append({
+            "freq_hz": float(freq),
+            "power_db": float(power),
+            "prominence": float(prominence),
+            "axes": axes_affected,
+            "n_axes": n_axes,
+            "source": source,
+            "confidence": confidence,
+            "detail": detail,
+            "remedy": _noise_remedy(source, freq, power, n_axes),
+        })
+
+    # Determine dominant noise source (highest power classified peak)
+    dominant = "clean"
+    summary_parts = []
+
+    if classified:
+        by_power = sorted(classified, key=lambda p: p["power_db"], reverse=True)
+        dominant = by_power[0]["source"]
+
+        # Group by source for summary
+        sources = {}
+        for p in classified:
+            sources.setdefault(p["source"], []).append(p)
+
+        source_labels = {
+            "prop_harmonics": "Propeller harmonics",
+            "motor_imbalance": "Motor/prop imbalance",
+            "structural": "Frame resonance",
+            "electrical": "Electrical interference",
+            "bearing_wear": "Motor bearing wear",
+            "propwash": "Propwash",
+            "motor_noise": "Motor noise",
+            "mechanical": "Mechanical vibration",
+            "vibration": "Low-frequency vibration",
+            "high_freq_noise": "High-frequency noise",
+            "unknown": "Unidentified noise",
+        }
+
+        for src, peaks in sources.items():
+            label = source_labels.get(src, src)
+            freqs_str = ", ".join(f"{p['freq_hz']:.0f}Hz" for p in peaks[:3])
+            severity = "strong" if any(p["power_db"] > -10 for p in peaks) else \
+                       "moderate" if any(p["power_db"] > -20 for p in peaks) else "mild"
+            summary_parts.append(f"{label} ({severity}) at {freqs_str}")
+
+    summary = "; ".join(summary_parts) if summary_parts else "Noise floor is clean - no dominant noise sources detected."
+
+    return {
+        "peaks": classified,
+        "dominant_source": dominant,
+        "summary": summary,
+    }
+
+
+def format_noise_fingerprint_terminal(fp, colors=None):
+    """Format noise fingerprint results for terminal display."""
+    if not fp["peaks"]:
+        return ""
+    R, B, C, G, Y, RED, DIM = colors or _colors()
+
+    lines = []
+    lines.append(f"\n  {B}NOISE SOURCES:{R}")
+
+    source_icons = {
+        "prop_harmonics": "⚙", "motor_imbalance": "⚖", "structural": "🔧",
+        "electrical": "⚡", "bearing_wear": "⊚", "propwash": "↻",
+        "motor_noise": "⚙", "mechanical": "~", "vibration": "~",
+        "high_freq_noise": "⚡", "unknown": "?",
+    }
+
+    for p in sorted(fp["peaks"], key=lambda x: x["power_db"], reverse=True):
+        icon = source_icons.get(p["source"], "?")
+        power_color = RED if p["power_db"] > -10 else Y if p["power_db"] > -20 else DIM
+        conf = f" [{p['confidence']}]" if p["confidence"] != "high" else ""
+        axes_str = "/".join(p["axes"])
+        lines.append(
+            f"    {icon} {power_color}{p['freq_hz']:.0f}Hz{R} ({p['power_db']:.0f}dB, {axes_str}) "
+            f"{DIM}{p['source'].replace('_', ' ')}{conf}{R}")
+        if p["detail"]:
+            lines.append(f"      {DIM}{p['detail']}{R}")
+        if p.get("remedy"):
+            lines.append(f"      {G}→ {p['remedy']}{R}")
+
+    return "\n".join(lines)
+
+
 def measure_tracking_delay_xcorr(sp, gy, sr, max_delay_ms=200):
     """Measure average tracking delay using cross-correlation.
     This is robust against residual tracking error, overshoot, and noise.
@@ -2169,17 +2542,81 @@ def analyze_dterm_noise(data, sr):
 # ─── Prescriptive Recommendation Engine ──────────────────────────────────────
 
 def compute_recommended_filter(noise_results, current_hz, filter_type="gyro", profile=None):
-    noise_starts = [nr["noise_start_freq"] for nr in noise_results if nr is not None]
-    if not noise_starts:
+    """Compute optimal LPF cutoff from actual noise spectrum.
+
+    Strategy:
+    1. Find the signal-to-noise crossover: where the smoothed PSD rises above
+       the "noise floor threshold" (signal band ends, noise band begins).
+    2. Apply a safety margin below that crossover so the filter rolls off
+       before noise starts.
+    3. Avoid placing the cutoff on or near a noise peak (would amplify it).
+    4. Clamp to the frame profile's min/max range.
+
+    Returns the recommended Hz value (int, rounded to 5), or None.
+    """
+    valid = [nr for nr in noise_results if nr is not None]
+    if not valid:
         return None
     if profile is None:
         profile = get_frame_profile(5)
+
     if filter_type == "gyro":
         min_cutoff, max_cutoff = profile["gyro_lpf_range"]
+        noise_threshold_db = -30  # dB above which we consider it "noise"
     else:
         min_cutoff, max_cutoff = profile["dterm_lpf_range"]
-    ideal = min(noise_starts) * profile["filter_safety"]
-    return round(int(np.clip(ideal, min_cutoff, max_cutoff)) / 5) * 5
+        noise_threshold_db = -35  # D-term is more sensitive
+
+    safety = profile["filter_safety"]
+    crossover_freqs = []
+
+    for nr in valid:
+        freqs = nr["freqs"]
+        psd_db = nr["psd_db"]
+
+        # Smooth the spectrum to find the trend (not individual peaks)
+        window = max(1, min(30, len(psd_db) // 10))
+        smoothed = np.convolve(psd_db, np.ones(window) / window, mode="same")
+
+        # Find where smoothed PSD first rises above threshold in the noise band
+        # Start searching above 20Hz (below is just DC/drift)
+        search_mask = freqs >= 20
+        search_freqs = freqs[search_mask]
+        search_psd = smoothed[search_mask]
+
+        # Find the crossover: first frequency where PSD > threshold
+        above = search_psd > noise_threshold_db
+        if np.any(above):
+            crossover_idx = np.argmax(above)
+            crossover_freqs.append(float(search_freqs[crossover_idx]))
+        else:
+            # Spectrum is clean — noise never rises above threshold
+            crossover_freqs.append(float(freqs[-1]))
+
+    if not crossover_freqs:
+        return None
+
+    # Use the worst (lowest) crossover across all axes
+    worst_crossover = min(crossover_freqs)
+
+    # Apply safety margin: place cutoff below the crossover
+    ideal = worst_crossover * safety
+
+    # Avoid placing cutoff near a noise peak (within ±15Hz of any strong peak)
+    all_peaks = []
+    for nr in valid:
+        for p in nr["peaks"]:
+            if p["power_db"] > -20:  # Only avoid strong peaks
+                all_peaks.append(p["freq_hz"])
+
+    # If ideal lands near a peak, push it lower
+    for peak_freq in sorted(all_peaks):
+        if abs(ideal - peak_freq) < 15:
+            ideal = min(ideal, peak_freq - 20)
+
+    # Clamp and round
+    result = round(int(np.clip(ideal, min_cutoff, max_cutoff)) / 5) * 5
+    return result
 
 
 def compute_recommended_pid(pid_result, current_p, current_i, current_d, profile=None):
@@ -4063,14 +4500,22 @@ def generate_narrative(plan, pid_results, motor_analysis, noise_results, config,
 
     # Noise
     noise_score = plan["scores"].get("noise")
+    noise_fp = plan.get("noise_fingerprint")
     if noise_score is not None:
         if noise_score >= 90:
             parts.append("Gyro noise levels are clean - no major vibration issues detected.")
         elif noise_score >= 60:
-            parts.append("There is moderate noise in the gyro signal. Lowering the gyro lowpass filter or enabling RPM filtering would help.")
+            if noise_fp and noise_fp["peaks"]:
+                parts.append(f"There is moderate noise in the gyro signal. {noise_fp['summary']}.")
+            else:
+                parts.append("There is moderate noise in the gyro signal. Lowering the gyro lowpass filter or enabling RPM filtering would help.")
         else:
-            parts.append("The gyro signal is noisy - this often comes from propeller vibrations, loose mounting, or motor issues. "
-                        "Addressing noise should be the top priority before fine-tuning PIDs.")
+            if noise_fp and noise_fp["peaks"]:
+                parts.append(f"The gyro signal is noisy. Primary sources identified: {noise_fp['summary']}. "
+                            "Addressing noise should be the top priority before fine-tuning PIDs.")
+            else:
+                parts.append("The gyro signal is noisy - this often comes from propeller vibrations, loose mounting, or motor issues. "
+                            "Addressing noise should be the top priority before fine-tuning PIDs.")
 
     # Motors
     if motor_analysis:
@@ -4090,7 +4535,7 @@ def generate_narrative(plan, pid_results, motor_analysis, noise_results, config,
 
 # ─── Terminal Output ──────────────────────────────────────────────────────────
 
-def print_terminal_report(plan, noise_results, pid_results, motor_analysis, config, data, show_narrative=True, profile=None):
+def print_terminal_report(plan, noise_results, pid_results, motor_analysis, config, data, show_narrative=True, profile=None, noise_fp=None):
     R, B, C, G, Y, RED, DIM = _colors()
     scores = plan["scores"]
     overall = scores["overall"]
@@ -4153,6 +4598,11 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
         for item in info_items:
             print(f"  {DIM}ℹ {item['text']}{R}")
             print(f"    {DIM}{item['detail']}{R}")
+
+    # Noise source fingerprinting
+    if noise_fp and noise_fp["peaks"]:
+        fp_text = format_noise_fingerprint_terminal(noise_fp, (R, B, C, G, Y, RED, DIM))
+        print(fp_text)
 
     actions = plan["actions"]
     active_actions = [a for a in actions if not a.get("deferred")]
@@ -4649,6 +5099,159 @@ footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-
 </div></body></html>"""
 
 
+def generate_trend_report(progression, craft_name, output_path):
+    """Generate a standalone HTML trend report from flight progression data.
+
+    Args:
+        progression: dict from FlightDB.get_progression() with 'flights', 'trend', 'changes'
+        craft_name: Name of the craft
+        output_path: Where to save the HTML file
+    """
+    flights = progression.get("flights", [])
+    if not flights:
+        return
+
+    trend = progression.get("trend", "insufficient")
+    changes = progression.get("changes", [])
+
+    # Build chart data as JSON arrays
+    labels = []
+    scores = []
+    noise_scores = []
+    pid_scores = []
+    motor_scores = []
+    osc_scores = []
+
+    for i, f in enumerate(flights):
+        labels.append(f"Flight {i+1}")
+        scores.append(f.get("score") or 0)
+        noise_scores.append(f.get("noise") or 0)
+        pid_scores.append(f.get("pid") or 0)
+        motor_scores.append(f.get("motor") or 0)
+        osc_scores.append(f.get("osc") or 0)
+
+    # Trend indicator
+    trend_icon = {"improving": "↑", "stable": "→", "degrading": "↓"}.get(trend, "?")
+    trend_color = {"improving": "#9ece6a", "stable": "#e0af68", "degrading": "#f7768e"}.get(trend, "#7aa2f7")
+
+    changes_html = ""
+    if changes:
+        changes_html = "<ul>" + "".join(f"<li>{c}</li>" for c in changes) + "</ul>"
+
+    # Flight history table
+    table_rows = ""
+    for i, f in enumerate(flights):
+        sc = f.get("score") or 0
+        sc_color = "#9ece6a" if sc >= 85 else "#e0af68" if sc >= 60 else "#f7768e"
+        dur = f.get("duration") or 0
+        table_rows += f"""<tr>
+            <td>Flight {i+1}</td>
+            <td style="color:{sc_color};font-weight:bold">{sc:.0f}</td>
+            <td>{f.get('noise') or 0:.0f}</td>
+            <td>{f.get('pid') or 0:.0f}</td>
+            <td>{f.get('motor') or 0:.0f}</td>
+            <td>{f.get('osc') or 0:.0f}</td>
+            <td>{dur:.0f}s</td>
+            <td>{f.get('verdict', '')}</td>
+        </tr>"""
+
+    import json as _json
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>Tuning Progression — {craft_name}</title>
+<style>
+  body {{ background: #1a1b26; color: #c0caf5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; }}
+  .container {{ max-width: 900px; margin: 0 auto; }}
+  h1 {{ color: #7aa2f7; margin-bottom: 5px; }}
+  h2 {{ color: #bb9af7; border-bottom: 1px solid #3b4261; padding-bottom: 8px; }}
+  .trend {{ display: inline-block; padding: 4px 12px; border-radius: 6px;
+            background: {trend_color}22; color: {trend_color}; font-weight: bold; font-size: 1.1em; }}
+  .changes {{ background: #24283b; padding: 12px 16px; border-radius: 8px; margin: 12px 0; }}
+  .changes li {{ margin: 4px 0; }}
+  canvas {{ background: #24283b; border-radius: 8px; padding: 10px; margin: 16px 0; }}
+  table {{ width: 100%; border-collapse: collapse; margin: 16px 0; }}
+  th, td {{ padding: 8px 12px; text-align: center; border-bottom: 1px solid #3b4261; }}
+  th {{ color: #7aa2f7; font-size: 0.85em; text-transform: uppercase; }}
+  footer {{ color: #565f89; font-size: 0.8em; margin-top: 30px; text-align: center; }}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head><body>
+<div class="container">
+<h1>Tuning Progression — {craft_name}</h1>
+<p class="trend">{trend_icon} {trend.title()}</p>
+<span style="color:#565f89; margin-left:12px">{len(flights)} flights analyzed</span>
+
+{"<div class='changes'><strong>Latest changes:</strong>" + changes_html + "</div>" if changes_html else ""}
+
+<h2>Score Progression</h2>
+<canvas id="scoreChart" height="250"></canvas>
+
+<h2>Component Scores</h2>
+<canvas id="componentChart" height="250"></canvas>
+
+<h2>Flight History</h2>
+<table>
+<tr><th>Flight</th><th>Score</th><th>Noise</th><th>PID</th><th>Motor</th><th>Osc</th><th>Duration</th><th>Verdict</th></tr>
+{table_rows}
+</table>
+
+<script>
+const labels = {_json.dumps(labels)};
+const scores = {_json.dumps(scores)};
+const noise = {_json.dumps(noise_scores)};
+const pid = {_json.dumps(pid_scores)};
+const motor = {_json.dumps(motor_scores)};
+const osc = {_json.dumps(osc_scores)};
+
+const gridColor = '#3b4261';
+const axisOpts = {{ ticks: {{ color: '#565f89' }}, grid: {{ color: gridColor }} }};
+
+new Chart(document.getElementById('scoreChart'), {{
+  type: 'line',
+  data: {{
+    labels: labels,
+    datasets: [{{
+      label: 'Overall Score',
+      data: scores,
+      borderColor: '#7aa2f7',
+      backgroundColor: '#7aa2f722',
+      fill: true,
+      tension: 0.3,
+      pointRadius: 5,
+      pointBackgroundColor: scores.map(s => s >= 85 ? '#9ece6a' : s >= 60 ? '#e0af68' : '#f7768e'),
+    }}]
+  }},
+  options: {{
+    scales: {{ y: {{ ...axisOpts, min: 0, max: 100 }}, x: axisOpts }},
+    plugins: {{ legend: {{ labels: {{ color: '#c0caf5' }} }} }}
+  }}
+}});
+
+new Chart(document.getElementById('componentChart'), {{
+  type: 'line',
+  data: {{
+    labels: labels,
+    datasets: [
+      {{ label: 'Noise',  data: noise,  borderColor: '#bb9af7', tension: 0.3 }},
+      {{ label: 'PID',    data: pid,    borderColor: '#7dcfff', tension: 0.3 }},
+      {{ label: 'Motor',  data: motor,  borderColor: '#e0af68', tension: 0.3 }},
+      {{ label: 'Oscillation', data: osc, borderColor: '#f7768e', tension: 0.3 }},
+    ]
+  }},
+  options: {{
+    scales: {{ y: {{ ...axisOpts, min: 0, max: 100 }}, x: axisOpts }},
+    plugins: {{ legend: {{ labels: {{ color: '#c0caf5' }} }} }}
+  }}
+}});
+</script>
+
+<footer>INAV Toolkit v{REPORT_VERSION} — Trend Report</footer>
+</div></body></html>"""
+
+    with open(output_path, "w") as f:
+        f.write(html)
+
+
 def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm_results, config, data, charts, nav_results=None):
     scores = plan["scores"]
     overall = scores["overall"]
@@ -4880,6 +5483,7 @@ def count_blackbox_logs(filepath):
 def main():
     parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.14.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
                         help="Blackbox log (.bbl/.bfl/.bbs/.txt or decoded .csv). "
                              "Optional when --device is used.")
@@ -4931,6 +5535,9 @@ def main():
                         help="Path to flight database (default: ./inav_flights.db)")
     parser.add_argument("--history", action="store_true",
                         help="Show flight history and progression for the craft, then exit.")
+    parser.add_argument("--trend", metavar="FILE", nargs="?", const="auto",
+                        help="Generate HTML trend report showing score progression across flights. "
+                             "Optionally specify output filename (default: <craft>_trend.html).")
     args = parser.parse_args()
 
     if args.no_color:
@@ -5097,7 +5704,7 @@ def main():
                 print(f"  Warning: Diff file not found: {diff_file}")
 
     # ── History mode: show progression and exit ──
-    if args.history:
+    if args.history or args.trend:
         try:
             from inav_toolkit.flight_db import FlightDB
         except ImportError:
@@ -5107,7 +5714,14 @@ def main():
         rp = parse_headers_from_bbl(logfile) if os.path.isfile(logfile) else {}
         cfg = extract_fc_config(rp)
         craft = cfg.get("craft_name", "unknown")
-        _print_flight_history(db, craft)
+        html_path = None
+        if args.trend:
+            if args.trend == "auto":
+                safe_name = craft.replace(" ", "_").replace("/", "_")
+                html_path = f"{safe_name}_trend.html"
+            else:
+                html_path = args.trend
+        _print_flight_history(db, craft, html_path=html_path)
         db.close()
         sys.exit(0)
 
@@ -5436,8 +6050,8 @@ def _print_config_review(diff_raw, config, frame_inches, plan):
     print(f"{B}{Y}{'─' * 70}{R}")
 
 
-def _print_flight_history(db, craft):
-    """Print flight history table for a craft."""
+def _print_flight_history(db, craft, html_path=None):
+    """Print flight history table for a craft, optionally generate HTML trend report."""
     R, B, C, G, Y, RED, DIM = _colors()
     history = db.get_craft_history(craft, limit=20)
     if not history:
@@ -5472,6 +6086,182 @@ def _print_flight_history(db, craft):
             print(f"    {ch}")
 
     print(f"{B}{C}{'═' * 70}{R}\n")
+
+    # Generate HTML trend report if requested
+    if html_path:
+        _generate_trend_html(history, craft, prog, html_path)
+
+
+def _generate_trend_html(history, craft, progression, output_path):
+    """Generate an HTML trend report with embedded SVG charts."""
+    # Build chronological flight data (exclude ground-only)
+    flights = [f for f in reversed(history)
+               if f.get("verdict") != "GROUND_ONLY" and f.get("overall_score") is not None]
+
+    if len(flights) < 2:
+        print(f"  Need at least 2 scored flights for a trend report (have {len(flights)}).")
+        return
+
+    # Build data arrays
+    labels = [f["timestamp"][:10] for f in flights]
+    scores = [f["overall_score"] or 0 for f in flights]
+    noise = [f["noise_score"] or 0 for f in flights]
+    pid = [f["pid_score"] or 0 for f in flights]
+    osc = [f["osc_score"] or 0 for f in flights]
+    motor = [f["motor_score"] or 0 for f in flights]
+
+    # Build per-axis PID data
+    axis_p = {"Roll": [], "Pitch": [], "Yaw": []}
+    axis_d = {"Roll": [], "Pitch": [], "Yaw": []}
+    for f in flights:
+        for axis in ["Roll", "Pitch", "Yaw"]:
+            ax_data = next((a for a in f.get("axes", []) if a["axis"] == axis), None)
+            axis_p[axis].append(ax_data["p_value"] if ax_data and ax_data.get("p_value") else None)
+            axis_d[axis].append(ax_data["d_value"] if ax_data and ax_data.get("d_value") else None)
+
+    n = len(flights)
+
+    def svg_line_chart(title, series, width=700, height=250):
+        """Generate SVG line chart with multiple series."""
+        # series = [(label, values, color), ...]
+        margin = {"top": 30, "right": 120, "bottom": 50, "left": 50}
+        w = width - margin["left"] - margin["right"]
+        h = height - margin["top"] - margin["bottom"]
+
+        all_vals = [v for _, vals, _ in series for v in vals if v is not None]
+        if not all_vals:
+            return ""
+        y_min = max(0, min(all_vals) - 5)
+        y_max = min(100, max(all_vals) + 5)
+        if y_max - y_min < 10:
+            y_max = y_min + 10
+
+        def x(i):
+            return margin["left"] + (i / max(1, n - 1)) * w if n > 1 else margin["left"] + w / 2
+
+        def y(v):
+            return margin["top"] + h - ((v - y_min) / (y_max - y_min)) * h
+
+        svg = [f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">']
+        svg.append(f'<text x="{width//2}" y="18" text-anchor="middle" fill="#ccc" font-size="14">{title}</text>')
+
+        # Grid lines
+        for tick in range(int(y_min), int(y_max) + 1, 10):
+            yp = y(tick)
+            svg.append(f'<line x1="{margin["left"]}" y1="{yp}" x2="{margin["left"]+w}" y2="{yp}" stroke="#333" stroke-dasharray="3"/>')
+            svg.append(f'<text x="{margin["left"]-5}" y="{yp+4}" text-anchor="end" fill="#888" font-size="11">{tick}</text>')
+
+        # X labels
+        step = max(1, n // 8)
+        for i in range(0, n, step):
+            svg.append(f'<text x="{x(i)}" y="{height-10}" text-anchor="middle" fill="#888" font-size="10">{labels[i]}</text>')
+
+        # Lines
+        for label, vals, color in series:
+            points = [(x(i), y(v)) for i, v in enumerate(vals) if v is not None]
+            if len(points) < 2:
+                continue
+            path = " ".join(f"{'M' if j==0 else 'L'}{px:.1f},{py:.1f}" for j, (px, py) in enumerate(points))
+            svg.append(f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2"/>')
+            # Dots
+            for px, py in points:
+                svg.append(f'<circle cx="{px}" cy="{py}" r="3" fill="{color}"/>')
+            # Legend
+            ly = margin["top"] + 15 + series.index((label, vals, color)) * 18
+            lx = margin["left"] + w + 10
+            svg.append(f'<line x1="{lx}" y1="{ly}" x2="{lx+15}" y2="{ly}" stroke="{color}" stroke-width="2"/>')
+            svg.append(f'<text x="{lx+20}" y="{ly+4}" fill="#ccc" font-size="11">{label}</text>')
+
+        svg.append('</svg>')
+        return "\n".join(svg)
+
+    # Build charts
+    score_chart = svg_line_chart("Overall Score", [
+        ("Overall", scores, "#4fc3f7"),
+    ])
+    breakdown_chart = svg_line_chart("Score Breakdown", [
+        ("Noise", noise, "#81c784"),
+        ("PID", pid, "#ffb74d"),
+        ("Oscillation", osc, "#e57373"),
+        ("Motor", motor, "#ba68c8"),
+    ])
+
+    # PID value chart
+    pid_series = []
+    colors_p = {"Roll": "#4fc3f7", "Pitch": "#81c784", "Yaw": "#ffb74d"}
+    for axis in ["Roll", "Pitch", "Yaw"]:
+        if any(v is not None for v in axis_p[axis]):
+            pid_series.append((f"{axis} P", axis_p[axis], colors_p[axis]))
+    pid_chart = svg_line_chart("P-gain Evolution", pid_series) if pid_series else ""
+
+    # Trend text
+    trend = progression.get("trend", "insufficient")
+    trend_icon = {"improving": "↑ Improving", "stable": "→ Stable",
+                  "degrading": "↓ Degrading"}.get(trend, "? Insufficient data")
+    changes_html = ""
+    if progression.get("changes"):
+        changes_html = "<ul>" + "".join(f"<li>{ch}</li>" for ch in progression["changes"]) + "</ul>"
+
+    # Flight table
+    table_rows = ""
+    for i, f in enumerate(flights):
+        sc = f["overall_score"]
+        sc_class = "good" if (sc or 0) >= 85 else "ok" if (sc or 0) >= 60 else "bad"
+        table_rows += f"""<tr>
+            <td>{i+1}</td>
+            <td>{f['timestamp'][:16].replace('T',' ')}</td>
+            <td>{f['duration_s']:.0f}s</td>
+            <td class="{sc_class}">{sc:.0f}</td>
+            <td>{f['noise_score']:.0f if f['noise_score'] else '-'}</td>
+            <td>{f['pid_score']:.0f if f['pid_score'] else 'N/A'}</td>
+            <td>{f['verdict'] or '?'}</td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Tuning Trend - {craft}</title>
+<style>
+body {{ background:#1a1a2e; color:#ccc; font-family:system-ui; max-width:800px; margin:0 auto; padding:20px; }}
+h1 {{ color:#4fc3f7; border-bottom:1px solid #333; padding-bottom:10px; }}
+h2 {{ color:#81c784; margin-top:30px; }}
+.trend {{ font-size:1.4em; padding:15px; border-radius:8px; margin:15px 0;
+          background:#222; border-left:4px solid {{ 'improving':'#81c784','stable':'#ffb74d','degrading':'#e57373' }}.get(trend,'#888'); }}
+table {{ width:100%; border-collapse:collapse; margin:15px 0; }}
+th, td {{ padding:8px 12px; text-align:right; border-bottom:1px solid #333; }}
+th {{ color:#4fc3f7; text-align:right; }}
+td:first-child, th:first-child {{ text-align:center; }}
+td:nth-child(2), th:nth-child(2) {{ text-align:left; }}
+.good {{ color:#81c784; font-weight:bold; }}
+.ok {{ color:#ffb74d; }}
+.bad {{ color:#e57373; font-weight:bold; }}
+svg {{ width:100%; height:auto; background:#222; border-radius:8px; margin:10px 0; }}
+ul {{ color:#aaa; }}
+footer {{ text-align:center; color:#555; margin-top:30px; padding:10px; border-top:1px solid #333; }}
+</style></head><body>
+<h1>Tuning Trend: {craft}</h1>
+<div class="trend">{trend_icon}</div>
+{changes_html}
+
+<h2>Score Progression</h2>
+{score_chart}
+
+<h2>Component Breakdown</h2>
+{breakdown_chart}
+
+{f'<h2>PID Progression</h2>{pid_chart}' if pid_chart else ''}
+
+<h2>Flight Log</h2>
+<table>
+<tr><th>#</th><th>Date</th><th>Dur</th><th>Score</th><th>Noise</th><th>PID</th><th>Verdict</th></tr>
+{table_rows}
+</table>
+
+<footer>INAV Blackbox Analyzer v{REPORT_VERSION} - {n} flights analyzed</footer>
+</body></html>"""
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"  {G}✓{R} Trend report: {output_path}")
 
 
 def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
@@ -5804,6 +6594,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
 
     hover_osc = detect_hover_oscillation(data, sr)
     noise_results = [analyze_noise(data, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
+    noise_fp = fingerprint_noise(noise_results, config, prop_harmonics)
     pid_results = [analyze_pid_response(data, i, sr) for i in range(3)]
     motor_analysis = analyze_motors(data, sr, config)
     dterm_results = analyze_dterm_noise(data, sr)
@@ -5816,6 +6607,14 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     plan = generate_action_plan(noise_results, pid_results, motor_analysis, dterm_results,
                                  config, data, profile, phase_lag, motor_response,
                                  rpm_range, prop_harmonics, hover_osc)
+    plan["noise_fingerprint"] = noise_fp
+
+    # Enrich filter action reasons with noise source identification
+    if noise_fp and noise_fp["peaks"] and noise_fp["dominant_source"] != "clean":
+        fp_summary = noise_fp["summary"]
+        for action in plan["actions"]:
+            if action.get("category") == "Filter" and "noise" in action.get("reason", "").lower():
+                action["reason"] += f". Sources: {fp_summary}"
 
     # ── Summary-only mode: store in DB and return summary ──
     if summary_only:
@@ -5849,7 +6648,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
 
     if not args.no_terminal:
         print_terminal_report(plan, noise_results, pid_results, motor_analysis, config, data,
-                              show_narrative=not args.no_narrative, profile=profile)
+                              show_narrative=not args.no_narrative, profile=profile, noise_fp=noise_fp)
 
     # ── Config review from diff (if available) ──
     # Runs parameter analyzer checks on the FC's current config.

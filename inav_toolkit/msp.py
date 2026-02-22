@@ -1003,6 +1003,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="INAV MSP - Download blackbox logs directly from flight controller")
+    parser.add_argument("--version", action="version", version=f"inav-msp {VERSION}")
     parser.add_argument("--device", "-d", default="auto",
                         help="Serial port or 'auto' to scan. "
                              "Examples: auto, /dev/ttyACM0 (Linux), "

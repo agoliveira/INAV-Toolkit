@@ -32,6 +32,9 @@ dependencies = [
     "pyserial>=3.5",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
 [project.urls]
 Homepage = "https://github.com/iNavFlight/inav-toolkit"
 Issues = "https://github.com/iNavFlight/inav-toolkit/issues"
@@ -44,3 +47,7 @@ inav-msp = "inav_toolkit.msp:main"
 
 [tool.setuptools.packages.find]
 include = ["inav_toolkit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

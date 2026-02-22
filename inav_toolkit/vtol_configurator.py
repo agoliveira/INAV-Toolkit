@@ -810,6 +810,7 @@ def main():
             Checks mixer profiles, motor/servo mixing, mode assignments,
             and transition settings for common mistakes.
         """))
+    parser.add_argument("--version", action="version", version=f"inav-vtol {VERSION}")
     parser.add_argument("difffile", help="INAV `diff all` output file")
     parser.add_argument("--json", action="store_true",
                         help="Output findings as JSON")

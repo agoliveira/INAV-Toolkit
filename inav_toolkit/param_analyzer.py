@@ -1780,6 +1780,7 @@ def main():
             Supported frame sizes: 5, 7, 10, 12, 15 inches
             Supported voltages: 4S, 6S, 8S, 12S
         """))
+    parser.add_argument("--version", action="version", version=f"inav-params {VERSION}")
     parser.add_argument("difffile", nargs="?", default=None,
                         help="INAV `diff all` output (.txt file or stdin)")
     parser.add_argument("--frame", type=int, metavar="INCHES",

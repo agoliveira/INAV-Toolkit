@@ -1025,6 +1025,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(
         description=f"INAV Toolkit v{VERSION} - Guided Session Manager")
+    parser.add_argument("--version", action="version", version=f"inav-toolkit {VERSION}")
     parser.add_argument("--device", metavar="PORT", default=None,
                         help="Serial port or 'auto' (e.g., /dev/ttyACM0, COM3)")
     parser.add_argument("--no-color", action="store_true",
