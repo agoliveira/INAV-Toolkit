@@ -6,10 +6,9 @@ A suite of Python tools for analyzing, validating, and tuning INAV flight contro
 
 | Tool | Purpose |
 |------|---------|
-| **Blackbox Analyzer** | Decode blackbox logs, analyze PID performance, detect oscillation, recommend tuning changes |
+| **Blackbox Analyzer** | Decode blackbox logs, analyze PID/noise/motor performance, recommend tuning changes. `--nav` mode for compass/GPS/baro health |
 | **Parameter Analyzer** | Validate `diff all` configs for safety, filter, PID, and navigation issues |
 | **VTOL Configurator** | Validate VTOL mixer profiles, motor/servo mixing, and transition setup |
-| **Flight Database** | SQLite storage for flight history, progression tracking across tuning sessions |
 | **MSP Communication** | Direct FC communication - download blackbox, pull config, identify hardware |
 
 ## Quick Start
