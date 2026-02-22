@@ -2561,12 +2561,13 @@ def analyze_baro_quality(data, sr):
     score = 100
 
     # ─── Detrend altitude (remove intentional climbs/descents) ───
-    # Use a very low-pass filter to get the trend, then subtract
-    from scipy.signal import butter, sosfilt
+    # Use a very low-pass filter to get the trend, then subtract.
+    # sosfiltfilt is zero-phase (no startup transient).
+    from scipy.signal import butter, sosfiltfilt
     try:
         if sr > 2:
             sos = butter(2, 0.5 / (sr / 2), btype='low', output='sos')
-            trend = sosfilt(sos, alt)
+            trend = sosfiltfilt(sos, alt)
             residual = alt - trend
         else:
             residual = alt - np.mean(alt)
