@@ -8,19 +8,29 @@ This works on any flight type including manual/acro. You don't need to fly posho
 
 ## Usage
 
+### Recommended: Direct from FC
+
+```bash
+# Download blackbox + pull config + nav analysis (preferred)
+python3 inav_blackbox_analyzer.py --device auto --nav
+```
+
+This is the best workflow. The analyzer connects to the FC, downloads the blackbox log, pulls the full configuration, and runs nav analysis with config cross-referencing. Cross-referenced findings combine flight data with FC settings to produce actionable results - for example, warning that high baro noise combined with aggressive altitude PID gains will cause oscillation.
+
+### From file
+
 ```bash
 # Nav health analysis
 python3 inav_blackbox_analyzer.py flight.bbl --nav
 
+# With explicit diff file for config enrichment
+python3 inav_blackbox_analyzer.py flight.bbl --nav --diff diff_all.txt
+
 # Analyze specific flight from multi-log flash dump
 python3 inav_blackbox_analyzer.py dataflash.bbl --nav
-
-# Suppress HTML report
-python3 inav_blackbox_analyzer.py flight.bbl --nav --no-html
-
-# With CLI diff for config enrichment
-python3 inav_blackbox_analyzer.py flight.bbl --nav --diff diff.txt
 ```
+
+**Auto-discovery:** If a `*_diff.txt` file exists in the same directory as the BBL (saved automatically by `--device` mode), it is loaded without needing `--diff`. To save a diff manually: open the CLI tab in INAV Configurator, type `diff all`, copy the output, save to a text file next to your BBL.
 
 When `--nav` is used, only navigation analysis runs. No PID response, noise spectrum, motor balance, filter phase lag, or tuning recommendations are produced.
 
@@ -185,6 +195,24 @@ The overall nav score is a weighted average:
 | Estimator | 20% |
 
 Althold and poshold scores are reported separately when available but do not contribute to the overall nav score (since they require specific flight modes).
+
+## Config Cross-Referencing
+
+When FC configuration is available (via `--device` or `--diff`), the analyzer combines flight data with config settings to produce findings that neither source can produce alone:
+
+**Baro noise + altitude PIDs:** High baro noise with aggressive `nav_mc_pos_z_p` or `nav_mc_vel_z_p` will cause altitude oscillation in althold. The analyzer warns and suggests reducing gains or fixing baro foam.
+
+**Compass jitter + mag calibration:** High heading jitter with uneven mag gain spread (>30%) confirms bad calibration. The analyzer recommends recalibrating outdoors.
+
+**Compass jitter + heading P gain:** High jitter amplified by aggressive `nav_mc_heading_p` causes position controller instability. The analyzer suggests fixing the compass first or reducing the gain.
+
+**GPS satellites + GNSS constellations:** Low satellite count with Galileo/Beidou/GLONASS disabled. The analyzer suggests enabling additional constellations with exact CLI commands.
+
+**No compass configured:** `mag_hardware=NONE` means poshold and RTH rely on GPS course only, which is unreliable at low speed and during hover.
+
+**Estimator divergence + baro weight:** Low baro-estimator correlation with low `inav_w_z_baro_p` suggests the estimator isn't trusting the barometer enough.
+
+Without config data, the analyzer still runs all sensor checks and reports scores, but cannot produce these combined findings.
 
 ## Output
 

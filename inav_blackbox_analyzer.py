@@ -747,6 +747,28 @@ CLI_TO_CONFIG = {
     "nav_mc_vel_xy_p": "nav_vel_xy_p",
     "nav_mc_vel_xy_i": "nav_vel_xy_i",
     "nav_mc_vel_xy_d": "nav_vel_xy_d",
+    "nav_mc_heading_p": "nav_heading_p",
+    "nav_rth_altitude": "nav_rth_altitude",
+    "nav_mc_hover_thr": "nav_hover_thr",
+
+    # Compass / magnetometer
+    "mag_hardware": "mag_hardware",
+    "align_mag": "align_mag",
+    "mag_calibration_0": "mag_cal_x",
+    "mag_calibration_1": "mag_cal_y",
+    "mag_calibration_2": "mag_cal_z",
+    "mag_declination": "mag_declination",
+
+    # GPS
+    "gps_ublox_use_galileo": "gps_use_galileo",
+    "gps_ublox_use_beidou": "gps_use_beidou",
+    "gps_ublox_use_glonass": "gps_use_glonass",
+    "gps_provider": "gps_provider",
+
+    # Estimator weights
+    "inav_w_z_baro_p": "inav_w_z_baro_p",
+    "inav_w_z_gps_p": "inav_w_z_gps_p",
+    "inav_w_xy_gps_p": "inav_w_xy_gps_p",
 
     # Level mode / angle
     "mc_p_level": "level_p",
@@ -779,15 +801,19 @@ CLI_INT_KEYS = {
     "looptime", "bb_rate_num", "bb_rate_denom",
     "nav_alt_p", "nav_vel_z_p", "nav_vel_z_i", "nav_vel_z_d",
     "nav_pos_p", "nav_vel_xy_p", "nav_vel_xy_i", "nav_vel_xy_d",
+    "nav_heading_p", "nav_rth_altitude", "nav_hover_thr",
     "level_p", "level_i", "level_d",
     "roll_rate", "pitch_rate", "yaw_rate",
     "rc_expo", "rc_yaw_expo",
     "antigravity_gain", "antigravity_cutoff",
+    "mag_cal_x", "mag_cal_y", "mag_cal_z", "mag_declination",
+    "inav_w_z_baro_p", "inav_w_z_gps_p", "inav_w_xy_gps_p",
 }
 
 # Settings that are boolean ON/OFF flags
 CLI_BOOL_KEYS = {
     "dyn_notch_enabled", "rpm_filter_enabled", "gyro_sync",
+    "gps_use_galileo", "gps_use_beidou", "gps_use_glonass",
 }
 
 
@@ -2939,7 +2965,135 @@ def run_nav_analysis(data, sr, config=None):
     else:
         results["nav_score"] = None
 
+    # ─── Cross-reference with FC config (when diff is available) ───
+    if config and config.get("_diff_merged"):
+        _cross_reference_nav_config(results, config)
+
     return results
+
+
+def _cross_reference_nav_config(nav_results, config):
+    """Cross-reference nav sensor readings with FC configuration.
+
+    Adds prescriptive findings when sensor data + config settings create
+    dangerous combinations. Only runs when CLI diff data is available.
+    """
+
+    # ─── Baro noise + altitude PID gains ───
+    baro = nav_results.get("baro")
+    if baro and baro.get("noise_cm") is not None:
+        noise = baro["noise_cm"]
+        alt_p = config.get("nav_alt_p")
+        vel_z_p = config.get("nav_vel_z_p")
+
+        if noise > 50 and alt_p is not None:
+            try:
+                alt_p = int(alt_p)
+                if alt_p > 40:
+                    baro["findings"].append((
+                        "WARNING",
+                        f"Baro noise {noise:.0f}cm + aggressive nav_mc_pos_z_p={alt_p} "
+                        f"will cause altitude oscillation in althold. "
+                        f"Fix baro foam first, or reduce: set nav_mc_pos_z_p = 30"))
+            except (ValueError, TypeError):
+                pass
+
+        if noise > 50 and vel_z_p is not None:
+            try:
+                vel_z_p = int(vel_z_p)
+                if vel_z_p > 100:
+                    baro["findings"].append((
+                        "INFO",
+                        f"High baro noise + nav_mc_vel_z_p={vel_z_p} amplifies noise "
+                        f"into throttle commands. Consider reducing after fixing baro."))
+            except (ValueError, TypeError):
+                pass
+
+    # ─── Compass jitter + mag calibration quality ───
+    compass = nav_results.get("compass")
+    if compass and compass.get("heading_jitter_deg") is not None:
+        jitter = compass["heading_jitter_deg"]
+
+        # Check mag gain spread
+        cal_x = config.get("mag_cal_x")
+        cal_y = config.get("mag_cal_y")
+        cal_z = config.get("mag_cal_z")
+        if cal_x is not None and cal_y is not None and cal_z is not None:
+            try:
+                gains = [abs(int(cal_x)), abs(int(cal_y)), abs(int(cal_z))]
+                if max(gains) > 0:
+                    spread = (max(gains) - min(gains)) / max(gains) * 100
+                    if spread > 30 and jitter > 2.0:
+                        compass["findings"].append((
+                            "WARNING",
+                            f"Compass jitter {jitter:.1f} deg/s + mag gain spread "
+                            f"{spread:.0f}% (X={gains[0]} Y={gains[1]} Z={gains[2]}). "
+                            f"Recalibrate compass outdoors away from metal and motors."))
+            except (ValueError, TypeError):
+                pass
+
+        # Check heading P gain amplifying jitter
+        heading_p = config.get("nav_heading_p")
+        if heading_p is not None and jitter > 3.0:
+            try:
+                heading_p = int(heading_p)
+                if heading_p > 30:
+                    compass["findings"].append((
+                        "INFO",
+                        f"Heading jitter {jitter:.1f} deg/s is amplified by "
+                        f"nav_mc_heading_p={heading_p}. Fix compass first, "
+                        f"or reduce: set nav_mc_heading_p = 30"))
+            except (ValueError, TypeError):
+                pass
+
+        # No compass configured
+        mag_hw = config.get("mag_hardware")
+        if mag_hw and str(mag_hw).upper() in ("NONE", "0", "FALSE"):
+            compass["findings"].append((
+                "WARNING",
+                "No compass configured (mag_hardware=NONE). "
+                "Poshold and RTH will use GPS course only - unreliable at low speed."))
+
+    # ─── GPS quality + constellation config ───
+    gps = nav_results.get("gps")
+    if gps and gps.get("avg_sats") is not None:
+        avg_sats = gps["avg_sats"]
+
+        galileo = config.get("gps_use_galileo")
+        beidou = config.get("gps_use_beidou")
+        glonass = config.get("gps_use_glonass")
+
+        disabled = []
+        if galileo is not None and not galileo:
+            disabled.append("Galileo")
+        if beidou is not None and not beidou:
+            disabled.append("Beidou")
+        if glonass is not None and not glonass:
+            disabled.append("GLONASS")
+
+        if disabled and avg_sats < 15:
+            fixes = [f"set gps_ublox_use_{d.lower()} = ON" for d in disabled]
+            gps["findings"].append((
+                "INFO",
+                f"{avg_sats:.0f} sats avg with {', '.join(disabled)} disabled. "
+                f"Enable for more satellites: {'; '.join(fixes)}"))
+
+    # ─── Estimator + weight tuning ───
+    est = nav_results.get("estimator")
+    if est and est.get("baro_vs_nav_corr") is not None:
+        corr = est["baro_vs_nav_corr"]
+        w_baro = config.get("inav_w_z_baro_p")
+        if w_baro is not None and corr < 0.9:
+            try:
+                w_baro = float(w_baro)
+                if w_baro < 0.5:
+                    est["findings"].append((
+                        "INFO",
+                        f"Estimator-baro correlation {corr:.2f} with low baro weight "
+                        f"inav_w_z_baro_p={w_baro:.1f}. If altitude drifts in althold, "
+                        f"increase: set inav_w_z_baro_p = 1.0"))
+            except (ValueError, TypeError):
+                pass
 
 
 def format_nav_report(nav_results, use_color=True):
@@ -4443,8 +4597,11 @@ def main():
                              "Used with --cells to predict where prop noise will be.")
     parser.add_argument("--no-narrative", action="store_true",
                         help="Omit the plain-English description of the quad's behavior.")
-    parser.add_argument("--diff", action="store_true",
-                        help="Pull 'diff all' config from FC via CLI (requires --device).")
+    parser.add_argument("--diff", metavar="FILE", default=None,
+                        help="Path to a CLI 'diff all' file for enriched analysis. "
+                             "Adds config cross-referencing to nav and tuning results. "
+                             "Not needed with --device (config is pulled automatically). "
+                             "Also auto-discovered if a *_diff.txt file sits next to the BBL.")
     parser.add_argument("--nav", action="store_true",
                         help="Enable navigation health analysis (compass, GPS, baro, "
                              "estimator). Works on any flight with nav fields in the log.")
@@ -4523,22 +4680,21 @@ def main():
             pct = summary['used_size'] * 100 // summary['total_size'] if summary['total_size'] > 0 else 0
             print(f"  Dataflash: {used_kb:.0f}KB / {total_kb:.0f}KB ({pct}% used)")
 
-            # Pull CLI diff if requested
+            # Pull CLI diff (always when connected - enriches analysis)
             diff_raw = None
-            if args.diff:
-                print("  Pulling configuration (diff all)...", end="", flush=True)
-                diff_raw = fc.get_diff_all(timeout=10.0)
-                if diff_raw:
-                    n_settings = len([l for l in diff_raw.splitlines() if l.strip().startswith("set ")])
-                    print(f" {n_settings} settings")
-                    # Save diff to file alongside blackbox
-                    diff_path = os.path.join(args.blackbox_dir, f"{info['craft_name'] or 'fc'}_diff.txt")
-                    os.makedirs(args.blackbox_dir, exist_ok=True)
-                    with open(diff_path, "w") as f:
-                        f.write(diff_raw)
-                    print(f"  ✓ Saved: {diff_path}")
-                else:
-                    print(" no response (FC may not support CLI over MSP)")
+            print("  Pulling configuration (diff all)...", end="", flush=True)
+            diff_raw = fc.get_diff_all(timeout=10.0)
+            if diff_raw:
+                n_settings = len([l for l in diff_raw.splitlines() if l.strip().startswith("set ")])
+                print(f" {n_settings} settings")
+                # Save diff to file alongside blackbox
+                diff_path = os.path.join(args.blackbox_dir, f"{info['craft_name'] or 'fc'}_diff.txt")
+                os.makedirs(args.blackbox_dir, exist_ok=True)
+                with open(diff_path, "w") as f:
+                    f.write(diff_raw)
+                print(f"  Saved: {diff_path}")
+            else:
+                print(" no response (FC may not support CLI over MSP)")
 
             if summary['used_size'] == 0:
                 print("  No blackbox data to download.")
@@ -4576,6 +4732,41 @@ def main():
 
     if not os.path.isfile(logfile):
         print(f"ERROR: File not found: {logfile}"); sys.exit(1)
+
+    # ── Load diff from file (when not using --device) ──
+    if diff_raw is None:
+        diff_file = None
+        if args.diff:
+            # Explicit file path: --diff my_diff.txt
+            diff_file = args.diff
+        else:
+            # Auto-discover diff files in same directory as BBL
+            log_dir = os.path.dirname(os.path.abspath(logfile))
+            candidates = []
+            for fname in os.listdir(log_dir):
+                if fname.endswith("_diff.txt") or fname == "diff.txt" or fname == "diff_all.txt":
+                    candidates.append(os.path.join(log_dir, fname))
+            if len(candidates) == 1:
+                diff_file = candidates[0]
+            elif len(candidates) > 1:
+                # Pick the most recently modified
+                diff_file = max(candidates, key=os.path.getmtime)
+
+        if diff_file:
+            if os.path.isfile(diff_file):
+                try:
+                    with open(diff_file, "r", errors="ignore") as f:
+                        diff_raw = f.read()
+                    n_settings = len([l for l in diff_raw.splitlines()
+                                      if l.strip().startswith("set ")])
+                    if n_settings > 0:
+                        print(f"  Config: {os.path.basename(diff_file)} ({n_settings} settings)")
+                    else:
+                        diff_raw = None  # not a valid diff file
+                except Exception:
+                    diff_raw = None
+            else:
+                print(f"  Warning: Diff file not found: {diff_file}")
 
     # ── History mode: show progression and exit ──
     if args.history:

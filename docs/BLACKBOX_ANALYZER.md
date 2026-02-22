@@ -6,6 +6,27 @@ The INAV Blackbox Analyzer decodes binary blackbox logs natively in Python and p
 
 ## Usage
 
+### Recommended: Direct from FC
+
+Connect the flight controller via USB and run:
+
+```bash
+# Download blackbox + pull config + analyze (preferred)
+python3 inav_blackbox_analyzer.py --device auto
+
+# Navigation health check
+python3 inav_blackbox_analyzer.py --device auto --nav
+
+# Specific serial port
+python3 inav_blackbox_analyzer.py --device /dev/ttyACM0
+```
+
+This is the preferred workflow. The analyzer connects to the FC, downloads the blackbox log, and automatically pulls the full configuration (`diff all`). The config enriches the analysis with cross-referenced findings that combine flight data with FC settings.
+
+### From file
+
+When the FC is not connected, analyze a previously saved blackbox log:
+
 ```bash
 # Basic analysis
 python3 inav_blackbox_analyzer.py flight.bbl
@@ -13,12 +34,16 @@ python3 inav_blackbox_analyzer.py flight.bbl
 # With frame size (improves filter recommendations)
 python3 inav_blackbox_analyzer.py flight.bbl --frame 10
 
-# JSON output only (no HTML report)
-python3 inav_blackbox_analyzer.py flight.bbl --json
+# Provide a CLI diff file for config enrichment
+python3 inav_blackbox_analyzer.py flight.bbl --diff diff_all.txt
 
-# Specify output directory
-python3 inav_blackbox_analyzer.py flight.bbl -o /path/to/output/
+# Nav health from file
+python3 inav_blackbox_analyzer.py flight.bbl --nav
 ```
+
+**Auto-discovery:** If a `*_diff.txt`, `diff.txt`, or `diff_all.txt` file exists in the same directory as the BBL, it is loaded automatically. The `--device` mode saves the diff alongside the blackbox log, so subsequent offline analysis of those files will pick it up without needing `--diff`.
+
+To save a diff manually: open the CLI tab in INAV Configurator, type `diff all`, copy the entire output, and save it to a text file next to your BBL.
 
 ## Binary Decoder
 
