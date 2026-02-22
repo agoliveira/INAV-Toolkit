@@ -548,6 +548,565 @@ class TestTrendAnalysis:
             db.close()
 
 
+class TestSanityCheck:
+    """Test pre-flight sanity check engine."""
+
+    def _make_diff(self, **overrides):
+        """Build a minimal diff all text with overrides."""
+        lines = [
+            "# INAV/TESTBOARD 9.0.1 Feb 22 2026 / 12:00:00 (abc123)",
+        ]
+        settings = {
+            "name": "TEST_QUAD",
+            "platform_type": "MULTIROTOR",
+            "motor_pwm_protocol": "DSHOT300",
+            "failsafe_procedure": "RTH",
+            "mc_p_roll": 40, "mc_p_pitch": 44,
+            "mc_d_roll": 25, "mc_d_pitch": 25,
+            "roll_rate": 50, "pitch_rate": 50, "yaw_rate": 40,
+            "gyro_main_lpf_hz": 110, "dterm_lpf_hz": 110,
+            "looptime": 500,
+        }
+        settings.update(overrides)
+        for k, v in settings.items():
+            if isinstance(v, bool):
+                lines.append(f"set {k} = {'ON' if v else 'OFF'}")
+            else:
+                lines.append(f"set {k} = {v}")
+        # GPS UART by default
+        lines.append("serial 1 2 115200 57600 0 115200")
+        # RX UART
+        lines.append("serial 0 64 115200 57600 0 115200")
+        # ARM mode
+        lines.append("aux 0 0 1 1800 2100")
+        # ANGLE mode
+        lines.append("aux 1 1 2 1800 2100")
+        # RTH mode
+        lines.append("aux 2 11 3 1800 2100")
+        return "\n".join(lines)
+
+    def test_good_config_passes(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff()
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, interactive=False)
+        fails = [i for i in items if i.status == SanityItem.FAIL]
+        assert len(fails) == 0, f"Unexpected fails: {fails}"
+
+    def test_no_arm_switch(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff()
+        # Remove aux lines (no ARM)
+        diff = "\n".join(l for l in diff.splitlines() if not l.startswith("aux"))
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, interactive=False)
+        arm_fails = [i for i in items if i.category == "Arming" and i.status == SanityItem.FAIL]
+        assert len(arm_fails) >= 1
+
+    def test_drop_failsafe_fails(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff(failsafe_procedure="DROP")
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, interactive=False)
+        fs_fails = [i for i in items if i.category == "Failsafe" and i.status == SanityItem.FAIL]
+        assert len(fs_fails) >= 1
+
+    def test_inverted_battery_fails(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff(bat_voltage_cell_min=450, bat_voltage_cell_max=420)
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, interactive=False)
+        batt_fails = [i for i in items if i.category == "Battery" and i.status == SanityItem.FAIL]
+        assert len(batt_fails) >= 1
+
+    def test_motor_inverted_asks(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff(motor_direction_inverted=True)
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, interactive=False)
+        motor_asks = [i for i in items if i.category == "Motors" and i.status == SanityItem.ASK]
+        assert len(motor_asks) >= 1
+
+    def test_zero_p_term_fails(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff(mc_p_roll=0)
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, interactive=False)
+        pid_fails = [i for i in items if i.category == "PIDs" and i.status == SanityItem.FAIL]
+        assert len(pid_fails) >= 1
+
+    def test_extreme_pids_fails(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff(mc_p_roll=150, mc_p_pitch=150)
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, interactive=False)
+        pid_fails = [i for i in items if i.category == "PIDs" and i.status == SanityItem.FAIL]
+        assert len(pid_fails) >= 1
+
+    def test_nav_without_gps_fails(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff()
+        # Remove GPS UART
+        diff = "\n".join(l for l in diff.splitlines()
+                         if not (l.startswith("serial 1") and "2 115200" in l))
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, interactive=False)
+        nav_fails = [i for i in items if i.category == "Navigation" and i.status == SanityItem.FAIL]
+        assert len(nav_fails) >= 1
+
+    def test_pid_frame_mismatch_asks(self):
+        from inav_toolkit.param_analyzer import parse_diff_all, run_sanity_check, SanityItem
+        diff = self._make_diff(mc_p_roll=44, mc_p_pitch=46)
+        parsed = parse_diff_all(diff)
+        items = run_sanity_check(parsed, frame_inches=10, interactive=False)
+        pid_asks = [i for i in items if i.category == "PIDs" and i.status == SanityItem.ASK]
+        assert len(pid_asks) >= 1
+
+    def test_json_output(self):
+        out, err, rc = run_module(
+            "inav_toolkit.param_analyzer", "--check", "--no-interactive",
+            "--json", os.path.join(TESTS_DIR, "test_basic_diff.txt"))
+        data = json.loads(out)
+        assert isinstance(data, list)
+        assert len(data) > 0
+        assert all("status" in i and "category" in i for i in data)
+
+    def test_check_exit_code_clean(self):
+        """Good config returns exit code 0."""
+        import tempfile
+        diff = self._make_diff()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(diff)
+            f.flush()
+            out, err, rc = run_module(
+                "inav_toolkit.param_analyzer", "--check", "--no-interactive", f.name)
+        os.unlink(f.name)
+        assert rc == 0, f"Expected rc=0, got {rc}\n{out}"
+
+    def test_check_exit_code_bad(self):
+        """Bad config returns exit code 1."""
+        import tempfile
+        diff = self._make_diff(failsafe_procedure="DROP", mc_p_roll=0)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+            f.write(diff)
+            f.flush()
+            out, err, rc = run_module(
+                "inav_toolkit.param_analyzer", "--check", "--no-interactive", f.name)
+        os.unlink(f.name)
+        assert rc == 1, f"Expected rc=1, got {rc}\n{out}"
+
+
+class TestComparison:
+    """Test comparative flight analysis."""
+
+    def test_analyze_for_compare(self):
+        """Test the comparison analysis pipeline with synthetic data."""
+        from inav_toolkit.blackbox_analyzer import (
+            _analyze_for_compare, generate_action_plan, analyze_noise,
+            analyze_pid_response, analyze_motors, analyze_dterm_noise,
+            detect_hover_oscillation, fingerprint_noise,
+        )
+        fixture = os.path.join(FIXTURES_DIR, "clean_hover.csv")
+        if not os.path.exists(fixture):
+            pytest.skip("clean_hover.csv fixture not found (run generate_fixtures.py)")
+
+        # Create a minimal args namespace
+        class Args:
+            frame = 5
+            props = None
+            blades = 3
+            cells = None
+            kv = None
+        args = Args()
+
+        result = _analyze_for_compare(fixture, args)
+        assert "plan" in result
+        assert "scores" in result["plan"]
+        assert "noise_results" in result
+        assert "pid_results" in result
+        assert "data" in result
+
+    def test_comparison_noise_chart(self):
+        """Test comparison noise overlay chart generation."""
+        from inav_toolkit.blackbox_analyzer import (
+            _create_comparison_noise_chart, analyze_noise
+        )
+        # Create minimal noise results
+        n = 1000
+        sr = 500.0
+        freqs = np.fft.rfftfreq(256, 1.0 / sr)
+        psd_db = -40 + np.random.randn(len(freqs)) * 5
+
+        nr_a = [{"axis": ax, "freqs": freqs, "psd_db": psd_db,
+                  "peaks": [{"freq_hz": 150, "power_db": -20}]}
+                 for ax in ["Roll", "Pitch", "Yaw"]]
+        nr_b = [{"axis": ax, "freqs": freqs, "psd_db": psd_db - 3,
+                  "peaks": [{"freq_hz": 150, "power_db": -23}]}
+                 for ax in ["Roll", "Pitch", "Yaw"]]
+
+        chart = _create_comparison_noise_chart(nr_a, nr_b, "Flight A", "Flight B")
+        assert isinstance(chart, str)
+        assert len(chart) > 100  # valid base64
+
+    def test_comparison_html(self):
+        """Test comparison HTML generation structure."""
+        from inav_toolkit.blackbox_analyzer import _generate_comparison_html
+
+        def _make_res(score, logfile="test.bbl"):
+            return {
+                "plan": {
+                    "scores": {"overall": score, "noise": score + 5, "pid": score - 5, "motor": 80},
+                    "verdict_text": "Test verdict",
+                    "actions": [],
+                },
+                "config": {"craft_name": "TEST", "roll_p": 40, "gyro_lowpass_hz": 110},
+                "data": {"time_s": np.array([0, 60])},
+                "noise_results": [None, None, None],
+                "pid_results": [None, None, None],
+                "logfile": logfile,
+            }
+
+        html = _generate_comparison_html(
+            _make_res(60, "A.bbl"), _make_res(75, "B.bbl"),
+            {}, "A", "B")
+        assert "INAV Flight Comparison" in html
+        assert "60" in html
+        assert "75" in html
+
+
+class TestReplay:
+    """Test interactive replay HTML generation."""
+
+    def test_downsample(self):
+        from inav_toolkit.blackbox_analyzer import _downsample
+        arr = np.arange(10000)
+        ds = _downsample(arr, 1000)
+        assert len(ds) <= 1100  # approximately 1000
+        assert ds[0] == 0
+
+    def test_downsample_short(self):
+        from inav_toolkit.blackbox_analyzer import _downsample
+        arr = np.arange(50)
+        ds = _downsample(arr, 1000)
+        assert len(ds) == 50  # no downsampling needed
+
+    def test_replay_html_generation(self):
+        """Test replay HTML output contains expected Plotly.js elements."""
+        from inav_toolkit.blackbox_analyzer import _generate_replay_html
+
+        n = 2000
+        sr = 500.0
+        data = {
+            "time_s": np.arange(n) / sr,
+            "gyro_roll": np.random.randn(n) * 10,
+            "gyro_pitch": np.random.randn(n) * 10,
+            "gyro_yaw": np.random.randn(n) * 5,
+            "setpoint_roll": np.random.randn(n) * 10,
+            "setpoint_pitch": np.random.randn(n) * 10,
+            "setpoint_yaw": np.random.randn(n) * 5,
+            "motor0": np.random.uniform(1000, 2000, n),
+            "motor1": np.random.uniform(1000, 2000, n),
+            "motor2": np.random.uniform(1000, 2000, n),
+            "motor3": np.random.uniform(1000, 2000, n),
+            "throttle": np.random.uniform(1000, 1800, n),
+            "n_rows": n, "sample_rate": sr,
+            "_slow_frames": [],
+        }
+        config = {"craft_name": "TEST_QUAD", "firmware_revision": "INAV 9.0"}
+        html = _generate_replay_html(config, data, sr)
+
+        # Plotly.js instead of Chart.js
+        assert "plotly" in html.lower()
+        assert "TEST_QUAD" in html
+        # Plotly div IDs
+        assert "plotRoll" in html
+        assert "plotMotors" in html
+        # Synced x-axis across all panels
+        assert "plotly_relayout" in html
+        # Flight mode overlay bar
+        assert "modeBar" in html
+        # Spectrogram waterfall (gyro data present so spectrogram computed)
+        assert "plotSpectro" in html
+        # WebGL rendering
+        assert "scattergl" in html
+
+    def test_replay_with_spectrogram(self):
+        """Test replay HTML includes noise spectrogram waterfall."""
+        from inav_toolkit.blackbox_analyzer import _generate_replay_html, _compute_spectrogram
+
+        n = 2000
+        sr = 500.0
+        gyro = np.random.randn(n) * 10
+        data = {
+            "time_s": np.arange(n) / sr,
+            "gyro_roll": gyro,
+            "n_rows": n, "sample_rate": sr,
+            "_slow_frames": [],
+        }
+
+        html = _generate_replay_html({"craft_name": "T"}, data, sr)
+        assert "plotSpectro" in html
+        assert "heatmap" in html
+
+        # Also test spectrogram computation directly
+        times, freqs, power = _compute_spectrogram(gyro, sr, nperseg=256)
+        assert len(times) > 0
+        assert len(freqs) > 0
+        assert len(power) == len(freqs)
+        assert len(power[0]) == len(times)
+        assert max(freqs) <= 500
+
+    def test_replay_flight_modes(self):
+        """Test flight mode extraction from slow frames."""
+        from inav_toolkit.blackbox_analyzer import _extract_flight_modes
+
+        sr = 500.0
+        n = 5000
+        data = {
+            "time_s": np.arange(n) / sr,
+            "n_rows": n, "sample_rate": sr,
+            "_slow_frames": [
+                (0, {"flightModeFlags": 1}),      # ARM only
+                (1000, {"flightModeFlags": 3}),    # ARM + ANGLE
+                (3000, {"flightModeFlags": 259}),  # ARM + ANGLE + NAV POSHOLD (bit 8)
+            ],
+        }
+        modes = _extract_flight_modes(data, sr)
+        assert len(modes) == 3
+        assert "ARM" in modes[0]["label"]
+        assert "ANGLE" in modes[1]["label"]
+        assert "NAV POSHOLD" in modes[2]["label"]
+
+
+
+class TestLogQuality:
+    """Tests for log quality scorer."""
+
+    def test_good_log(self):
+        """Test that a well-formed log gets GOOD grade."""
+        from inav_toolkit.blackbox_analyzer import assess_log_quality
+
+        n = 5000
+        sr = 500.0
+        data = {
+            "time_s": np.arange(n) / sr,
+            "gyro_roll": np.random.randn(n) * 50,
+            "gyro_pitch": np.random.randn(n) * 50,
+            "gyro_yaw": np.random.randn(n) * 20,
+            "setpoint_roll": np.random.randn(n) * 30,
+            "motor0": np.random.uniform(1000, 2000, n),
+            "motor1": np.random.uniform(1000, 2000, n),
+            "throttle": np.random.uniform(1100, 1800, n),
+            "n_rows": n, "sample_rate": sr,
+            "found_columns": ["gyro_roll", "gyro_pitch", "gyro_yaw",
+                              "setpoint_roll", "motor0", "motor1", "throttle"],
+        }
+        q = assess_log_quality(data)
+        assert q["usable"] is True
+        assert q["grade"] == "GOOD"
+        assert q["stats"]["has_gyro"] is True
+
+    def test_too_short(self):
+        """Test that a very short log is UNUSABLE."""
+        from inav_toolkit.blackbox_analyzer import assess_log_quality
+
+        n = 100
+        sr = 500.0
+        data = {
+            "time_s": np.arange(n) / sr,
+            "gyro_roll": np.random.randn(n),
+            "n_rows": n, "sample_rate": sr,
+            "found_columns": ["gyro_roll"],
+        }
+        q = assess_log_quality(data)
+        assert q["grade"] == "UNUSABLE"
+        assert q["usable"] is False
+        assert any("short" in i["message"] or "only" in i["message"].lower() for i in q["issues"])
+
+    def test_no_gyro(self):
+        """Test that missing gyro data is UNUSABLE."""
+        from inav_toolkit.blackbox_analyzer import assess_log_quality
+
+        n = 5000
+        sr = 500.0
+        data = {
+            "time_s": np.arange(n) / sr,
+            "motor0": np.random.uniform(1000, 2000, n),
+            "n_rows": n, "sample_rate": sr,
+            "found_columns": ["motor0"],
+        }
+        q = assess_log_quality(data)
+        assert q["usable"] is False
+        assert any("gyro" in i["message"].lower() for i in q["issues"])
+
+    def test_low_sample_rate(self):
+        """Test that low sample rate is flagged."""
+        from inav_toolkit.blackbox_analyzer import assess_log_quality
+
+        n = 500
+        sr = 50.0
+        data = {
+            "time_s": np.arange(n) / sr,
+            "gyro_roll": np.random.randn(n) * 50,
+            "setpoint_roll": np.random.randn(n) * 30,
+            "motor0": np.random.uniform(1000, 2000, n),
+            "throttle": np.random.uniform(1100, 1800, n),
+            "n_rows": n, "sample_rate": sr,
+            "found_columns": ["gyro_roll", "setpoint_roll", "motor0", "throttle"],
+        }
+        q = assess_log_quality(data)
+        assert any("sample rate" in i["message"].lower() for i in q["issues"])
+
+    def test_ground_only_detection(self):
+        """Test detection of no-flight (ground-only) logs."""
+        from inav_toolkit.blackbox_analyzer import assess_log_quality
+
+        n = 5000
+        sr = 500.0
+        data = {
+            "time_s": np.arange(n) / sr,
+            "gyro_roll": np.random.randn(n) * 50,
+            "setpoint_roll": np.zeros(n),      # no stick movement
+            "setpoint_pitch": np.zeros(n),
+            "throttle": np.ones(n) * 1000,     # throttle at minimum
+            "motor0": np.random.uniform(1000, 2000, n),
+            "n_rows": n, "sample_rate": sr,
+            "found_columns": ["gyro_roll", "setpoint_roll", "setpoint_pitch",
+                              "throttle", "motor0"],
+        }
+        q = assess_log_quality(data)
+        assert any("stick" in i["message"].lower() or "ground" in i["message"].lower()
+                    for i in q["issues"])
+
+    def test_corrupt_frames(self):
+        """Test corrupt frame detection from decoder stats."""
+        from inav_toolkit.blackbox_analyzer import assess_log_quality
+
+        n = 5000
+        sr = 500.0
+        data = {
+            "time_s": np.arange(n) / sr,
+            "gyro_roll": np.random.randn(n) * 50,
+            "setpoint_roll": np.random.randn(n) * 30,
+            "motor0": np.random.uniform(1000, 2000, n),
+            "throttle": np.random.uniform(1100, 1800, n),
+            "n_rows": n, "sample_rate": sr,
+            "found_columns": ["gyro_roll", "setpoint_roll", "motor0", "throttle"],
+            "_decoder_stats": {"i_frames": 100, "p_frames": 200, "errors": 150},
+        }
+        q = assess_log_quality(data)
+        assert any("corrupt" in i["message"].lower() for i in q["issues"])
+
+    def test_all_zeros_gyro(self):
+        """Test dead sensor detection."""
+        from inav_toolkit.blackbox_analyzer import assess_log_quality
+
+        n = 5000
+        sr = 500.0
+        data = {
+            "time_s": np.arange(n) / sr,
+            "gyro_roll": np.zeros(n),
+            "gyro_pitch": np.random.randn(n) * 50,
+            "setpoint_roll": np.random.randn(n) * 30,
+            "motor0": np.random.uniform(1000, 2000, n),
+            "throttle": np.random.uniform(1100, 1800, n),
+            "n_rows": n, "sample_rate": sr,
+            "found_columns": ["gyro_roll", "gyro_pitch", "setpoint_roll",
+                              "motor0", "throttle"],
+        }
+        q = assess_log_quality(data)
+        assert any("zeros" in i["message"].lower() and "roll" in i["message"].lower()
+                    for i in q["issues"])
+
+
+class TestMarkdownReport:
+    """Tests for Markdown report generation."""
+
+    def test_basic_report(self):
+        """Test markdown report contains expected sections."""
+        from inav_toolkit.blackbox_analyzer import generate_markdown_report, get_frame_profile
+
+        profile = get_frame_profile(5, 5, 3)
+        config = {"craft_name": "TestQuad", "firmware_revision": "INAV 9.0.0"}
+        data = {
+            "time_s": np.arange(5000) / 500.0,
+            "sample_rate": 500.0,
+        }
+        noise_results = [None, None, None]
+        pid_results = [
+            {"tracking_delay_ms": 3.5, "avg_overshoot_pct": 12.0},
+            {"tracking_delay_ms": 4.0, "avg_overshoot_pct": 8.0},
+            {"tracking_delay_ms": None, "avg_overshoot_pct": None},
+        ]
+        motor_analysis = None
+        plan = {
+            "scores": {"overall": 72, "noise": 85, "pid": 60, "motor": 90},
+            "verdict": "NEEDS_WORK",
+            "verdict_text": "Room for improvement",
+            "findings": [
+                {"severity": "warning", "message": "Roll delay slightly high"},
+            ],
+            "noise_fingerprint": [],
+            "actions": [
+                {"action": "Lower P gain", "param": "mc_p_pitch", "current": "44",
+                 "new": "38", "reason": "Reduce overshoot"},
+            ],
+        }
+
+        md = generate_markdown_report(plan, config, data, noise_results,
+                                      pid_results, motor_analysis, profile)
+        assert "TestQuad" in md
+        assert "72/100" in md
+        assert "mc_p_pitch" in md
+        assert "Recommended Changes" in md
+        assert "set mc_p_pitch = 38" in md
+        assert "INAV Toolkit" in md
+
+    def test_report_with_quality(self):
+        """Test markdown report includes quality info when provided."""
+        from inav_toolkit.blackbox_analyzer import generate_markdown_report, get_frame_profile
+
+        profile = get_frame_profile(5, 5, 3)
+        config = {"craft_name": "T", "firmware_revision": "INAV 9"}
+        data = {"time_s": np.arange(1000) / 500.0, "sample_rate": 500.0}
+        plan = {"scores": {"overall": 50}, "verdict": "OK", "verdict_text": "OK",
+                "findings": [], "noise_fingerprint": [], "actions": []}
+        quality = {
+            "grade": "MARGINAL",
+            "issues": [{"severity": "WARN", "message": "Short log"}],
+        }
+
+        md = generate_markdown_report(plan, config, data, [None]*3, [None]*3,
+                                      None, profile, quality)
+        assert "MARGINAL" in md
+        assert "Short log" in md
+
+    def test_report_with_deferred_actions(self):
+        """Test markdown report shows deferred actions separately."""
+        from inav_toolkit.blackbox_analyzer import generate_markdown_report, get_frame_profile
+
+        profile = get_frame_profile(5, 5, 3)
+        config = {"craft_name": "T", "firmware_revision": "INAV 9"}
+        data = {"time_s": np.arange(5000) / 500.0, "sample_rate": 500.0}
+        plan = {
+            "scores": {"overall": 80}, "verdict": "GOOD", "verdict_text": "Good tune",
+            "findings": [], "noise_fingerprint": [],
+            "actions": [
+                {"action": "Lower D", "param": "mc_d_roll", "current": "30",
+                 "new": "25", "reason": "D-term noise"},
+                {"action": "Enable RPM filter", "param": "rpm_filter_enabled",
+                 "current": "OFF", "new": "ON", "reason": "Better filtering",
+                 "deferred": True},
+            ],
+        }
+
+        md = generate_markdown_report(plan, config, data, [None]*3, [None]*3,
+                                      None, profile)
+        assert "mc_d_roll" in md
+        assert "Deferred" in md
+        assert "rpm_filter_enabled" in md
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Standalone runner (works without pytest)
 # ═════════════════════════════════════════════════════════════════════════════

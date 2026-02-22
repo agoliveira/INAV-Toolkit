@@ -76,6 +76,18 @@ inav-analyze flight.bbl --kv 980
 # Navigation health analysis mode
 inav-analyze flight.bbl --nav
 
+# Compare two flights side-by-side
+inav-analyze flight_before.bbl --compare flight_after.bbl
+
+# Interactive replay with Plotly.js (spectrogram, synced zoom, flight modes)
+inav-analyze flight.bbl --replay
+
+# Quick log quality check (exit code 1 if unusable)
+inav-analyze flight.bbl --check-log
+
+# Generate Markdown report for forum/Discord
+inav-analyze flight.bbl --report md
+
 # Skip database storage for one-off analysis
 inav-analyze flight.bbl --no-db
 
@@ -91,6 +103,14 @@ inav-analyze flight.bbl --db-path ~/my_flights.db
 - **Filter phase lag:** Total delay through the filter chain
 - **Tracking error:** RMS deviation between setpoint and gyro
 - **Navigation health** (`--nav`): Compass interference, GPS quality, barometer noise, position hold drift, altitude hold accuracy
+
+**Comparative analysis** (`--compare`): Side-by-side analysis of two flights with overlay noise spectra, PID response deltas, motor balance comparison, and overall score improvement/degradation arrow. Warns on craft/frame mismatches.
+
+**Interactive replay** (`--replay`): Standalone HTML with Plotly.js WebGL rendering. Panels: gyro vs setpoint (3 axes), motor outputs, noise spectrogram waterfall (sliding FFT heatmap), throttle. Synced zoom/pan across all panels. Flight mode overlay bar decoded from S-frame bitmask.
+
+**Log quality scoring** (`--check-log`): Pre-analysis validation that grades logs as GOOD/MARGINAL/UNUSABLE. Checks: duration, sample rate, field completeness, stick activity, all-zeros sensors, corrupt frames, NaN gaps. Also runs automatically during normal analysis.
+
+**Markdown reports** (`--report md`): Generates a forum/Discord-pasteable report with scores, findings, noise sources, PID metrics, and CLI commands in a fenced code block.
 
 **Multi-log splitting:** Dataflash dumps containing multiple arm/disarm cycles are automatically detected and split. Each flight is analyzed individually with per-flight progression tracking.
 

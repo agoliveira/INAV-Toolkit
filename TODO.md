@@ -1,33 +1,55 @@
 # INAV Toolkit - TODO / Backlog
 
-## Pending
+## Next Up
 
-### SD Card Blackbox Download via MSC
+### Config Backup Manager
 - **Priority:** Medium
-- **Effort:** Multi-day (platform-specific code + hardware testing)
-- **Context:** INAV supports three blackbox backends: dataflash (implemented), SD card, OpenLog (not worth supporting). SD card logs can only be retrieved via USB MSC (Mass Storage Class) mode — no MSP file-read commands exist. The `msc` CLI command reboots the FC into a USB drive; the OS mounts it, files are copied, then FC reboots back to normal.
-- **Current state:** Detection implemented in `inav_msp.py`. When `get_dataflash_summary()` returns unsupported, `download_blackbox()` queries `MSP_BLACKBOX_CONFIG` (cmd 80) to identify the storage backend and gives a clear message for SD card and serial users. What remains is the actual MSC download automation.
-- **Implementation plan:**
-  1. Start with Linux only (testable on real hardware)
-  2. Send `msc` via CLI, wait for serial port to disappear
-  3. Detect new block device / mount point (`/dev/sd*`, `/media/`, `udisksctl`)
-  4. Find `.bbl` / `LOG*.TXT` files, copy the latest
-  5. Unmount/eject, wait for FC to reboot back to normal mode
-  6. Reconnect via serial (reuse restore-flow reconnect logic)
-  7. Later: Windows (new drive letter detection), macOS (`/Volumes/`)
-- **Risks:** MSC mode has known bugs on some FCs (F722-WPX, H743 regressions). Failed MSC cycle leaves FC unresponsive with no serial port. Need robust timeout and manual recovery instructions.
-
-### PyPI Publishing
-- **Priority:** Low
 - **Effort:** Small
-- **Context:** Package is pip-installable from source (`pip install -e .`) and wheel builds cleanly. Publishing to PyPI would allow `pip install inav-toolkit` without cloning the repo. Steps: Create PyPI account, configure trusted publishing via GitHub Actions, add publish workflow on tag push.
+- **Context:** `inav-toolkit backups` command that lists all backups by date/craft, lets you diff any two, or restore a specific one. The wizard already takes backups but they're loose timestamped files. Useful when tuning over weeks and wanting to revert to "the one that flew well."
+
+### INAV Configurator Preset Export
+- **Priority:** Medium
+- **Effort:** Small
+- **Context:** Generate a `.json` preset file that users can import directly into INAV Configurator instead of pasting CLI commands. Configurator supports preset imports, the format is documented.
 
 ### Version Bump Automation
-- **Priority:** Low
+- **Priority:** Medium
 - **Effort:** Small
-- **Context:** Version is defined in `__init__.py` and `pyproject.toml`, plus `VERSION`/`REPORT_VERSION` in each module. Bumping requires editing 6+ files. A bump script or single-source version (e.g. `importlib.metadata`) would reduce errors -- the v2.14.0 to v2.14.1 bump missed several files and was caught by CI.
+- **Context:** Version duplicated in 8 files (pyproject.toml + 7 .py files). A bump script or single-source version via `importlib.metadata` would prevent mismatches. Consider `bumpversion` or a simple `scripts/bump.sh`.
+
+## Backlog
+
+### Automated Tuning Loop (Raspberry Pi companion)
+- **Priority:** Medium (deferred)
+- **Effort:** Large
+- **Context:** Run on a Raspberry Pi Zero 2W as an onboard companion. Analyze-compute-apply loop: download blackbox after landing, compute new PIDs, generate CLI commands, optionally apply before next flight. All pieces exist (analysis, MSP, CLI batch), needs orchestration and conservative gain scheduling. Discuss architecture separately.
+
+### SD Card Blackbox Download via MSC
+- **Priority:** Low
+- **Effort:** Multi-day (platform-specific code + hardware testing)
+- **Context:** Detection implemented in `inav_msp.py`. What remains is the actual MSC download automation: send `msc` CLI command, wait for USB mass storage mount, copy logs, unmount, reconnect. Linux first, then Windows/macOS.
 
 ### GUI / Desktop App
 - **Priority:** Low (exploratory)
 - **Effort:** Large
-- **Context:** CLI-only interface works for technical users but limits adoption. Options: PyInstaller single-file executables (simplest), Electron/Tauri wrapper around HTML reports, or native GUI. PyInstaller is the most pragmatic first step -- wraps the CLI with zero code changes and produces a single downloadable binary per platform.
+- **Context:** PyInstaller single-file executables as the most pragmatic first step — wraps CLI with zero code changes, produces downloadable binary per platform.
+
+## Done
+
+### ~~Comparative Flight Analysis~~ (v2.15.0)
+Side-by-side `--compare` with overlay charts, score deltas, motor balance, craft mismatch warnings.
+
+### ~~Blackbox Replay Visualization~~ (v2.15.0)
+Interactive `--replay` with Plotly.js WebGL, spectrogram waterfall, flight mode overlay, synced axes.
+
+### ~~First-Flight Sanity Check~~ (v2.14.1)
+`inav-params --check` with 16 categories, interactive validation, GO/NO-GO verdict.
+
+### ~~Log Quality Scorer~~ (v2.15.0)
+`--check-log` with 8 quality checks, GOOD/MARGINAL/UNUSABLE grading, auto-gate in analysis.
+
+### ~~Markdown Report Output~~ (v2.15.0)
+`--report md` for forum/Discord-pasteable reports with CLI commands.
+
+### ~~PyPI Publishing~~ (v2.15.0)
+GitHub Actions trusted publishing on tag push. `pip install inav-toolkit`.

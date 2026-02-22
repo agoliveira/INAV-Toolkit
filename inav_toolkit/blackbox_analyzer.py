@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.14.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.15.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -87,7 +87,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.14.1"
+REPORT_VERSION = "2.15.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1663,6 +1663,7 @@ def decode_blackbox_native(filepath, raw_params, quiet=False):
     # Attach decoded auxiliary frame data for nav analysis
     data["_slow_frames"] = decoder.slow_frames    # [(frame_idx, {field: value})]
     data["_gps_frames"] = decoder.gps_frames      # [(frame_idx, {field: value})]
+    data["_decoder_stats"] = decoder.stats         # {i_frames, p_frames, errors, ...}
 
     # Detect available nav fields for downstream analysis
     nav_fields = [k for k in data if k.startswith("nav_") or k.startswith("att_") or k == "baro_alt"]
@@ -1769,6 +1770,216 @@ def parse_csv_log(csv_path):
     data["n_rows"] = n_rows
     data["found_columns"] = list(found.keys())
     return data
+
+
+# ─── Log Quality Scorer ──────────────────────────────────────────────────────
+
+def assess_log_quality(data, config=None, filepath=None):
+    """Assess whether a blackbox log is suitable for analysis.
+
+    Returns dict with:
+        usable: bool — True if the log is good enough for full analysis
+        grade: str — "GOOD", "MARGINAL", "UNUSABLE"
+        issues: list of {severity, check, message} dicts
+        summary: str — one-line human-readable summary
+        stats: dict of computed metrics
+    """
+    issues = []
+    stats = {}
+
+    n_rows = data.get("n_rows", 0)
+    sr = data.get("sample_rate", 0)
+    duration = data["time_s"][-1] if "time_s" in data and len(data.get("time_s", [])) > 0 else 0
+    stats["n_rows"] = n_rows
+    stats["sample_rate_hz"] = sr
+    stats["duration_s"] = duration
+
+    # ── Check 1: Duration ──
+    if duration < 2.0:
+        issues.append({"severity": "FAIL", "check": "duration",
+                       "message": f"Log is only {duration:.1f}s — need at least 5s for analysis"})
+    elif duration < 5.0:
+        issues.append({"severity": "WARN", "check": "duration",
+                       "message": f"Log is short ({duration:.1f}s) — results may be unreliable, 10s+ recommended"})
+
+    # ── Check 2: Sample rate ──
+    if sr < 50:
+        issues.append({"severity": "FAIL", "check": "sample_rate",
+                       "message": f"Sample rate {sr:.0f}Hz is too low for spectral analysis (need 100Hz+)"})
+    elif sr < 200:
+        issues.append({"severity": "WARN", "check": "sample_rate",
+                       "message": f"Sample rate {sr:.0f}Hz limits noise analysis to {sr/2:.0f}Hz (500Hz+ preferred)"})
+    stats["nyquist_hz"] = sr / 2 if sr > 0 else 0
+
+    # ── Check 3: Sample count ──
+    min_samples_for_fft = 512
+    if n_rows < min_samples_for_fft:
+        issues.append({"severity": "FAIL", "check": "sample_count",
+                       "message": f"Only {n_rows} samples — need at least {min_samples_for_fft} for FFT"})
+
+    # ── Check 4: Required fields ──
+    has_gyro = any(f"gyro_{ax}" in data for ax in ["roll", "pitch", "yaw"])
+    has_motors = any(f"motor{i}" in data for i in range(8))
+    has_setpoint = any(f"setpoint_{ax}" in data for ax in ["roll", "pitch", "yaw"])
+    stats["has_gyro"] = has_gyro
+    stats["has_motors"] = has_motors
+    stats["has_setpoint"] = has_setpoint
+    stats["field_count"] = len(data.get("found_columns", []))
+
+    if not has_gyro:
+        issues.append({"severity": "FAIL", "check": "missing_gyro",
+                       "message": "No gyro data found — cannot perform noise or PID analysis"})
+    if not has_motors:
+        issues.append({"severity": "WARN", "check": "missing_motors",
+                       "message": "No motor data — motor balance analysis unavailable"})
+    if not has_setpoint:
+        issues.append({"severity": "WARN", "check": "missing_setpoint",
+                       "message": "No setpoint/rcCommand data — PID response analysis unavailable"})
+
+    # ── Check 5: Stick activity (was the pilot actually flying?) ──
+    stick_active = False
+    for ax in ["roll", "pitch", "yaw"]:
+        sk = f"setpoint_{ax}"
+        if sk in data and hasattr(data[sk], '__len__') and len(data[sk]) > 0:
+            sp = data[sk]
+            sp_clean = sp[~np.isnan(sp)] if hasattr(sp, '__len__') else sp
+            if len(sp_clean) > 10:
+                sp_std = float(np.std(sp_clean))
+                if sp_std > 5.0:  # meaningful stick movement
+                    stick_active = True
+                    break
+
+    throttle_active = False
+    if "throttle" in data and hasattr(data["throttle"], '__len__') and len(data["throttle"]) > 0:
+        thr = data["throttle"]
+        thr_clean = thr[~np.isnan(thr)] if hasattr(thr, '__len__') else thr
+        if len(thr_clean) > 10:
+            thr_range = float(np.max(thr_clean) - np.min(thr_clean))
+            stats["throttle_range"] = thr_range
+            if thr_range > 50:
+                throttle_active = True
+
+    stats["stick_active"] = stick_active
+    stats["throttle_active"] = throttle_active
+
+    if not stick_active and not throttle_active:
+        issues.append({"severity": "WARN", "check": "no_stick_activity",
+                       "message": "No stick movement detected — log may be ground-only (armed but not flying)"})
+
+    # ── Check 6: All-zeros channels (dead/disconnected sensors) ──
+    for ax in ["roll", "pitch", "yaw"]:
+        gk = f"gyro_{ax}"
+        if gk in data and hasattr(data[gk], '__len__') and len(data[gk]) > 100:
+            g = data[gk]
+            if np.all(g == 0) or (np.std(g) < 0.01 and np.mean(np.abs(g)) < 0.01):
+                issues.append({"severity": "FAIL", "check": f"zeros_{ax}",
+                               "message": f"Gyro {ax} is all zeros — sensor may be dead or not logging"})
+
+    for i in range(4):
+        mk = f"motor{i}"
+        if mk in data and hasattr(data[mk], '__len__') and len(data[mk]) > 100:
+            m = data[mk]
+            if np.all(m == 0):
+                issues.append({"severity": "WARN", "check": f"motor{i}_zeros",
+                               "message": f"Motor {i} output is all zeros — motor disabled or not armed?"})
+
+    # ── Check 7: Corrupt frame ratio (if decoder stats available) ──
+    decoder_stats = data.get("_decoder_stats", {})
+    if decoder_stats:
+        total = decoder_stats.get("i_frames", 0) + decoder_stats.get("p_frames", 0)
+        errors = decoder_stats.get("errors", 0)
+        stats["decode_errors"] = errors
+        stats["decode_total"] = total
+        if total > 0:
+            error_pct = errors / (total + errors) * 100
+            stats["error_pct"] = error_pct
+            if error_pct > 20:
+                issues.append({"severity": "FAIL", "check": "corrupt_frames",
+                               "message": f"{error_pct:.0f}% of frames corrupt — log may be damaged"})
+            elif error_pct > 5:
+                issues.append({"severity": "WARN", "check": "corrupt_frames",
+                               "message": f"{error_pct:.1f}% of frames had decode errors"})
+
+    # ── Check 8: NaN ratio in gyro data ──
+    for ax in ["roll", "pitch", "yaw"]:
+        gk = f"gyro_{ax}"
+        if gk in data and hasattr(data[gk], '__len__') and len(data[gk]) > 0:
+            nan_pct = np.sum(np.isnan(data[gk])) / len(data[gk]) * 100
+            if nan_pct > 50:
+                issues.append({"severity": "FAIL", "check": f"nan_{ax}",
+                               "message": f"Gyro {ax} has {nan_pct:.0f}% NaN values — data largely missing"})
+            elif nan_pct > 10:
+                issues.append({"severity": "WARN", "check": f"nan_{ax}",
+                               "message": f"Gyro {ax} has {nan_pct:.1f}% NaN values — some data gaps"})
+            stats[f"nan_pct_{ax}"] = nan_pct
+
+    # ── Compute overall grade ──
+    fails = sum(1 for i in issues if i["severity"] == "FAIL")
+    warns = sum(1 for i in issues if i["severity"] == "WARN")
+    stats["fails"] = fails
+    stats["warns"] = warns
+
+    if fails > 0:
+        grade = "UNUSABLE"
+        usable = False
+    elif warns >= 3:
+        grade = "MARGINAL"
+        usable = True
+    elif warns > 0:
+        grade = "MARGINAL"
+        usable = True
+    else:
+        grade = "GOOD"
+        usable = True
+
+    # One-line summary
+    parts = [f"{duration:.1f}s", f"{sr:.0f}Hz", f"{n_rows} rows"]
+    if not has_gyro:
+        parts.append("NO GYRO")
+    if not stick_active and not throttle_active:
+        parts.append("ground-only?")
+    if fails:
+        parts.append(f"{fails} FAIL")
+    if warns:
+        parts.append(f"{warns} WARN")
+    summary = f"[{grade}] {' | '.join(parts)}"
+
+    return {
+        "usable": usable,
+        "grade": grade,
+        "issues": issues,
+        "summary": summary,
+        "stats": stats,
+    }
+
+
+def print_log_quality(quality, verbose=False):
+    """Print log quality assessment to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    grade = quality["grade"]
+    gc = G if grade == "GOOD" else Y if grade == "MARGINAL" else RED
+
+    print(f"\n  {B}Log Quality: {gc}{grade}{R}")
+    stats = quality["stats"]
+    print(f"  {DIM}{stats['duration_s']:.1f}s | {stats['sample_rate_hz']:.0f}Hz | "
+          f"{stats['n_rows']} rows | {stats['field_count']} fields{R}")
+
+    if quality["issues"]:
+        for issue in quality["issues"]:
+            sev = issue["severity"]
+            sc = RED if sev == "FAIL" else Y
+            sym = "✗" if sev == "FAIL" else "⚠"
+            print(f"  {sc}{sym} {sev}: {issue['message']}{R}")
+    else:
+        print(f"  {G}✓ All quality checks passed{R}")
+
+    if verbose:
+        print(f"\n  {DIM}Fields: gyro={'✓' if stats.get('has_gyro') else '✗'} "
+              f"motors={'✓' if stats.get('has_motors') else '✗'} "
+              f"setpoint={'✓' if stats.get('has_setpoint') else '✗'} "
+              f"stick={'active' if stats.get('stick_active') else 'idle'} "
+              f"throttle={'active' if stats.get('throttle_active') else 'idle'}{R}")
+    print()
 
 
 # ─── Signal Analysis ──────────────────────────────────────────────────────────
@@ -5368,6 +5579,140 @@ footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-
 </div><footer>INAV Blackbox Analyzer v{REPORT_VERSION} - Test changes with props off first</footer></body></html>"""
 
 
+# ─── Markdown Report ─────────────────────────────────────────────────────────
+
+def generate_markdown_report(plan, config, data, noise_results, pid_results,
+                             motor_analysis, profile, quality=None):
+    """Generate a Markdown report suitable for pasting into forums/Discord.
+
+    Returns the markdown string.
+    """
+    scores = plan["scores"]
+    craft = config.get("craft_name", "Unknown")
+    fw = config.get("firmware_revision", "?")
+    sr = data.get("sample_rate", 0)
+    duration = data["time_s"][-1] if "time_s" in data and len(data.get("time_s", [])) > 0 else 0
+
+    lines = []
+    lines.append(f"## INAV Blackbox Analysis — {craft}")
+    lines.append(f"")
+    lines.append(f"**Firmware:** {fw}  ")
+    lines.append(f"**Duration:** {duration:.1f}s @ {sr:.0f}Hz  ")
+    lines.append(f"**Frame profile:** {profile['name']}  ")
+    lines.append(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
+    lines.append(f"")
+
+    # Log quality (if available)
+    if quality:
+        grade = quality["grade"]
+        emoji = "✅" if grade == "GOOD" else "⚠️" if grade == "MARGINAL" else "❌"
+        lines.append(f"**Log quality:** {emoji} {grade}")
+        for issue in quality.get("issues", []):
+            sym = "❌" if issue["severity"] == "FAIL" else "⚠️"
+            lines.append(f"- {sym} {issue['message']}")
+        lines.append(f"")
+
+    # Scores
+    lines.append(f"### Scores")
+    lines.append(f"")
+    lines.append(f"| Metric | Score |")
+    lines.append(f"|--------|-------|")
+    lines.append(f"| **Overall** | **{scores.get('overall', 0):.0f}/100** |")
+    for key, label in [("noise", "Noise"), ("pid", "PID Response"),
+                       ("motor", "Motor Balance"), ("osc", "Oscillation")]:
+        val = scores.get(key)
+        if val is not None:
+            lines.append(f"| {label} | {val:.0f}/100 |")
+    lines.append(f"")
+
+    # Verdict
+    verdict = plan.get("verdict_text", plan.get("verdict", "?"))
+    lines.append(f"**Verdict:** {verdict}")
+    lines.append(f"")
+
+    # Findings
+    findings = plan.get("findings", [])
+    if findings:
+        lines.append(f"### Findings")
+        lines.append(f"")
+        for f in findings:
+            sev = f.get("severity", "info")
+            emoji = "🔴" if sev == "critical" else "🟡" if sev == "warning" else "🟢"
+            lines.append(f"- {emoji} {f.get('message', f.get('finding', ''))}")
+        lines.append(f"")
+
+    # Noise fingerprint
+    noise_fp = plan.get("noise_fingerprint", {})
+    fp_peaks = noise_fp.get("peaks", []) if isinstance(noise_fp, dict) else []
+    if fp_peaks:
+        lines.append(f"### Noise Sources")
+        lines.append(f"")
+        if isinstance(noise_fp, dict) and noise_fp.get("summary"):
+            lines.append(f"**{noise_fp['summary']}**")
+            lines.append(f"")
+        for fp in fp_peaks[:8]:
+            source = fp.get("source", "unknown")
+            conf = fp.get("confidence", "?")
+            freq = fp.get("freq_hz", 0)
+            power = fp.get("power_db", 0)
+            detail = fp.get("detail", "")
+            lines.append(f"- **{source}** ({conf} confidence) — {freq:.0f}Hz, {power:.1f}dB"
+                        f"{f' ({detail})' if detail else ''}")
+        lines.append(f"")
+
+    # PID response summary
+    pid_summary = []
+    for i, ax in enumerate(AXIS_NAMES):
+        pr = pid_results[i] if i < len(pid_results) else None
+        if pr and pr.get("tracking_delay_ms") is not None:
+            pid_summary.append(f"- **{ax}**: delay {pr['tracking_delay_ms']:.1f}ms, "
+                              f"overshoot {pr.get('avg_overshoot_pct', 0):.1f}%")
+    if pid_summary:
+        lines.append(f"### PID Response")
+        lines.append(f"")
+        lines.extend(pid_summary)
+        lines.append(f"")
+
+    # Recommended actions (the CLI commands)
+    actions = [a for a in plan.get("actions", []) if not a.get("deferred")]
+    if actions:
+        lines.append(f"### Recommended Changes")
+        lines.append(f"")
+        lines.append(f"```")
+        for a in actions:
+            param = a.get("param", "")
+            new_val = a.get("new", "")
+            if param and new_val != "":
+                lines.append(f"set {param} = {new_val}")
+        lines.append(f"save")
+        lines.append(f"```")
+        lines.append(f"")
+
+        # Show what changed
+        lines.append(f"| Setting | Current | Recommended | Reason |")
+        lines.append(f"|---------|---------|-------------|--------|")
+        for a in actions:
+            param = a.get("param", "")
+            if param:
+                reason = a.get("reason", a.get("action", ""))[:60]
+                lines.append(f"| `{param}` | {a.get('current', '?')} | {a.get('new', '?')} | {reason} |")
+        lines.append(f"")
+
+    deferred = [a for a in plan.get("actions", []) if a.get("deferred")]
+    if deferred:
+        lines.append(f"### Deferred (apply after test flight)")
+        lines.append(f"")
+        for a in deferred:
+            lines.append(f"- `set {a.get('param', '?')} = {a.get('new', '?')}` — {a.get('action', '')}")
+        lines.append(f"")
+
+    lines.append(f"---")
+    lines.append(f"*Generated by [INAV Toolkit v{REPORT_VERSION}]"
+                f"(https://github.com/agoliveira/INAV-Toolkit)*")
+
+    return "\n".join(lines)
+
+
 # ─── State file ───────────────────────────────────────────────────────────────
 
 def save_state(filepath, plan, config, data):
@@ -5481,7 +5826,7 @@ def count_blackbox_logs(filepath):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.14.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.15.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -5538,6 +5883,17 @@ def main():
     parser.add_argument("--trend", metavar="FILE", nargs="?", const="auto",
                         help="Generate HTML trend report showing score progression across flights. "
                              "Optionally specify output filename (default: <craft>_trend.html).")
+    parser.add_argument("--compare", metavar="FILE",
+                        help="Second log file for side-by-side comparison. "
+                             "Usage: inav-analyze flight_A.bbl --compare flight_B.bbl")
+    parser.add_argument("--replay", action="store_true",
+                        help="Generate interactive HTML replay with time-series plots.")
+    parser.add_argument("--check-log", action="store_true",
+                        help="Assess log quality and exit. Reports duration, sample rate, "
+                             "field completeness, corrupt frames, and usability grade.")
+    parser.add_argument("--report", metavar="FORMAT", choices=["md", "markdown"],
+                        help="Generate Markdown report alongside HTML. "
+                             "Usage: inav-analyze flight.bbl --report md")
     args = parser.parse_args()
 
     if args.no_color:
@@ -5724,6 +6080,38 @@ def main():
         _print_flight_history(db, craft, html_path=html_path)
         db.close()
         sys.exit(0)
+
+    # ── Comparison mode: analyze two flights side-by-side ──
+    if args.compare:
+        if not logfile:
+            parser.error("Two log files required: inav-analyze A.bbl --compare B.bbl")
+        if not os.path.isfile(args.compare):
+            print(f"ERROR: Comparison file not found: {args.compare}")
+            sys.exit(1)
+        _run_comparison(logfile, args.compare, args, diff_raw)
+        return
+
+    # ── Replay mode: interactive HTML time-series ──
+    if args.replay:
+        if not logfile:
+            parser.error("logfile required for --replay")
+        _run_replay(logfile, args, diff_raw)
+        return
+
+    # ── Log quality check mode ──
+    if getattr(args, 'check_log', False):
+        if not logfile:
+            parser.error("logfile required for --check-log")
+        raw_params = parse_headers_from_bbl(logfile)
+        config = extract_fc_config(raw_params)
+        ext = os.path.splitext(logfile)[1].lower()
+        if ext in (".bbl", ".bfl", ".bbs"):
+            data = decode_blackbox_native(logfile, raw_params, quiet=True)
+        else:
+            data = parse_csv_log(logfile)
+        quality = assess_log_quality(data, config, logfile)
+        print_log_quality(quality, verbose=True)
+        sys.exit(0 if quality["usable"] else 1)
 
     # ── Multi-log detection and splitting ──
     n_logs = count_blackbox_logs(logfile)
@@ -6264,6 +6652,885 @@ footer {{ text-align:center; color:#555; margin-top:30px; padding:10px; border-t
     print(f"  {G}✓{R} Trend report: {output_path}")
 
 
+# ─── Comparison Mode ─────────────────────────────────────────────────────────
+
+def _analyze_for_compare(logfile, args, diff_raw=None):
+    """Run analysis pipeline on a single file and return structured results.
+    Returns dict with: config, data, noise_results, pid_results, motor_analysis,
+                        dterm_results, plan, noise_fp, hover_osc, profile
+    """
+    raw_params = parse_headers_from_bbl(logfile)
+    config = extract_fc_config(raw_params)
+    if diff_raw:
+        merge_diff_into_config(config, diff_raw)
+
+    # Auto-detect frame
+    craft = config.get("craft_name", "")
+    detected_frame = None
+    if craft:
+        m = re.search(r'\b(\d{1,2})(?:\s*(?:inch|in|"|' + r"'" + r'))?(?:\s|$)', craft, re.I)
+        if m:
+            candidate = int(m.group(1))
+            if 3 <= candidate <= 15:
+                detected_frame = candidate
+
+    frame_inches = args.frame or detected_frame
+    prop_inches = args.props or frame_inches
+    n_blades = args.blades
+    profile = get_frame_profile(frame_inches, prop_inches, n_blades)
+
+    # Decode
+    ext = os.path.splitext(logfile)[1].lower()
+    is_blackbox = ext in (".bbl", ".bfl", ".bbs")
+    if is_blackbox:
+        data = decode_blackbox_native(logfile, raw_params, quiet=True)
+    else:
+        data = parse_csv_log(logfile)
+
+    sr = data["sample_rate"]
+
+    # Run all analyses
+    hover_osc = detect_hover_oscillation(data, sr)
+    noise_results = [analyze_noise(data, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
+    pid_results = [analyze_pid_response(data, i, sr) for i in range(3)]
+    motor_analysis = analyze_motors(data, sr, config)
+    dterm_results = analyze_dterm_noise(data, sr)
+
+    rpm_range = estimate_rpm_range(args.kv, args.cells)
+    prop_harmonics = estimate_prop_harmonics(rpm_range, n_blades) if rpm_range else None
+    noise_fp = fingerprint_noise(noise_results, config, prop_harmonics)
+
+    motor_response = analyze_motor_response(data, sr)
+    phase_lag = None
+    if config_has_filters(config):
+        sig_freq = (profile["noise_band_mid"][0] + profile["noise_band_mid"][1]) / 4
+        phase_lag = estimate_total_phase_lag(config, profile, sig_freq)
+
+    plan = generate_action_plan(noise_results, pid_results, motor_analysis, dterm_results,
+                                config, data, profile, phase_lag, motor_response,
+                                rpm_range, prop_harmonics, hover_osc)
+    plan["noise_fingerprint"] = noise_fp
+
+    return {
+        "config": config, "data": data, "sr": sr,
+        "noise_results": noise_results, "pid_results": pid_results,
+        "motor_analysis": motor_analysis, "dterm_results": dterm_results,
+        "plan": plan, "noise_fp": noise_fp, "hover_osc": hover_osc,
+        "profile": profile, "logfile": logfile,
+    }
+
+
+def _create_comparison_noise_chart(nr_a, nr_b, label_a, label_b):
+    """Create overlaid noise spectrum chart for two flights."""
+    setup_dark_style()
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+    fig.suptitle("Noise Spectrum Comparison", fontsize=14, color="#c0caf5", fontweight="bold", y=1.02)
+
+    for i in range(3):
+        ax = axes[i]
+        a_r = nr_a[i] if nr_a[i] else None
+        b_r = nr_b[i] if nr_b[i] else None
+
+        if a_r:
+            ax.plot(a_r["freqs"], a_r["psd_db"], color="#565f89", linewidth=1.5, alpha=0.7, label=label_a)
+            ax.fill_between(a_r["freqs"], a_r["psd_db"], -80, alpha=0.08, color="#565f89")
+        if b_r:
+            ax.plot(b_r["freqs"], b_r["psd_db"], color=AXIS_COLORS[i], linewidth=1.5, alpha=0.9, label=label_b)
+            ax.fill_between(b_r["freqs"], b_r["psd_db"], -80, alpha=0.12, color=AXIS_COLORS[i])
+
+        ax.set_title(AXIS_NAMES[i], color=AXIS_COLORS[i], fontweight="bold")
+        ax.set_xlabel("Frequency (Hz)")
+        if i == 0:
+            ax.set_ylabel("Power (dB)")
+        max_freq = 1000
+        if a_r:
+            max_freq = min(max_freq, a_r["freqs"][-1])
+        ax.set_xlim(0, max_freq)
+        ax.legend(loc="upper right", fontsize=8, facecolor="#1a1b26", edgecolor="#565f89")
+
+    fig.tight_layout()
+    return fig_to_base64(fig)
+
+
+def _create_comparison_pid_chart(pid_a, pid_b, sr_a, sr_b, label_a, label_b):
+    """Create PID response comparison chart."""
+    setup_dark_style()
+    fig, axes = plt.subplots(3, 1, figsize=(18, 10), sharex=True)
+    fig.suptitle("PID Response Comparison", fontsize=14, color="#c0caf5", fontweight="bold", y=1.01)
+
+    for i in range(3):
+        ax = axes[i]
+        pa = pid_a[i] if pid_a[i] else None
+        pb = pid_b[i] if pid_b[i] else None
+
+        if pa:
+            sp, gy = pa["setpoint"], pa["gyro"]
+            ws = int(sr_a * 2)
+            bs, bv = 0, 0
+            for s in range(0, max(1, len(sp) - ws), ws // 4):
+                v = np.var(sp[s:s + ws])
+                if v > bv:
+                    bv, bs = v, s
+            sl = slice(bs, min(bs + ws, len(sp)))
+            t = np.arange(sl.stop - sl.start) / sr_a * 1000
+            n = min(len(t), sl.stop - sl.start)
+            ax.plot(t[:n], gy[sl][:n], color="#565f89", linewidth=1.0, alpha=0.6, label=f"Gyro ({label_a})")
+            ax.plot(t[:n], sp[sl][:n], color="#3b4261", linewidth=1.0, alpha=0.4, linestyle="--", label=f"SP ({label_a})")
+
+        if pb:
+            sp, gy = pb["setpoint"], pb["gyro"]
+            ws = int(sr_b * 2)
+            bs, bv = 0, 0
+            for s in range(0, max(1, len(sp) - ws), ws // 4):
+                v = np.var(sp[s:s + ws])
+                if v > bv:
+                    bv, bs = v, s
+            sl = slice(bs, min(bs + ws, len(sp)))
+            t = np.arange(sl.stop - sl.start) / sr_b * 1000
+            n = min(len(t), sl.stop - sl.start)
+            ax.plot(t[:n], gy[sl][:n], color=AXIS_COLORS[i], linewidth=1.2, alpha=0.9, label=f"Gyro ({label_b})")
+            ax.plot(t[:n], sp[sl][:n], color=AXIS_COLORS[i], linewidth=1.0, alpha=0.4, linestyle="--", label=f"SP ({label_b})")
+
+        ax.set_title(AXIS_NAMES[i], color=AXIS_COLORS[i], fontweight="bold")
+        ax.set_ylabel("deg/s")
+        ax.legend(loc="upper right", fontsize=7, facecolor="#1a1b26", edgecolor="#565f89", ncol=2)
+
+    axes[-1].set_xlabel("Time (ms)")
+    fig.tight_layout()
+    return fig_to_base64(fig)
+
+
+def _generate_comparison_html(res_a, res_b, charts, label_a, label_b):
+    """Generate comparison HTML report."""
+    sa = res_a["plan"]["scores"]
+    sb = res_b["plan"]["scores"]
+
+    def _delta_html(key, higher_is_better=True):
+        va = sa.get(key)
+        vb = sb.get(key)
+        if va is None or vb is None:
+            return "-"
+        d = vb - va
+        if abs(d) < 0.5:
+            return '<span style="color:var(--dm)">→ 0</span>'
+        color = "var(--gn)" if (d > 0) == higher_is_better else "var(--rd)"
+        sign = "+" if d > 0 else ""
+        return f'<span style="color:{color};font-weight:700">{sign}{d:.0f}</span>'
+
+    def _score_cell(val, is_b=False):
+        if val is None:
+            return '<td style="color:var(--dm)">-</td>'
+        color = "var(--gn)" if val >= 85 else "var(--yl)" if val >= 60 else "var(--rd)"
+        weight = "700" if is_b else "400"
+        return f'<td style="color:{color};font-weight:{weight}">{val:.0f}</td>'
+
+    # Config diff table
+    cfg_a = res_a["config"]
+    cfg_b = res_b["config"]
+    config_rows = ""
+    config_keys = set()
+    for k in ["roll_p", "roll_i", "roll_d", "pitch_p", "pitch_i", "pitch_d",
+              "yaw_p", "yaw_i", "yaw_d", "gyro_lowpass_hz", "dterm_lpf_hz",
+              "dyn_notch_min_hz", "dyn_notch_q", "looptime"]:
+        va = cfg_a.get(k, "-")
+        vb = cfg_b.get(k, "-")
+        if va != vb:
+            config_rows += (f'<tr><td>{k}</td><td style="color:var(--dm)">{va}</td>'
+                           f'<td style="color:var(--bl);font-weight:600">{vb}</td></tr>')
+            config_keys.add(k)
+
+    ci = lambda k: f'<img src="data:image/png;base64,{charts[k]}" style="width:100%;border-radius:4px">' if charts.get(k) else ""
+
+    craft_a = cfg_a.get("craft_name", os.path.basename(res_a["logfile"]))
+    craft_b = cfg_b.get("craft_name", os.path.basename(res_b["logfile"]))
+
+    # Craft/frame mismatch warning
+    warnings_html = ""
+    if craft_a != craft_b and craft_a and craft_b:
+        warnings_html += (f'<div style="background:rgba(224,175,104,.1);border:1px solid rgba(224,175,104,.3);'
+                          f'border-radius:6px;padding:12px;margin:12px 0;color:var(--yl);font-size:.85rem">'
+                          f'⚠ Different craft: "{craft_a}" vs "{craft_b}" — thresholds may differ</div>')
+
+    # Big improvement arrow
+    ov_a = sa.get("overall", 0) or 0
+    ov_b = sb.get("overall", 0) or 0
+    ov_delta = ov_b - ov_a
+    if ov_delta > 5:
+        arrow_html = (f'<div style="text-align:center;padding:24px;margin:16px 0;border-radius:12px;'
+                      f'background:rgba(158,206,106,.08);border:2px solid rgba(158,206,106,.3)">'
+                      f'<div style="font-size:3rem;color:var(--gn)">▲</div>'
+                      f'<div style="font-size:1.5rem;font-weight:700;color:var(--gn)">+{ov_delta:.0f} points</div>'
+                      f'<div style="color:var(--dm);font-size:.85rem;margin-top:4px">Tune improved</div></div>')
+    elif ov_delta < -5:
+        arrow_html = (f'<div style="text-align:center;padding:24px;margin:16px 0;border-radius:12px;'
+                      f'background:rgba(247,118,142,.08);border:2px solid rgba(247,118,142,.3)">'
+                      f'<div style="font-size:3rem;color:var(--rd)">▼</div>'
+                      f'<div style="font-size:1.5rem;font-weight:700;color:var(--rd)">{ov_delta:.0f} points</div>'
+                      f'<div style="color:var(--dm);font-size:.85rem;margin-top:4px">Tune degraded</div></div>')
+    else:
+        arrow_html = (f'<div style="text-align:center;padding:16px;margin:16px 0;border-radius:12px;'
+                      f'background:rgba(122,162,247,.06);border:1px solid rgba(122,162,247,.2)">'
+                      f'<div style="font-size:1.2rem;color:var(--dm)">→ Roughly the same ({ov_delta:+.0f})</div></div>')
+
+    # Motor balance comparison
+    motor_html = ""
+    ma_a = res_a.get("motor_analysis")
+    ma_b = res_b.get("motor_analysis")
+    if ma_a and ma_b and not ma_a.get("idle_detected") and not ma_b.get("idle_detected"):
+        sp_a = ma_a.get("balance_spread_pct", 0)
+        sp_b = ma_b.get("balance_spread_pct", 0)
+        sp_d = sp_b - sp_a
+        sp_color = "var(--gn)" if sp_d < -0.5 else "var(--rd)" if sp_d > 0.5 else "var(--dm)"
+
+        motor_rows = ""
+        for i, (m_a, m_b) in enumerate(zip(ma_a["motors"], ma_b["motors"])):
+            sat_d = m_b["saturation_pct"] - m_a["saturation_pct"]
+            sc = "var(--gn)" if sat_d < -0.5 else "var(--rd)" if sat_d > 0.5 else "var(--dm)"
+            motor_rows += (f'<tr><td>M{m_a["motor"]}</td>'
+                          f'<td>{m_a["avg_pct"]:.1f}%</td><td>{m_b["avg_pct"]:.1f}%</td>'
+                          f'<td>{m_a["saturation_pct"]:.1f}%</td><td>{m_b["saturation_pct"]:.1f}%</td>'
+                          f'<td style="color:{sc}">{sat_d:+.1f}%</td></tr>')
+
+        motor_html = (f'<section><h2>Motor Balance</h2><div class="cc"><table>'
+                     f'<tr><th>Motor</th><th>Avg A</th><th>Avg B</th>'
+                     f'<th>Sat A</th><th>Sat B</th><th>Δ Sat</th></tr>'
+                     f'{motor_rows}'
+                     f'<tr style="border-top:2px solid var(--bd)"><td style="font-weight:700">Spread</td>'
+                     f'<td colspan="2" style="text-align:center">{sp_a:.1f}%</td>'
+                     f'<td colspan="2" style="text-align:center">{sp_b:.1f}%</td>'
+                     f'<td style="color:{sp_color}">{sp_d:+.1f}%</td></tr>'
+                     f'</table></div></section>')
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>INAV Flight Comparison</title><style>
+:root{{--bg:#0f1117;--cd:#1a1b26;--ca:#1e2030;--bd:#2a2d3e;--tx:#c0caf5;--dm:#7982a9;--bl:#7aa2f7;--gn:#9ece6a;--rd:#f7768e;--yl:#e0af68;--tl:#4ecdc4;--pp:#bb9af7;--or:#ff9e64}}
+*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:'SF Mono','Cascadia Code','JetBrains Mono',monospace;background:var(--bg);color:var(--tx);line-height:1.6}}
+.ct{{max-width:1200px;margin:0 auto;padding:24px}}header{{background:linear-gradient(135deg,#1a1b26,#24283b);border-bottom:2px solid var(--pp);padding:24px 0;text-align:center}}
+header h1{{font-size:1.5rem;letter-spacing:3px;text-transform:uppercase;color:var(--pp)}}.mt{{color:var(--dm);font-size:.8rem;margin-top:8px}}
+section{{margin:32px 0}}h2{{font-size:1rem;color:var(--bl);letter-spacing:2px;text-transform:uppercase;border-bottom:1px solid var(--bd);padding-bottom:8px;margin-bottom:16px}}
+.cc{{background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:16px;margin:12px 0;overflow-x:auto}}
+table{{width:100%;border-collapse:collapse;margin:8px 0}}th{{background:var(--ca);color:var(--bl);font-size:.7rem;letter-spacing:1px;text-transform:uppercase;padding:8px 14px;text-align:left;border-bottom:1px solid var(--bd)}}
+td{{padding:7px 14px;border-bottom:1px solid var(--bd);font-size:.85rem}}
+.delta-up{{color:var(--gn);font-weight:700}}.delta-down{{color:var(--rd);font-weight:700}}.delta-same{{color:var(--dm)}}
+footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-top:1px solid var(--bd);margin-top:40px}}
+</style></head><body>
+<header><h1>▲ INAV Flight Comparison</h1>
+<div class="mt">{label_a} vs {label_b} | {datetime.now().strftime('%Y-%m-%d %H:%M')}</div></header>
+<div class="ct">
+{warnings_html}
+{arrow_html}
+<section><h2>Score Comparison</h2><div class="cc">
+<table>
+<tr><th>Metric</th><th>{label_a}</th><th>{label_b}</th><th>Change</th></tr>
+<tr><td style="font-weight:700">Overall</td>{_score_cell(sa.get("overall"))}{_score_cell(sb.get("overall"), True)}<td>{_delta_html("overall")}</td></tr>
+<tr><td>Noise</td>{_score_cell(sa.get("noise"))}{_score_cell(sb.get("noise"), True)}<td>{_delta_html("noise")}</td></tr>
+<tr><td>PID Response</td>{_score_cell(sa.get("pid"))}{_score_cell(sb.get("pid"), True)}<td>{_delta_html("pid")}</td></tr>
+<tr><td>Motor Balance</td>{_score_cell(sa.get("motor"))}{_score_cell(sb.get("motor"), True)}<td>{_delta_html("motor")}</td></tr>
+</table></div></section>
+
+<section><h2>Verdict</h2><div class="cc">
+<table>
+<tr><th></th><th>{label_a}</th><th>{label_b}</th></tr>
+<tr><td>Verdict</td><td style="color:var(--dm)">{res_a["plan"].get("verdict_text","?")}</td>
+<td style="color:var(--bl);font-weight:600">{res_b["plan"].get("verdict_text","?")}</td></tr>
+<tr><td>Duration</td><td>{res_a["data"]["time_s"][-1]:.1f}s</td><td>{res_b["data"]["time_s"][-1]:.1f}s</td></tr>
+<tr><td>Actions Remaining</td><td>{len([a for a in res_a["plan"]["actions"] if not a.get("deferred")])}</td>
+<td>{len([a for a in res_b["plan"]["actions"] if not a.get("deferred")])}</td></tr>
+</table></div></section>
+
+{'<section><h2>Config Changes</h2><div class="cc"><table><tr><th>Setting</th><th>'+label_a+'</th><th>'+label_b+'</th></tr>'+config_rows+'</table></div></section>' if config_rows else ''}
+
+{motor_html}
+<section><h2>Noise Spectrum Overlay</h2><div class="cc">{ci("noise")}</div></section>
+<section><h2>PID Response Comparison</h2><div class="cc">{ci("pid")}</div></section>
+
+</div><footer>INAV Blackbox Analyzer v{REPORT_VERSION} - Comparison Report</footer></body></html>"""
+
+
+def _run_comparison(file_a, file_b, args, diff_raw):
+    """Run comparative analysis on two flight logs."""
+    R, B, C, G, Y, RED, DIM = _colors()
+
+    print(f"\n  ▲ INAV Flight Comparison v{REPORT_VERSION}")
+    print(f"  Flight A: {file_a}")
+    print(f"  Flight B: {file_b}")
+    print()
+
+    print(f"  Analyzing flight A...", end=" ", flush=True)
+    res_a = _analyze_for_compare(file_a, args, diff_raw)
+    sa = res_a["plan"]["scores"]
+    print(f"score {sa['overall']:.0f}/100")
+
+    print(f"  Analyzing flight B...", end=" ", flush=True)
+    res_b = _analyze_for_compare(file_b, args, diff_raw)
+    sb = res_b["plan"]["scores"]
+    print(f"score {sb['overall']:.0f}/100")
+
+    label_a = os.path.splitext(os.path.basename(file_a))[0]
+    label_b = os.path.splitext(os.path.basename(file_b))[0]
+
+    # Warn if different craft or frame sizes
+    craft_a = res_a["config"].get("craft_name", "")
+    craft_b = res_b["config"].get("craft_name", "")
+    if craft_a and craft_b and craft_a != craft_b:
+        print(f"  {Y}⚠ Different craft names: \"{craft_a}\" vs \"{craft_b}\"{R}")
+        print(f"  {DIM}  Comparison still works but thresholds may differ.{R}")
+    profile_a = res_a["profile"]["name"]
+    profile_b = res_b["profile"]["name"]
+    if profile_a != profile_b:
+        print(f"  {Y}⚠ Different frame profiles: {profile_a} vs {profile_b}{R}")
+        print(f"  {DIM}  Score thresholds differ — deltas may reflect profile, not tuning.{R}")
+
+    # Terminal comparison
+    print(f"\n  {B}{'═' * 60}{R}")
+    print(f"  {B}COMPARISON: {label_a} → {label_b}{R}")
+    print(f"  {B}{'═' * 60}{R}")
+
+    metrics = [
+        ("Overall", sa.get("overall"), sb.get("overall")),
+        ("Noise", sa.get("noise"), sb.get("noise")),
+        ("PID", sa.get("pid"), sb.get("pid")),
+        ("Motor", sa.get("motor"), sb.get("motor")),
+    ]
+
+    print(f"\n  {'Metric':<16} {'A':>8} {'B':>8} {'Δ':>8}")
+    print(f"  {'─' * 44}")
+
+    for name, va, vb in metrics:
+        va_str = f"{va:.0f}" if va is not None else "-"
+        vb_str = f"{vb:.0f}" if vb is not None else "-"
+        if va is not None and vb is not None:
+            d = vb - va
+            if abs(d) < 0.5:
+                delta_str = f"{DIM}→ 0{R}"
+            elif d > 0:
+                delta_str = f"{G}+{d:.0f}{R}"
+            else:
+                delta_str = f"{RED}{d:.0f}{R}"
+        else:
+            delta_str = "-"
+        print(f"  {name:<16} {va_str:>8} {vb_str:>8} {delta_str}")
+
+    # PID response comparison
+    print(f"\n  {B}PID Response:{R}")
+    print(f"  {'Axis':<8} {'Delay A':>10} {'Delay B':>10} {'OS A':>8} {'OS B':>8}")
+    print(f"  {'─' * 50}")
+    for i in range(3):
+        pa = res_a["pid_results"][i]
+        pb = res_b["pid_results"][i]
+        da = f"{pa['tracking_delay_ms']:.1f}ms" if pa and pa["tracking_delay_ms"] is not None else "-"
+        db = f"{pb['tracking_delay_ms']:.1f}ms" if pb and pb["tracking_delay_ms"] is not None else "-"
+        oa = f"{pa['avg_overshoot_pct']:.1f}%" if pa and pa["avg_overshoot_pct"] is not None else "-"
+        ob = f"{pb['avg_overshoot_pct']:.1f}%" if pb and pb["avg_overshoot_pct"] is not None else "-"
+        print(f"  {AXIS_NAMES[i]:<8} {da:>10} {db:>10} {oa:>8} {ob:>8}")
+
+    # Motor balance comparison
+    ma_a = res_a["motor_analysis"]
+    ma_b = res_b["motor_analysis"]
+    if ma_a and ma_b and not ma_a.get("idle_detected") and not ma_b.get("idle_detected"):
+        print(f"\n  {B}Motor Balance:{R}")
+        print(f"  {'':12} {'Spread A':>10} {'Spread B':>10} {'Δ':>8}")
+        print(f"  {'─' * 44}")
+        sp_a = ma_a.get("balance_spread_pct", 0)
+        sp_b = ma_b.get("balance_spread_pct", 0)
+        d = sp_b - sp_a
+        dc = G if d < -0.5 else RED if d > 0.5 else DIM
+        print(f"  {'Spread':<12} {sp_a:>9.1f}% {sp_b:>9.1f}% {dc}{d:>+.1f}%{R}")
+
+        sat_a = max(m["saturation_pct"] for m in ma_a["motors"])
+        sat_b = max(m["saturation_pct"] for m in ma_b["motors"])
+        d = sat_b - sat_a
+        dc = G if d < -0.5 else RED if d > 0.5 else DIM
+        print(f"  {'Peak Sat':<12} {sat_a:>9.1f}% {sat_b:>9.1f}% {dc}{d:>+.1f}%{R}")
+
+    overall_delta = (sb.get("overall", 0) or 0) - (sa.get("overall", 0) or 0)
+    print(f"\n  {B}{'═' * 60}{R}")
+    if overall_delta > 5:
+        print(f"  {G}▲ Overall improved by {overall_delta:.0f} points{R}")
+    elif overall_delta < -5:
+        print(f"  {RED}▼ Overall degraded by {abs(overall_delta):.0f} points{R}")
+    else:
+        print(f"  {Y}→ Overall score roughly the same{R}")
+
+    # Generate HTML report
+    if not args.no_html:
+        print(f"\n  Generating comparison report...")
+        charts = {}
+        charts["noise"] = _create_comparison_noise_chart(
+            res_a["noise_results"], res_b["noise_results"], label_a, label_b)
+        charts["pid"] = _create_comparison_pid_chart(
+            res_a["pid_results"], res_b["pid_results"],
+            res_a["sr"], res_b["sr"], label_a, label_b)
+
+        html = _generate_comparison_html(res_a, res_b, charts, label_a, label_b)
+        on = args.output or f"{label_a}_vs_{label_b}_compare.html"
+        op = os.path.join(os.path.dirname(file_a) or ".", on)
+        with open(op, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"  ✓ Report: {op}")
+
+    print()
+
+
+# ─── Replay Mode ─────────────────────────────────────────────────────────────
+
+def _downsample(arr, target_points=5000):
+    """Downsample array to target number of points using decimation."""
+    if len(arr) <= target_points:
+        return arr.tolist() if hasattr(arr, 'tolist') else list(arr)
+    step = max(1, len(arr) // target_points)
+    return arr[::step].tolist() if hasattr(arr, 'tolist') else list(arr[::step])
+
+
+def _compute_spectrogram(gyro, sr, nperseg=256, noverlap=None):
+    """Compute spectrogram for noise heatmap over time.
+
+    Returns: (times, freqs, power_db) where power_db is a 2D array [freq x time].
+    """
+    if noverlap is None:
+        noverlap = nperseg // 2
+
+    step = nperseg - noverlap
+    n_segments = max(1, (len(gyro) - nperseg) // step + 1)
+
+    # Limit segments for HTML size
+    max_segments = 400
+    if n_segments > max_segments:
+        step = max(1, (len(gyro) - nperseg) // max_segments)
+        n_segments = min(max_segments, (len(gyro) - nperseg) // step + 1)
+
+    freqs = np.fft.rfftfreq(nperseg, 1.0 / sr)
+    # Only keep up to 500Hz
+    freq_mask = freqs <= 500
+    freqs = freqs[freq_mask]
+
+    window = np.hanning(nperseg)
+    power = np.zeros((len(freqs), n_segments))
+    times = np.zeros(n_segments)
+
+    for i in range(n_segments):
+        start = i * step
+        end = start + nperseg
+        if end > len(gyro):
+            break
+        segment = gyro[start:end] * window
+        fft_vals = np.fft.rfft(segment)
+        psd = np.abs(fft_vals[:len(freqs)]) ** 2
+        psd[psd < 1e-12] = 1e-12
+        power[:, i] = 10 * np.log10(psd)
+        times[i] = (start + nperseg / 2) / sr
+
+    return times.tolist(), freqs.tolist(), power.tolist()
+
+
+def _extract_flight_modes(data, sr):
+    """Extract flight mode transitions from slow frames.
+
+    Returns list of {start_s, end_s, modes} for the flight mode overlay bar.
+    INAV stores flight modes as a bitmask in slow frames.
+    """
+    slow_frames = data.get("_slow_frames", [])
+    if not slow_frames:
+        return []
+
+    # INAV flight mode IDs (from src/main/fc/runtime_config.h)
+    MODE_NAMES = {
+        0: "ARM", 1: "ANGLE", 2: "HORIZON", 3: "NAV ALTHOLD",
+        4: "HEADING HOLD", 5: "HEADFREE", 6: "HEAD ADJ",
+        7: "NAV RTH", 8: "NAV POSHOLD", 9: "MANUAL",
+        10: "BEEPER", 11: "NAV LAUNCH",
+        12: "OSD SW", 28: "NAV CRUISE",
+        29: "NAV COURSE HOLD", 45: "ANGLE HOLD",
+    }
+
+    n_rows = data.get("n_rows", len(data.get("time_s", [])))
+    transitions = []
+
+    for frame_idx, fields in slow_frames:
+        # Look for flightModeFlags in the slow frame
+        mode_flags = fields.get("flightModeFlags", None)
+        if mode_flags is None:
+            # Try alternative field names
+            for k in fields:
+                if "flight" in k.lower() and "mode" in k.lower():
+                    mode_flags = fields[k]
+                    break
+
+        if mode_flags is not None:
+            # Decode bitmask
+            try:
+                flags = int(mode_flags)
+            except (ValueError, TypeError):
+                continue
+
+            active_modes = []
+            for bit, name in MODE_NAMES.items():
+                if flags & (1 << bit):
+                    active_modes.append(name)
+
+            t_s = frame_idx / sr if sr > 0 else 0
+            if frame_idx < n_rows:
+                t_s = data["time_s"][min(frame_idx, len(data["time_s"]) - 1)]
+
+            transitions.append({
+                "time_s": float(t_s),
+                "modes": active_modes,
+                "flags": flags,
+            })
+
+    if not transitions:
+        return []
+
+    # Convert transitions to segments
+    segments = []
+    for i, tr in enumerate(transitions):
+        end_t = transitions[i + 1]["time_s"] if i + 1 < len(transitions) else data["time_s"][-1]
+        label = ", ".join(tr["modes"]) if tr["modes"] else "DISARMED"
+        segments.append({
+            "start_s": round(tr["time_s"], 3),
+            "end_s": round(end_t, 3),
+            "label": label,
+        })
+
+    return segments
+
+
+def _generate_replay_html(config, data, sr, noise_results=None):
+    """Generate interactive HTML replay with Plotly.js time-series,
+    spectrogram waterfall, synced axes, and flight mode overlay.
+    """
+    craft = config.get("craft_name", "Unknown")
+    fw = config.get("firmware_revision", "")
+    duration = data["time_s"][-1]
+
+    # Prepare data series — keep more points for Plotly WebGL
+    max_pts = 20000
+    time_ds = _downsample(data["time_s"], max_pts)
+    step = max(1, len(data["time_s"]) // max_pts)
+
+    # Gyro and setpoint
+    gyro_data = {}
+    sp_data = {}
+    for ax in ["roll", "pitch", "yaw"]:
+        gk = f"gyro_{ax}"
+        sk = f"setpoint_{ax}"
+        if gk in data:
+            gyro_data[ax] = _downsample(data[gk], max_pts)
+        if sk in data:
+            sp_data[ax] = _downsample(data[sk], max_pts)
+
+    # Motors
+    motor_data = {}
+    for i in range(8):
+        mk = f"motor{i}"
+        if mk in data:
+            raw = data[mk]
+            if hasattr(raw, '__len__') and len(raw) > 0:
+                raw_max = np.max(raw)
+                if raw_max > 100:
+                    raw_min = np.min(raw[raw > 0]) if np.any(raw > 0) else 0
+                    rng = raw_max - raw_min if raw_max > raw_min else 1
+                    motor_data[f"M{i}"] = _downsample(
+                        (raw - raw_min) / rng * 100, max_pts)
+                else:
+                    motor_data[f"M{i}"] = _downsample(raw, max_pts)
+
+    # Throttle
+    throttle = None
+    if "throttle" in data:
+        throttle = _downsample(data["throttle"], max_pts)
+
+    # Spectrogram waterfall — compute on roll gyro (most representative)
+    spectrogram = None
+    gyro_key = None
+    for ax in ["roll", "pitch"]:
+        if f"gyro_{ax}" in data:
+            gyro_key = f"gyro_{ax}"
+            break
+
+    if gyro_key is not None:
+        raw_gyro = data[gyro_key]
+        if len(raw_gyro) > 512:
+            spec_times, spec_freqs, spec_power = _compute_spectrogram(
+                raw_gyro, sr, nperseg=256)
+            spectrogram = {
+                "times": spec_times,
+                "freqs": spec_freqs,
+                "power": spec_power,
+            }
+
+    # Flight mode overlay
+    flight_modes = _extract_flight_modes(data, sr)
+
+    import json as _json
+    payload = _json.dumps({
+        "time": time_ds,
+        "gyro": gyro_data,
+        "setpoint": sp_data,
+        "motors": motor_data,
+        "throttle": throttle,
+        "spectrogram": spectrogram,
+        "flight_modes": flight_modes,
+        "duration": duration,
+    }, separators=(',', ':'))
+
+    axis_colors = {"roll": "#FF6B6B", "pitch": "#4ECDC4", "yaw": "#FFD93D"}
+    motor_colors = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA",
+                    "#FF9E64", "#9ECE6A", "#7AA2F7", "#BB9AF7"]
+
+    # Mode colors for the overlay bar
+    mode_colors = {
+        "ARM": "#3b4261", "ANGLE": "#7aa2f7", "HORIZON": "#bb9af7",
+        "NAV ALTHOLD": "#9ece6a", "NAV RTH": "#f7768e",
+        "NAV POSHOLD": "#4ecdc4", "MANUAL": "#565f89",
+        "NAV CRUISE": "#e0af68", "NAV COURSE HOLD": "#e0af68",
+        "NAV LAUNCH": "#ff9e64", "HEADING HOLD": "#73daca",
+    }
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>INAV Flight Replay - {craft}</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.27.1/plotly.min.js"></script>
+<style>
+:root{{--bg:#0f1117;--cd:#1a1b26;--ca:#1e2030;--bd:#2a2d3e;--tx:#c0caf5;--dm:#7982a9;--bl:#7aa2f7}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'SF Mono','Cascadia Code',monospace;background:var(--bg);color:var(--tx);line-height:1.6}}
+.ct{{max-width:1400px;margin:0 auto;padding:16px}}
+header{{background:linear-gradient(135deg,#1a1b26,#24283b);border-bottom:2px solid var(--bl);padding:20px 0;text-align:center}}
+header h1{{font-size:1.3rem;letter-spacing:3px;text-transform:uppercase;color:var(--bl)}}
+.mt{{color:var(--dm);font-size:.75rem;margin-top:6px}}
+.panel{{background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:8px;margin:8px 0}}
+.panel h3{{font-size:.8rem;color:var(--bl);letter-spacing:2px;text-transform:uppercase;margin:4px 8px}}
+.mode-bar{{display:flex;height:24px;border-radius:4px;overflow:hidden;margin:8px 0;background:var(--ca);border:1px solid var(--bd)}}
+.mode-seg{{display:flex;align-items:center;justify-content:center;font-size:.6rem;font-weight:600;letter-spacing:.5px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:#fff;opacity:0.9}}
+.mode-legend{{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0;font-size:.65rem}}
+.mode-legend span{{padding:2px 6px;border-radius:3px;opacity:0.9}}
+footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:16px 0;border-top:1px solid var(--bd);margin-top:24px}}
+</style></head><body>
+<header><h1>▲ INAV Flight Replay</h1>
+<div class="mt">{craft} | {fw} | {duration:.1f}s | {sr:.0f}Hz | {datetime.now().strftime('%Y-%m-%d %H:%M')}</div></header>
+<div class="ct">
+
+<div class="panel"><h3>Flight Modes</h3><div id="modeBar" class="mode-bar"></div><div id="modeLegend" class="mode-legend"></div></div>
+
+<div class="panel"><h3>Gyro vs Setpoint — Roll</h3><div id="plotRoll" style="height:220px"></div></div>
+<div class="panel"><h3>Gyro vs Setpoint — Pitch</h3><div id="plotPitch" style="height:220px"></div></div>
+<div class="panel"><h3>Gyro vs Setpoint — Yaw</h3><div id="plotYaw" style="height:220px"></div></div>
+<div class="panel"><h3>Motor Output (%)</h3><div id="plotMotors" style="height:220px"></div></div>
+{'<div class="panel"><h3>Noise Spectrogram (Waterfall)</h3><div id="plotSpectro" style="height:280px"></div></div>' if spectrogram else ''}
+{'<div class="panel"><h3>Throttle</h3><div id="plotThrottle" style="height:160px"></div></div>' if throttle else ''}
+
+</div>
+<footer>INAV Blackbox Analyzer v{REPORT_VERSION} - Interactive Replay (zoom any panel, all sync)</footer>
+
+<script>
+const D = {payload};
+const COLORS = {_json.dumps(axis_colors)};
+const MCOLORS = {_json.dumps(motor_colors)};
+const MODE_COLORS = {_json.dumps(mode_colors)};
+
+const LAYOUT_BASE = {{
+    paper_bgcolor: '#1a1b26', plot_bgcolor: '#1a1b26',
+    font: {{ family: "'SF Mono','Cascadia Code',monospace", size: 10, color: '#7982a9' }},
+    margin: {{ l: 50, r: 16, t: 8, b: 32 }},
+    xaxis: {{ color: '#565f89', gridcolor: '#24283b', zeroline: false,
+              range: [0, Math.min(5, D.duration)] }},
+    yaxis: {{ color: '#565f89', gridcolor: '#24283b', zeroline: false }},
+    legend: {{ font: {{ size: 9 }}, bgcolor: 'rgba(26,27,38,0.8)', bordercolor: '#2a2d3e', borderwidth: 1,
+               x: 1, xanchor: 'right', y: 1, yanchor: 'top' }},
+    hovermode: 'x unified',
+}};
+
+const allPlotIds = [];
+
+function makePlot(divId, traces, yLabel, extra) {{
+    const layout = JSON.parse(JSON.stringify(LAYOUT_BASE));
+    layout.yaxis.title = {{ text: yLabel, font: {{ size: 10 }} }};
+    if (extra) Object.assign(layout, extra);
+    Plotly.newPlot(divId, traces, layout, {{
+        responsive: true,
+        displayModeBar: true,
+        modeBarButtonsToRemove: ['sendDataToCloud','lasso2d','select2d'],
+        displaylogo: false,
+    }});
+    allPlotIds.push(divId);
+}}
+
+// ── Gyro/Setpoint panels ──
+['roll','pitch','yaw'].forEach(ax => {{
+    const traces = [];
+    if (D.setpoint[ax]) traces.push({{
+        x: D.time, y: D.setpoint[ax], type: 'scattergl', mode: 'lines',
+        name: 'Setpoint', line: {{ color: '#565f89', width: 1.5 }}
+    }});
+    if (D.gyro[ax]) traces.push({{
+        x: D.time, y: D.gyro[ax], type: 'scattergl', mode: 'lines',
+        name: 'Gyro', line: {{ color: COLORS[ax], width: 1.2 }}
+    }});
+    if (traces.length) makePlot('plot'+ax.charAt(0).toUpperCase()+ax.slice(1), traces, 'deg/s');
+}});
+
+// ── Motor panel ──
+const mTraces = Object.entries(D.motors).map(([name,vals],i) => ({{
+    x: D.time, y: vals, type: 'scattergl', mode: 'lines',
+    name: name, line: {{ color: MCOLORS[i%MCOLORS.length], width: 1 }}
+}}));
+if (mTraces.length) makePlot('plotMotors', mTraces, '%');
+
+// ── Spectrogram waterfall ──
+if (D.spectrogram && document.getElementById('plotSpectro')) {{
+    const spec = D.spectrogram;
+    const trace = {{
+        x: spec.times, y: spec.freqs, z: spec.power,
+        type: 'heatmap',
+        colorscale: [
+            [0, '#0f1117'], [0.15, '#1a1b26'], [0.3, '#24283b'],
+            [0.45, '#7aa2f7'], [0.6, '#4ecdc4'], [0.75, '#e0af68'],
+            [0.9, '#ff9e64'], [1.0, '#f7768e']
+        ],
+        colorbar: {{ title: 'dB', titlefont: {{ size: 9 }}, tickfont: {{ size: 8 }},
+                     len: 0.8, thickness: 12 }},
+        hovertemplate: '%{{x:.2f}}s<br>%{{y:.0f}}Hz<br>%{{z:.1f}}dB<extra></extra>',
+    }};
+    const layout = JSON.parse(JSON.stringify(LAYOUT_BASE));
+    layout.yaxis.title = {{ text: 'Frequency (Hz)', font: {{ size: 10 }} }};
+    layout.yaxis.range = [0, 500];
+    Plotly.newPlot('plotSpectro', [trace], layout, {{
+        responsive: true, displayModeBar: true, displaylogo: false,
+        modeBarButtonsToRemove: ['sendDataToCloud','lasso2d','select2d'],
+    }});
+    allPlotIds.push('plotSpectro');
+}}
+
+// ── Throttle panel ──
+if (D.throttle && document.getElementById('plotThrottle')) {{
+    makePlot('plotThrottle', [{{
+        x: D.time, y: D.throttle, type: 'scattergl', mode: 'lines',
+        name: 'Throttle', line: {{ color: '#7aa2f7', width: 1.2 }},
+        fill: 'tozeroy', fillcolor: 'rgba(122,162,247,0.08)',
+    }}], 'µs');
+}}
+
+// ── Synced x-axis across all panels ──
+allPlotIds.forEach(srcId => {{
+    document.getElementById(srcId).on('plotly_relayout', function(ed) {{
+        if (ed['xaxis.range[0]'] !== undefined && ed['xaxis.range[1]'] !== undefined) {{
+            const xRange = [ed['xaxis.range[0]'], ed['xaxis.range[1]']];
+            allPlotIds.forEach(tgtId => {{
+                if (tgtId !== srcId) {{
+                    Plotly.relayout(tgtId, {{ 'xaxis.range': xRange }});
+                }}
+            }});
+        }}
+        if (ed['xaxis.autorange']) {{
+            allPlotIds.forEach(tgtId => {{
+                if (tgtId !== srcId) {{
+                    Plotly.relayout(tgtId, {{ 'xaxis.autorange': true }});
+                }}
+            }});
+        }}
+    }});
+}});
+
+// ── Flight mode overlay bar ──
+(function() {{
+    const bar = document.getElementById('modeBar');
+    const legend = document.getElementById('modeLegend');
+    if (!D.flight_modes || !D.flight_modes.length) {{
+        bar.innerHTML = '<div class="mode-seg" style="flex:1;background:var(--ca);color:var(--dm)">No flight mode data (S-frames)</div>';
+        return;
+    }}
+    const total = D.duration || 1;
+    const seen = new Set();
+    D.flight_modes.forEach(seg => {{
+        const pct = ((seg.end_s - seg.start_s) / total * 100).toFixed(2);
+        if (parseFloat(pct) < 0.3) return;
+        // Pick color based on most significant mode
+        const modes = seg.label.split(', ');
+        let color = '#3b4261';
+        for (const m of modes) {{
+            if (MODE_COLORS[m]) {{ color = MODE_COLORS[m]; break; }}
+        }}
+        const el = document.createElement('div');
+        el.className = 'mode-seg';
+        el.style.flex = '0 0 ' + pct + '%';
+        el.style.background = color;
+        el.title = seg.label + ' (' + seg.start_s.toFixed(1) + 's - ' + seg.end_s.toFixed(1) + 's)';
+        // Only show label if segment is wide enough
+        if (parseFloat(pct) > 5) el.textContent = modes[modes.length-1];
+        bar.appendChild(el);
+        modes.forEach(m => seen.add(m));
+    }});
+    // Legend
+    seen.forEach(m => {{
+        const s = document.createElement('span');
+        s.style.background = MODE_COLORS[m] || '#3b4261';
+        s.style.color = '#fff';
+        s.textContent = m;
+        legend.appendChild(s);
+    }});
+}})();
+</script></body></html>"""
+
+
+def _run_replay(logfile, args, diff_raw):
+    """Generate interactive replay HTML for a single flight."""
+    R, B, C, G, Y, RED, DIM = _colors()
+
+    print(f"\n  ▲ INAV Flight Replay v{REPORT_VERSION}")
+    print(f"  Loading: {logfile}")
+
+    raw_params = parse_headers_from_bbl(logfile)
+    config = extract_fc_config(raw_params)
+    if diff_raw:
+        merge_diff_into_config(config, diff_raw)
+
+    ext = os.path.splitext(logfile)[1].lower()
+    is_blackbox = ext in (".bbl", ".bfl", ".bbs")
+    if is_blackbox:
+        data = decode_blackbox_native(logfile, raw_params, quiet=False)
+    else:
+        data = parse_csv_log(logfile)
+
+    sr = data["sample_rate"]
+    craft = config.get("craft_name", "Unknown")
+    duration = data['time_s'][-1]
+    print(f"  {data['n_rows']:,} rows | {sr:.0f}Hz | {duration:.1f}s")
+
+    # Show data availability
+    parts = []
+    n_slow = len(data.get("_slow_frames", []))
+    if n_slow:
+        parts.append(f"{n_slow} flight mode frames")
+    for ax in ["roll", "pitch", "yaw"]:
+        if f"gyro_{ax}" in data:
+            parts.append("gyro")
+            break
+    motor_count = sum(1 for i in range(8) if f"motor{i}" in data)
+    if motor_count:
+        parts.append(f"{motor_count} motors")
+    if parts:
+        print(f"  Data: {', '.join(parts)}")
+
+    # Quick noise analysis for spectrogram reference
+    print(f"  Computing spectrogram...", end=" ", flush=True)
+    noise_results = [analyze_noise(data, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
+    print("done")
+
+    print(f"  Generating Plotly.js replay (WebGL)...")
+    html = _generate_replay_html(config, data, sr, noise_results)
+
+    on = args.output or os.path.splitext(os.path.basename(logfile))[0] + "_replay.html"
+    op = os.path.join(os.path.dirname(logfile) or ".", on)
+    with open(op, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    size_kb = os.path.getsize(op) / 1024
+    print(f"\n  ✓ Replay: {op} ({size_kb:.0f}KB)")
+    print(f"    Panels: gyro×3, motors, spectrogram waterfall, throttle")
+    print(f"    Features: synced zoom/pan, flight mode overlay, WebGL rendering")
+    print()
+
+
 def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     """Analyze a single blackbox log file.
     
@@ -6468,68 +7735,83 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     if not summary_only:
         print(f"  {data['n_rows']:,} rows | {sr:.0f}Hz | {data['time_s'][-1]:.1f}s")
 
-        if nav_mode:
-            # Show nav field summary instead of PID/filter info
-            nav_fields = [k for k in data if k.startswith("nav_") or k.startswith("att_") or k == "baro_alt"]
-            gps_count = len(data.get("_gps_frames", []))
-            slow_count = len(data.get("_slow_frames", []))
-            parts = []
-            if nav_fields:
-                parts.append(f"{len(nav_fields)} nav fields")
-            if gps_count:
-                parts.append(f"{gps_count} GPS frames")
-            if slow_count:
-                parts.append(f"{slow_count} slow frames")
-            if parts:
-                print(f"  Nav data: {', '.join(parts)}")
-            else:
-                print("  Warning: No navigation fields found in this log")
+        # Automatic log quality check
+        quality = assess_log_quality(data, config, logfile)
+        if quality["grade"] == "UNUSABLE":
+            print_log_quality(quality)
+            print(f"  Log is not usable for analysis. Run with --check-log for details.")
+            return {"verdict": "UNUSABLE", "score": 0} if summary_only else None
+        elif quality["grade"] == "MARGINAL":
+            R2, B2, C2, G2, Y2, RED2, DIM2 = _colors()
+            print(f"  {Y2}⚠ Log quality: MARGINAL{R2} — ", end="")
+            warn_msgs = [i["message"] for i in quality["issues"]]
+            print(f"{'; '.join(warn_msgs[:2])}{R2}")
+    else:
+        quality = assess_log_quality(data, config, logfile)
+        if not quality["usable"]:
+            return {"verdict": "UNUSABLE", "score": 0}
 
-        if not nav_mode:
-            if config_has_pid(config):
-                for ax in ["roll","pitch","yaw"]:
-                    ff = config.get(f'{ax}_ff', '')
-                    ff_str = f" FF={ff}" if ff else ""
-                    print(f"  {ax.capitalize()} PID: P={config.get(f'{ax}_p','?')} I={config.get(f'{ax}_i','?')} D={config.get(f'{ax}_d','?')}{ff_str}")
-            else:
-                print("  Warning: No PID values in headers - use .bbl for exact recommendations")
+    if not summary_only and nav_mode:
+        # Show nav field summary instead of PID/filter info
+        nav_fields = [k for k in data if k.startswith("nav_") or k.startswith("att_") or k == "baro_alt"]
+        gps_count = len(data.get("_gps_frames", []))
+        slow_count = len(data.get("_slow_frames", []))
+        parts = []
+        if nav_fields:
+            parts.append(f"{len(nav_fields)} nav fields")
+        if gps_count:
+            parts.append(f"{gps_count} GPS frames")
+        if slow_count:
+            parts.append(f"{slow_count} slow frames")
+        if parts:
+            print(f"  Nav data: {', '.join(parts)}")
+        else:
+            print("  Warning: No navigation fields found in this log")
 
-        if not nav_mode and config_has_filters(config):
-            filt_parts = []
-            for k, l in [("gyro_lowpass_hz","Gyro LPF"),("dterm_lpf_hz","D-term LPF"),("yaw_lpf_hz","Yaw LPF")]:
-                v = config.get(k)
-                if v is not None and v != 0:
-                    filt_parts.append(f"{l}={v}Hz")
-            dyn_en = config.get("dyn_notch_enabled")
-            if dyn_en and dyn_en not in (0, "0", "OFF"):
-                dyn_min = config.get("dyn_notch_min_hz", "?")
-                dyn_q = config.get("dyn_notch_q", "?")
-                filt_parts.append(f"DynNotch=ON(min={dyn_min}Hz,Q={dyn_q})")
-            rpm_en = config.get("rpm_filter_enabled")
-            if rpm_en and rpm_en not in (0, "0", "OFF"):
-                filt_parts.append("RPM=ON")
-            elif rpm_en is not None:
-                filt_parts.append("RPM=OFF")
-            if filt_parts:
-                print(f"  Filters: {', '.join(filt_parts)}")
+    if not summary_only and not nav_mode:
+        if config_has_pid(config):
+            for ax in ["roll","pitch","yaw"]:
+                ff = config.get(f'{ax}_ff', '')
+                ff_str = f" FF={ff}" if ff else ""
+                print(f"  {ax.capitalize()} PID: P={config.get(f'{ax}_p','?')} I={config.get(f'{ax}_i','?')} D={config.get(f'{ax}_d','?')}{ff_str}")
+        else:
+            print("  Warning: No PID values in headers - use .bbl for exact recommendations")
 
-        # Show diff-enriched config extras
-        if not nav_mode and config.get("_diff_merged"):
-            diff_extras = []
-            if config.get("motor_poles"):
-                diff_extras.append(f"MotorPoles={config['motor_poles']}")
-            if config.get("motor_idle") is not None:
-                diff_extras.append(f"Idle={config['motor_idle']}")
-            if config.get("antigravity_gain") is not None:
-                diff_extras.append(f"AntiGrav={config['antigravity_gain']}")
-            if config.get("nav_alt_p") is not None:
-                diff_extras.append(f"NavAltP={config['nav_alt_p']}")
-            if config.get("level_p") is not None:
-                diff_extras.append(f"LevelP={config['level_p']}")
-            if diff_extras:
-                print(f"  Diff extras: {', '.join(diff_extras)}")
-            print(f"  {config['_diff_settings_count']} settings from CLI diff "
-                  f"({config.get('_diff_unmapped_count', 0)} additional stored)")
+    if not summary_only and not nav_mode and config_has_filters(config):
+        filt_parts = []
+        for k, l in [("gyro_lowpass_hz","Gyro LPF"),("dterm_lpf_hz","D-term LPF"),("yaw_lpf_hz","Yaw LPF")]:
+            v = config.get(k)
+            if v is not None and v != 0:
+                filt_parts.append(f"{l}={v}Hz")
+        dyn_en = config.get("dyn_notch_enabled")
+        if dyn_en and dyn_en not in (0, "0", "OFF"):
+            dyn_min = config.get("dyn_notch_min_hz", "?")
+            dyn_q = config.get("dyn_notch_q", "?")
+            filt_parts.append(f"DynNotch=ON(min={dyn_min}Hz,Q={dyn_q})")
+        rpm_en = config.get("rpm_filter_enabled")
+        if rpm_en and rpm_en not in (0, "0", "OFF"):
+            filt_parts.append("RPM=ON")
+        elif rpm_en is not None:
+            filt_parts.append("RPM=OFF")
+        if filt_parts:
+            print(f"  Filters: {', '.join(filt_parts)}")
+
+    if not summary_only and not nav_mode and config.get("_diff_merged"):
+        diff_extras = []
+        if config.get("motor_poles"):
+            diff_extras.append(f"MotorPoles={config['motor_poles']}")
+        if config.get("motor_idle") is not None:
+            diff_extras.append(f"Idle={config['motor_idle']}")
+        if config.get("antigravity_gain") is not None:
+            diff_extras.append(f"AntiGrav={config['antigravity_gain']}")
+        if config.get("nav_alt_p") is not None:
+            diff_extras.append(f"NavAltP={config['nav_alt_p']}")
+        if config.get("level_p") is not None:
+            diff_extras.append(f"LevelP={config['level_p']}")
+        if diff_extras:
+            print(f"  Diff extras: {', '.join(diff_extras)}")
+        print(f"  {config['_diff_settings_count']} settings from CLI diff "
+              f"({config.get('_diff_unmapped_count', 0)} additional stored)")
 
     # ── RPM prediction (tuning mode only) ──
     rpm_range = None
@@ -6718,6 +8000,16 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
             db.close()
         except Exception as e:
             print(f"  ⚠ Database: {e}")
+
+    # ── Markdown report ──
+    if getattr(args, 'report', None) in ('md', 'markdown') and not summary_only:
+        md = generate_markdown_report(plan, config, data, noise_results, pid_results,
+                                      motor_analysis, profile, quality)
+        md_name = os.path.splitext(os.path.basename(logfile))[0] + "_report.md"
+        md_path = os.path.join(os.path.dirname(logfile) or ".", md_name)
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(md)
+        print(f"  ✓ Markdown: {md_path} (paste into forum/Discord)")
 
     print()
 

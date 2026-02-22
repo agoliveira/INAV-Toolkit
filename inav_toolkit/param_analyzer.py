@@ -21,7 +21,7 @@ import sys
 import textwrap
 from datetime import datetime
 
-VERSION = "2.14.1"
+VERSION = "2.15.0"
 
 
 def _enable_ansi_colors():
@@ -64,6 +64,26 @@ INFO = "INFO"              # Suggestion, nice-to-have
 OK = "OK"                  # Checked and looks good
 
 SEVERITY_ORDER = {CRITICAL: 0, WARNING: 1, INFO: 2, OK: 3}
+
+# ─── INAV Aux Mode IDs (from src/main/fc/rc_modes.h) ────────────────────────
+
+INAV_MODES = {
+    0: "ARM", 1: "ANGLE", 2: "HORIZON", 3: "NAV ALTHOLD",
+    5: "HEADING HOLD", 10: "NAV POSHOLD", 11: "NAV RTH",
+    12: "MANUAL", 13: "NAV WP", 28: "NAV LAUNCH", 45: "TURTLE",
+    47: "OSD ALT", 48: "NAV COURSE HOLD", 53: "MULTI FUNCTION",
+    62: "MIXER PROFILE 2", 63: "MIXER TRANSITION",
+}
+
+# Modes that require GPS
+GPS_MODES = {10, 11, 13, 48}  # POSHOLD, RTH, WP, COURSE HOLD
+# Modes that require baro or althold
+ALT_MODES = {3}  # NAV ALTHOLD
+# Modes that benefit from compass
+COMPASS_MODES = {10, 11, 13, 5}  # POSHOLD, RTH, WP, HEADING HOLD
+
+# Multirotor platform types
+MC_PLATFORMS = {"MULTIROTOR", "TRICOPTER"}
 
 # ─── Known Defaults & Limits ─────────────────────────────────────────────────
 
@@ -1675,6 +1695,743 @@ def check_crossref_blackbox(parsed, bb_state):
 
 # ─── Terminal Output ─────────────────────────────────────────────────────────
 
+# ─── Pre-Flight Sanity Check ─────────────────────────────────────────────────
+# A "will this crash on first flight?" validator.
+# Different from the tuning-focused analysis above — this catches
+# dangerous misconfigurations that can destroy hardware or hurt people.
+
+class SanityItem:
+    """A single pre-flight check result."""
+    FAIL = "FAIL"
+    WARN = "WARN"
+    ASK = "ASK"
+    PASS = "PASS"
+
+    def __init__(self, status, category, message, detail=None, question=None,
+                 recommendation=None, cli_fix=None):
+        self.status = status
+        self.category = category
+        self.message = message
+        self.detail = detail or ""
+        self.question = question       # Interactive confirmation prompt
+        self.recommendation = recommendation
+        self.cli_fix = cli_fix
+        self.user_confirmed = None     # None=not asked, True/False=answer
+
+    def __repr__(self):
+        return f"<{self.status} {self.category}: {self.message}>"
+
+
+def _ask_pilot(question, default_yes=False):
+    """Ask the pilot a yes/no question interactively."""
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    try:
+        answer = input(f"    ? {question} {suffix} ").strip().lower()
+        if not answer:
+            return default_yes
+        return answer in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default_yes
+
+
+def _get_assigned_modes(parsed):
+    """Return set of mode IDs that have aux channel assignments."""
+    return {m["mode_id"] for m in parsed["aux_modes"]
+            if m["range_low"] < m["range_high"]}
+
+
+def _has_gps_uart(parsed):
+    """Check if any serial port has GPS function enabled."""
+    for _port_id, config in parsed["serial_ports"].items():
+        parts = config.split()
+        if len(parts) >= 1:
+            try:
+                func_mask = int(parts[0])
+                if func_mask & 2:  # GPS function bit
+                    return True
+            except ValueError:
+                pass
+    return False
+
+
+def _has_feature(parsed, feat_name):
+    """Check if a feature is enabled (present in features list)."""
+    return feat_name.upper() in [f.upper() for f in parsed["features"]]
+
+
+def _has_feature_disabled(parsed, feat_name):
+    """Check if a feature is explicitly disabled."""
+    return feat_name.upper() in [f.upper() for f in parsed.get("features_disabled", [])]
+
+
+def _detect_frame_from_name(parsed):
+    """Try to detect frame size from craft name."""
+    name = get_setting(parsed, "name", "")
+    if not name:
+        return None
+    name_upper = str(name).upper()
+    for size in [15, 12, 10, 7, 5]:
+        if str(size) in name_upper:
+            return size
+    return None
+
+
+def _detect_motor_count(parsed):
+    """Detect motor count from motor_mix or platform type."""
+    if parsed["motor_mix"]:
+        return max(m["index"] for m in parsed["motor_mix"]) + 1
+    # Infer from platform_type
+    platform = get_setting(parsed, "platform_type", "")
+    platform_map = {
+        "QUADX": 4, "QUAD": 4, "QUADP": 4,
+        "HEX6": 6, "HEXX": 6, "HEXH": 6, "HEX6X": 6,
+        "OCTOX8": 8, "OCTOFLATX": 8, "OCTOFLATP": 8,
+        "Y6": 6,
+        "TRI": 3, "TRICOPTER": 3,
+    }
+    mixer = get_setting(parsed, "mixer_preset", "")
+    if isinstance(mixer, str):
+        for key, count in platform_map.items():
+            if key in mixer.upper():
+                return count
+    return None
+
+
+def run_sanity_check(parsed, frame_inches=None, interactive=True):
+    """Run pre-flight sanity checks. Returns list of SanityItems."""
+    items = []
+
+    # Auto-detect frame size if not provided
+    if frame_inches is None:
+        frame_inches = _detect_frame_from_name(parsed)
+
+    assigned_modes = _get_assigned_modes(parsed)
+    has_gps = _has_gps_uart(parsed)
+    motor_count = _detect_motor_count(parsed)
+    profile = get_active_control(parsed)
+
+    # ── 1. ARMING ────────────────────────────────────────────────────────
+    if 0 not in assigned_modes:
+        items.append(SanityItem(
+            SanityItem.FAIL, "Arming",
+            "No ARM switch assigned",
+            "Without an ARM mode on an aux channel, the aircraft cannot be armed "
+            "(or worse, may arm unexpectedly if using stick commands).",
+            recommendation="Assign ARM to an AUX channel in the Modes tab"))
+    else:
+        arm_modes = [m for m in parsed["aux_modes"] if m["mode_id"] == 0]
+        for am in arm_modes:
+            rng = am["range_high"] - am["range_low"]
+            if rng > 800:
+                items.append(SanityItem(
+                    SanityItem.WARN, "Arming",
+                    f"ARM range is very wide ({am['range_low']}-{am['range_high']})",
+                    "A wide ARM range increases the risk of accidental arming.",
+                    recommendation="Use a narrow range like 1800-2100"))
+            else:
+                items.append(SanityItem(
+                    SanityItem.PASS, "Arming",
+                    "ARM switch assigned"))
+
+    # ── 2. MOTOR OUTPUT ──────────────────────────────────────────────────
+    output_enabled = get_setting(parsed, "motor_pwm_protocol", "")
+    # In INAV, motor output is disabled by default until you enable it in Outputs tab.
+    # The feature MOTOR_STOP / output is controlled differently.
+    # If we see no motor protocol at all or DISABLED, that's a problem.
+    if output_enabled == "DISABLED" or output_enabled == "" or output_enabled == 0:
+        items.append(SanityItem(
+            SanityItem.FAIL, "Motor Output",
+            "Motor output appears DISABLED",
+            "INAV disables motor output by default as a safety measure. "
+            "Motors will not spin until you enable output in the Outputs tab.",
+            recommendation="In Configurator: Outputs tab → enable motor output, select DSHOT protocol"))
+
+    # ── 3. MOTOR DIRECTION ───────────────────────────────────────────────
+    motor_inverted = get_setting(parsed, "motor_direction_inverted", False)
+    if motor_inverted:
+        items.append(SanityItem(
+            SanityItem.ASK, "Motors",
+            "Motor direction is INVERTED (props-out configuration)",
+            "motor_direction_inverted = ON means the FC expects reversed motor spin "
+            "(props-out). If your motors spin the normal way (props-in), the quad "
+            "will yaw violently and flip on takeoff.",
+            question="Are you running props-out (reversed) motor direction?",
+            recommendation="If props-in, set motor_direction_inverted = OFF",
+            cli_fix="set motor_direction_inverted = OFF"))
+    else:
+        items.append(SanityItem(
+            SanityItem.PASS, "Motors",
+            "Motor direction: standard (props-in)"))
+
+    # ── 4. FAILSAFE ──────────────────────────────────────────────────────
+    fs_proc = get_setting(parsed, "failsafe_procedure", "DROP")
+    if fs_proc == "DROP" or fs_proc == 0:
+        items.append(SanityItem(
+            SanityItem.FAIL, "Failsafe",
+            "Failsafe procedure is DROP",
+            "On signal loss, the aircraft will disarm and freefall from any altitude. "
+            "This is the default but extremely dangerous for any altitude flight.",
+            recommendation="Set failsafe to RTH if you have GPS, or LAND",
+            cli_fix="set failsafe_procedure = RTH"))
+    elif (fs_proc == "RTH" or fs_proc == 2) and not has_gps:
+        items.append(SanityItem(
+            SanityItem.FAIL, "Failsafe",
+            "Failsafe set to RTH but no GPS configured",
+            "RTH failsafe requires GPS. Without it, the aircraft will fall back "
+            "to emergency landing which may not work correctly.",
+            recommendation="Configure GPS on a UART, or change failsafe to LAND"))
+    elif fs_proc == "RTH" or fs_proc == 2:
+        items.append(SanityItem(
+            SanityItem.PASS, "Failsafe",
+            "Failsafe set to RTH with GPS available"))
+
+    # Failsafe throttle + airmode
+    airmode = get_setting(parsed, "airmode_type", "")
+    fs_throttle = get_setting(parsed, "failsafe_throttle", 1000)
+    if isinstance(fs_throttle, (int, float)) and fs_throttle <= 1050:
+        if airmode and str(airmode).upper() != "STICK_CENTER":
+            items.append(SanityItem(
+                SanityItem.WARN, "Failsafe",
+                f"Low failsafe throttle ({fs_throttle}) with airmode enabled",
+                "Airmode keeps PID corrections active even at zero throttle. "
+                "Combined with low failsafe throttle, this can cause the aircraft "
+                "to tumble during emergency landing instead of descending smoothly.",
+                recommendation="Consider raising failsafe_throttle to hover level"))
+
+    # ── 5. BATTERY ───────────────────────────────────────────────────────
+    batt_profile = get_active_battery(parsed)
+    vmin = batt_profile.get("bat_voltage_cell_min", get_setting(parsed, "bat_voltage_cell_min", 330))
+    vmax = batt_profile.get("bat_voltage_cell_max", get_setting(parsed, "bat_voltage_cell_max", 420))
+    vwarn = batt_profile.get("bat_voltage_cell_warning", get_setting(parsed, "bat_voltage_cell_warning", 350))
+
+    if isinstance(vmin, (int, float)) and isinstance(vmax, (int, float)):
+        if vmin >= vmax:
+            items.append(SanityItem(
+                SanityItem.FAIL, "Battery",
+                f"Cell min voltage ({vmin/100:.2f}V) >= max ({vmax/100:.2f}V)",
+                "Battery voltage limits are inverted or equal. "
+                "The aircraft will think the battery is always critical."))
+        elif vmin < 250 or vmin > 380:
+            items.append(SanityItem(
+                SanityItem.WARN, "Battery",
+                f"Unusual cell min voltage: {vmin/100:.2f}V",
+                "Normal range is 2.80-3.50V for LiPo, 2.50-2.80V for Li-ion.",
+                question="Is this voltage correct for your battery type?"))
+        else:
+            items.append(SanityItem(
+                SanityItem.PASS, "Battery",
+                f"Battery limits: {vmin/100:.2f}V min, {vmax/100:.2f}V max"))
+
+    # No battery monitoring
+    if _has_feature_disabled(parsed, "VBAT"):
+        items.append(SanityItem(
+            SanityItem.FAIL, "Battery",
+            "Battery voltage monitoring is DISABLED",
+            "Without voltage monitoring, you will have no low battery warning "
+            "and no battery-related failsafe. The aircraft will fly until "
+            "the battery cuts out, causing an uncontrolled crash.",
+            recommendation="Enable VBAT feature",
+            cli_fix="feature VBAT"))
+
+    # ── 6. GPS & NAVIGATION ──────────────────────────────────────────────
+    nav_modes_assigned = assigned_modes & GPS_MODES
+    nav_mode_names = [INAV_MODES.get(m, f"Mode {m}") for m in nav_modes_assigned]
+
+    if nav_modes_assigned and not has_gps:
+        items.append(SanityItem(
+            SanityItem.FAIL, "Navigation",
+            f"Nav modes assigned but no GPS configured: {', '.join(nav_mode_names)}",
+            "These modes require GPS to function. Without GPS, activating them "
+            "will cause unpredictable behavior or no effect at all.",
+            recommendation="Configure GPS on a UART in the Ports tab"))
+    elif nav_modes_assigned and has_gps:
+        items.append(SanityItem(
+            SanityItem.PASS, "Navigation",
+            f"GPS configured for nav modes: {', '.join(nav_mode_names)}"))
+
+    if has_gps and not nav_modes_assigned and 11 not in assigned_modes:
+        items.append(SanityItem(
+            SanityItem.WARN, "Navigation",
+            "GPS configured but no NAV RTH mode assigned",
+            "You have GPS hardware configured but no return-to-home switch. "
+            "RTH is valuable as an emergency recovery option.",
+            recommendation="Assign NAV RTH to an AUX channel"))
+
+    # ALTHOLD without baro
+    alt_modes_assigned = assigned_modes & ALT_MODES
+    # Check for baro - it's usually a hardware feature, not always in diff
+    baro_hardware = get_setting(parsed, "baro_hardware", "")
+    if alt_modes_assigned and baro_hardware and str(baro_hardware).upper() == "NONE":
+        items.append(SanityItem(
+            SanityItem.FAIL, "Navigation",
+            "NAV ALTHOLD assigned but barometer is disabled",
+            "Altitude hold requires a barometer. Without it, altitude control "
+            "will not work and the aircraft may climb or descend uncontrollably.",
+            recommendation="Enable barometer hardware or remove ALTHOLD mode"))
+
+    # POSHOLD/RTH without compass
+    compass_modes_assigned = assigned_modes & COMPASS_MODES
+    compass_mode_names = [INAV_MODES.get(m, f"Mode {m}") for m in compass_modes_assigned]
+    mag_hardware = get_setting(parsed, "mag_hardware", "")
+    mag_disabled = (isinstance(mag_hardware, str) and mag_hardware.upper() == "NONE") or mag_hardware == 0
+    if compass_modes_assigned and mag_disabled:
+        items.append(SanityItem(
+            SanityItem.WARN, "Navigation",
+            f"Compass disabled but nav modes assigned: {', '.join(compass_mode_names)}",
+            "INAV can fly nav modes without compass using GPS-derived heading, "
+            "but position hold performance is reduced and toilet-bowl patterns "
+            "are more likely, especially at low speed.",
+            question="Are you intentionally flying without compass?"))
+
+    # Hover throttle at default
+    hover_thr = get_setting(parsed, "nav_mc_hover_thr", 1500)
+    if isinstance(hover_thr, (int, float)) and hover_thr == 1500:
+        if nav_modes_assigned:
+            items.append(SanityItem(
+                SanityItem.ASK, "Navigation",
+                "Hover throttle is at default (1500)",
+                "The default hover throttle may not match your aircraft. "
+                "If too low, the aircraft will sink in altitude hold. "
+                "If too high, it will climb.",
+                question="Have you calibrated the hover throttle for this aircraft?",
+                recommendation="Hover the aircraft, note the throttle value, "
+                "set nav_mc_hover_thr to that value"))
+
+    # ── 7. PIDS ──────────────────────────────────────────────────────────
+    p_roll = get_setting(parsed, "mc_p_roll", profile.get("mc_p_roll", 40))
+    p_pitch = get_setting(parsed, "mc_p_pitch", profile.get("mc_p_pitch", 44))
+    d_roll = get_setting(parsed, "mc_d_roll", profile.get("mc_d_roll", 25))
+    d_pitch = get_setting(parsed, "mc_d_pitch", profile.get("mc_d_pitch", 25))
+
+    # Zero P = no stabilization
+    if isinstance(p_roll, (int, float)) and isinstance(p_pitch, (int, float)):
+        if p_roll == 0 or p_pitch == 0:
+            items.append(SanityItem(
+                SanityItem.FAIL, "PIDs",
+                f"P-term is ZERO (roll={p_roll}, pitch={p_pitch})",
+                "With P=0 the aircraft has no stabilization on that axis. "
+                "It will be completely uncontrollable.",
+                recommendation="Set P values to at least 20"))
+
+    # Extremely high PIDs
+    if isinstance(p_roll, (int, float)) and isinstance(p_pitch, (int, float)):
+        if p_roll > 100 or p_pitch > 100:
+            items.append(SanityItem(
+                SanityItem.FAIL, "PIDs",
+                f"P-term is extremely high (roll={p_roll}, pitch={p_pitch})",
+                "P values above 100 will cause violent oscillation on any airframe. "
+                "The aircraft will shake itself apart on takeoff.",
+                recommendation="Reduce P to a sane starting point for your frame size"))
+
+    # PID mismatch with detected frame size
+    if frame_inches and frame_inches in FRAME_PROFILES:
+        fp = FRAME_PROFILES[frame_inches]
+        expected_p = fp["pids"].get("mc_p_roll", 40)
+
+        if isinstance(p_roll, (int, float)):
+            # Check if PIDs are way off for this frame size
+            # A 10" frame with 5" PIDs (40-44) is too aggressive
+            # A 5" frame with 15" PIDs (26) is too sluggish
+            if frame_inches >= 10 and p_roll >= 44:
+                # Looks like 5"/7" defaults on a big frame
+                items.append(SanityItem(
+                    SanityItem.ASK, "PIDs",
+                    f"PIDs look aggressive for a {frame_inches}-inch frame "
+                    f"(P_roll={p_roll}, expected ~{expected_p})",
+                    f"These PID values are typical for a 5-7 inch quad. On a "
+                    f"{frame_inches}-inch frame, this will likely cause violent "
+                    f"oscillation due to higher prop inertia.",
+                    question=f"Is this actually a {frame_inches}-inch frame?",
+                    recommendation=f"Use inav-params --setup {frame_inches} for starting PIDs",
+                    cli_fix=f"# Run: inav-params --setup {frame_inches}"))
+            elif frame_inches <= 5 and p_roll < 25:
+                items.append(SanityItem(
+                    SanityItem.ASK, "PIDs",
+                    f"PIDs look very low for a {frame_inches}-inch frame "
+                    f"(P_roll={p_roll}, expected ~{expected_p})",
+                    "Very low PIDs on a small frame will make it feel mushy and unresponsive.",
+                    question=f"Is this actually a {frame_inches}-inch frame?"))
+
+    if isinstance(p_roll, (int, float)) and isinstance(p_pitch, (int, float)):
+        if not (p_roll == 0 or p_pitch == 0) and not (p_roll > 100 or p_pitch > 100):
+            items.append(SanityItem(
+                SanityItem.PASS, "PIDs",
+                f"PIDs in reasonable range (P_roll={p_roll}, P_pitch={p_pitch})"))
+
+    # ── 8. RATES ─────────────────────────────────────────────────────────
+    roll_rate = get_setting(parsed, "roll_rate",
+                            profile.get("roll_rate", 40))
+    pitch_rate = get_setting(parsed, "pitch_rate",
+                             profile.get("pitch_rate", 40))
+    yaw_rate = get_setting(parsed, "yaw_rate",
+                           profile.get("yaw_rate", 30))
+
+    for axis, rate in [("Roll", roll_rate), ("Pitch", pitch_rate), ("Yaw", yaw_rate)]:
+        if isinstance(rate, (int, float)):
+            if rate == 0:
+                items.append(SanityItem(
+                    SanityItem.FAIL, "Rates",
+                    f"{axis} rate is ZERO",
+                    f"With rate=0, the aircraft cannot rotate on the {axis.lower()} axis. "
+                    "It will be uncontrollable.",
+                    recommendation=f"Set {axis.lower()}_rate to at least 20"))
+            elif rate > 120:  # 1200 dps — extreme
+                items.append(SanityItem(
+                    SanityItem.WARN, "Rates",
+                    f"{axis} rate is extremely high ({rate} = {rate*10}dps)",
+                    "Very high rates make the aircraft extremely twitchy and hard to control. "
+                    "Most pilots use 200-700dps for multirotors.",
+                    question=f"Is {rate*10}dps {axis.lower()} rate intentional?"))
+
+    # ── 9. FILTERS ───────────────────────────────────────────────────────
+    gyro_lpf = get_setting(parsed, "gyro_main_lpf_hz", 110)
+    dterm_lpf = get_setting(parsed, "dterm_lpf_hz", 110)
+    looptime = get_setting(parsed, "looptime", 500)
+
+    if isinstance(looptime, (int, float)) and looptime > 0:
+        sample_rate = 1_000_000 / looptime
+        nyquist = sample_rate / 2
+
+        if isinstance(gyro_lpf, (int, float)):
+            if gyro_lpf == 0:
+                items.append(SanityItem(
+                    SanityItem.WARN, "Filters",
+                    "Gyro LPF is DISABLED (0 Hz)",
+                    "Running with no gyro low-pass filter passes all noise directly "
+                    "to the PID controller. Unless you have very clean motors and "
+                    "a well-built frame, this will cause motor heating and oscillation.",
+                    question="Are you intentionally running without gyro LPF?"))
+            elif gyro_lpf > nyquist:
+                items.append(SanityItem(
+                    SanityItem.FAIL, "Filters",
+                    f"Gyro LPF ({gyro_lpf}Hz) is above Nyquist ({nyquist:.0f}Hz)",
+                    "The filter cutoff is higher than what the sample rate can represent. "
+                    "This provides no filtering and may cause aliasing artifacts.",
+                    recommendation=f"Lower gyro_main_lpf_hz below {nyquist:.0f}"))
+
+        if isinstance(dterm_lpf, (int, float)):
+            if dterm_lpf == 0:
+                items.append(SanityItem(
+                    SanityItem.WARN, "Filters",
+                    "D-term LPF is DISABLED (0 Hz)",
+                    "D-term amplifies noise by design. Without filtering, motor "
+                    "heating and high-frequency oscillation are very likely.",
+                    question="Are you intentionally running without D-term LPF?"))
+
+    if isinstance(gyro_lpf, (int, float)) and gyro_lpf > 0:
+        if frame_inches and frame_inches in FRAME_PROFILES:
+            expected_lpf = FRAME_PROFILES[frame_inches]["filters"]["gyro_main_lpf_hz"]
+            if gyro_lpf > expected_lpf * 2:
+                items.append(SanityItem(
+                    SanityItem.WARN, "Filters",
+                    f"Gyro LPF ({gyro_lpf}Hz) seems high for {frame_inches}-inch "
+                    f"(expected ~{expected_lpf}Hz)",
+                    "Higher filter cutoff passes more noise. Large frames need lower cutoffs "
+                    "because they vibrate at lower frequencies."))
+        else:
+            items.append(SanityItem(
+                SanityItem.PASS, "Filters",
+                f"Gyro LPF at {gyro_lpf}Hz"))
+
+    # ── 10. RECEIVER ─────────────────────────────────────────────────────
+    rx_type = get_setting(parsed, "serialrx_provider", None)
+    has_rx_uart = False
+    for _port_id, config in parsed["serial_ports"].items():
+        parts = config.split()
+        if len(parts) >= 1:
+            try:
+                func_mask = int(parts[0])
+                if func_mask & 64:  # Serial RX function bit
+                    has_rx_uart = True
+            except ValueError:
+                pass
+
+    if not has_rx_uart and rx_type is not None:
+        # Might be using SPI RX or other non-serial receiver
+        items.append(SanityItem(
+            SanityItem.PASS, "Receiver",
+            f"Receiver protocol: {rx_type}"))
+    elif has_rx_uart:
+        items.append(SanityItem(
+            SanityItem.PASS, "Receiver",
+            f"Serial receiver configured" + (f" ({rx_type})" if rx_type else "")))
+    else:
+        items.append(SanityItem(
+            SanityItem.WARN, "Receiver",
+            "No serial receiver UART detected in diff",
+            "This may be normal if using SPI RX (like on AIO boards) or "
+            "if the receiver is on default UART2 (not shown in diff)."))
+
+    # ── 11. BOARD ALIGNMENT ──────────────────────────────────────────────
+    align_roll = get_setting(parsed, "align_board_roll", 0)
+    align_pitch = get_setting(parsed, "align_board_pitch", 0)
+    align_yaw = get_setting(parsed, "align_board_yaw", 0)
+
+    has_alignment = False
+    for axis_name, val in [("roll", align_roll), ("pitch", align_pitch), ("yaw", align_yaw)]:
+        if isinstance(val, (int, float)) and val != 0:
+            has_alignment = True
+            degrees = val / 10.0  # INAV stores in decidegrees
+            if abs(degrees) > 0 and abs(degrees) not in (90, 180, 270):
+                items.append(SanityItem(
+                    SanityItem.ASK, "Board Alignment",
+                    f"Board alignment {axis_name} = {degrees:.1f} degrees",
+                    "Non-standard board alignment. Common values are 0, 90, 180, 270. "
+                    "Wrong alignment will cause the FC to fight you — stabilization "
+                    "will push the aircraft the wrong way.",
+                    question=f"Is your FC rotated {degrees:.1f} degrees on {axis_name}?"))
+            elif abs(degrees) in (90, 180, 270):
+                items.append(SanityItem(
+                    SanityItem.PASS, "Board Alignment",
+                    f"Board rotated {degrees:.0f}° on {axis_name}"))
+
+    if not has_alignment:
+        items.append(SanityItem(
+            SanityItem.PASS, "Board Alignment",
+            "Standard orientation (no rotation)"))
+
+    # ── 12. OSD / VIDEO ──────────────────────────────────────────────────
+    osd_video = get_setting(parsed, "osd_video_system", "")
+    if isinstance(osd_video, str) and osd_video.upper() not in ("", "AUTO"):
+        # Has specific video system configured
+        items.append(SanityItem(
+            SanityItem.PASS, "OSD",
+            f"OSD video system: {osd_video}"))
+
+    # ── 13. BEEPER SAFETY ────────────────────────────────────────────────
+    critical_beepers = ["BAT_CRIT_LOW", "BAT_LOW", "RX_LOST", "RX_LOST_LANDING"]
+    disabled = parsed.get("beepers_disabled", [])
+    missing_critical = [b for b in critical_beepers if b in disabled]
+    if missing_critical:
+        items.append(SanityItem(
+            SanityItem.WARN, "Safety",
+            f"Critical beepers disabled: {', '.join(missing_critical)}",
+            "You will have no audible warning for low battery or signal loss.",
+            recommendation="Enable critical beepers",
+            cli_fix="\n".join(f"beeper {b}" for b in missing_critical)))
+    else:
+        items.append(SanityItem(
+            SanityItem.PASS, "Safety",
+            "Critical beepers enabled"))
+
+    # ── 14. TRICOPTER SERVO ──────────────────────────────────────────────
+    platform = get_setting(parsed, "platform_type", "")
+    if isinstance(platform, str) and "TRI" in platform.upper():
+        # Check servo direction
+        items.append(SanityItem(
+            SanityItem.ASK, "Platform",
+            "Tricopter detected — verify tail servo direction",
+            "Tricopters need the tail servo to push in the correct direction "
+            "for yaw authority. An inverted servo will cause uncontrollable yaw.",
+            question="Have you verified the tail servo moves correctly for yaw "
+            "in the Configurator Outputs tab?"))
+
+    # ── 15. HEX/OCTO MOTOR ORDER ────────────────────────────────────────
+    if motor_count and motor_count >= 6:
+        platform_name = "Hexacopter" if motor_count == 6 else "Octocopter"
+        items.append(SanityItem(
+            SanityItem.ASK, "Platform",
+            f"{platform_name} detected ({motor_count} motors)",
+            f"With {motor_count} motors, correct motor order and spin direction "
+            "are critical. Verify in the Configurator Outputs tab that each motor "
+            "matches the diagram.",
+            question=f"Have you verified all {motor_count} motor positions and spin directions?"))
+
+    # ── 16. FLIGHT MODES ─────────────────────────────────────────────────
+    has_stabilized = assigned_modes & {1, 2}  # ANGLE or HORIZON
+    if not has_stabilized and 12 not in assigned_modes:
+        # No stabilized mode and no manual mode — only ARM
+        items.append(SanityItem(
+            SanityItem.WARN, "Modes",
+            "No flight mode switch assigned (ANGLE/HORIZON)",
+            "Without a flight mode on a switch, the aircraft defaults to "
+            "ACRO/rate mode which requires advanced piloting skills. "
+            "Most pilots want at least ANGLE mode for recovery.",
+            question="Are you an experienced ACRO pilot?"))
+    elif has_stabilized:
+        mode_names = [INAV_MODES.get(m, "") for m in assigned_modes & {1, 2}]
+        items.append(SanityItem(
+            SanityItem.PASS, "Modes",
+            f"Stabilized mode available: {', '.join(mode_names)}"))
+
+    return items
+
+
+def print_sanity_report(items, parsed, interactive=True):
+    """Print the interactive pre-flight sanity check report."""
+    R, B, C, G, Y, RED, DIM = _colors()
+
+    print(f"\n  {B}{'=' * 55}{R}")
+    print(f"  {B}  INAV Pre-Flight Sanity Check v{VERSION}{R}")
+    print(f"  {B}{'=' * 55}{R}")
+
+    # Aircraft identification
+    name = get_setting(parsed, "name", "")
+    board = parsed.get("board", "")
+    version = parsed.get("version", "")
+    platform = get_setting(parsed, "platform_type", "")
+
+    print(f"\n  {B}AIRCRAFT{R}")
+    if name:
+        print(f"    Craft name:  {C}{name}{R}")
+    if board:
+        print(f"    Board:       {board}")
+    if version:
+        print(f"    Firmware:    INAV {version}")
+    if platform:
+        print(f"    Platform:    {platform}")
+    print()
+
+    # Group items by category
+    categories = []
+    seen = set()
+    for item in items:
+        if item.category not in seen:
+            categories.append(item.category)
+            seen.add(item.category)
+
+    n_fail = 0
+    n_warn = 0
+    n_ask_unconfirmed = 0
+    n_pass = 0
+
+    for category in categories:
+        cat_items = [i for i in items if i.category == category]
+        print(f"  {B}{category}{R}")
+
+        for item in cat_items:
+            if item.status == SanityItem.PASS:
+                print(f"    {G}✓{R} {item.message}")
+                n_pass += 1
+
+            elif item.status == SanityItem.FAIL:
+                print(f"    {RED}✗ FAIL:{R} {item.message}")
+                if item.detail:
+                    for line in textwrap.wrap(item.detail, 68):
+                        print(f"      {DIM}{line}{R}")
+                if item.recommendation:
+                    print(f"      {Y}→ {item.recommendation}{R}")
+                if item.cli_fix:
+                    print(f"      {C}CLI: {item.cli_fix}{R}")
+                n_fail += 1
+
+            elif item.status == SanityItem.WARN:
+                print(f"    {Y}⚠ WARNING:{R} {item.message}")
+                if item.detail:
+                    for line in textwrap.wrap(item.detail, 68):
+                        print(f"      {DIM}{line}{R}")
+                if item.question and interactive:
+                    confirmed = _ask_pilot(item.question)
+                    item.user_confirmed = confirmed
+                    if confirmed:
+                        print(f"      {G}→ Acknowledged by pilot{R}")
+                    else:
+                        print(f"      {RED}→ Pilot says NO — review this before flying{R}")
+                        n_fail += 1
+                        continue
+                elif item.recommendation:
+                    print(f"      {Y}→ {item.recommendation}{R}")
+                if item.cli_fix:
+                    print(f"      {C}CLI: {item.cli_fix}{R}")
+                n_warn += 1
+
+            elif item.status == SanityItem.ASK:
+                print(f"    {C}? CONFIRM:{R} {item.message}")
+                if item.detail:
+                    for line in textwrap.wrap(item.detail, 68):
+                        print(f"      {DIM}{line}{R}")
+                if item.question and interactive:
+                    confirmed = _ask_pilot(item.question)
+                    item.user_confirmed = confirmed
+                    if confirmed:
+                        print(f"      {G}→ Confirmed{R}")
+                        n_pass += 1
+                    else:
+                        print(f"      {RED}→ NOT confirmed — fix this before flying{R}")
+                        if item.recommendation:
+                            print(f"      {Y}→ {item.recommendation}{R}")
+                        if item.cli_fix:
+                            print(f"      {C}CLI: {item.cli_fix}{R}")
+                        n_fail += 1
+                else:
+                    # Non-interactive: treat ASK as warning
+                    if item.recommendation:
+                        print(f"      {Y}→ {item.recommendation}{R}")
+                    n_ask_unconfirmed += 1
+
+        print()
+
+    # ── VERDICT ──────────────────────────────────────────────────────────
+    print(f"  {B}{'=' * 55}{R}")
+    print(f"  {B}  PRE-FLIGHT VERDICT{R}")
+    print(f"  {B}{'=' * 55}{R}")
+
+    if n_fail > 0:
+        print(f"    {RED}✗{R} {n_fail} CRITICAL issue{'s' if n_fail > 1 else ''} — must fix before flying")
+    if n_warn > 0:
+        print(f"    {Y}⚠{R} {n_warn} WARNING{'s' if n_warn > 1 else ''} — review recommended")
+    if n_ask_unconfirmed > 0:
+        print(f"    {C}?{R} {n_ask_unconfirmed} item{'s' if n_ask_unconfirmed > 1 else ''} need{'s' if n_ask_unconfirmed == 1 else ''} pilot confirmation (use --check without --no-interactive)")
+    if n_pass > 0:
+        print(f"    {G}✓{R} {n_pass} check{'s' if n_pass > 1 else ''} passed")
+
+    print()
+    if n_fail > 0:
+        print(f"    {RED}{B}██ NO-GO ██{R}")
+        print(f"    {RED}Fix critical issues and run --check again.{R}")
+    elif n_warn > 0 or n_ask_unconfirmed > 0:
+        print(f"    {Y}{B}██ CONDITIONAL ██{R}")
+        print(f"    {Y}Review warnings before flying.{R}")
+    else:
+        print(f"    {G}{B}██ GO ██{R}")
+        print(f"    {G}All checks passed. Fly safe!{R}")
+    print()
+
+    return n_fail
+
+
+def _pull_diff_from_device(device_path, no_color=False):
+    """Connect to FC via MSP and pull diff all. Returns (text, info) or exits."""
+    R, B, C, G, Y, RED, DIM = _colors()
+
+    try:
+        from inav_toolkit.msp import auto_detect_fc, INAVDevice
+    except ImportError:
+        from msp import auto_detect_fc, INAVDevice
+
+    print(f"  {B}Connecting to FC...{R}", end=" ", flush=True)
+
+    if device_path == "auto":
+        dev, info = auto_detect_fc()
+        if not dev:
+            print(f"\n  {RED}ERROR: No INAV flight controller found.{R}")
+            sys.exit(1)
+    else:
+        dev = INAVDevice(device_path)
+        dev.open()
+        info = dev.get_info()
+
+    fc_name = info.get("craft_name", "Unknown")
+    fw_ver = info.get("fw_version", "?")
+    board = info.get("board_id", "?")
+    print(f"{C}{board}{R} — {fc_name} — INAV {fw_ver}")
+
+    print(f"  Pulling configuration...", end=" ", flush=True)
+    try:
+        diff_text = dev.get_diff_all(timeout=15.0)
+        print(f"done ({len(diff_text.splitlines())} lines)")
+    except Exception as e:
+        print(f"\n  {RED}ERROR: Failed to pull diff: {e}{R}")
+        dev.close()
+        sys.exit(1)
+
+    dev.close()
+    return diff_text
+
+
+# ─── Reporting ───────────────────────────────────────────────────────────────
+
 def print_report(parsed, findings, frame_inches=None):
     R, B, C, G, Y, RED, DIM = _colors()
 
@@ -1776,6 +2533,8 @@ def main():
             Modes:
               Analysis (default):  inav-params diff_all.txt --frame 10
               Setup:               inav-params --setup 10 --voltage 6S
+              Sanity check:        inav-params --check diff_all.txt
+              Sanity check (USB):  inav-params --check --device auto
             
             Supported frame sizes: 5, 7, 10, 12, 15 inches
             Supported voltages: 4S, 6S, 8S, 12S
@@ -1793,8 +2552,55 @@ def main():
                         help="Generate starting configuration for a new quad (7/10/12/15)")
     parser.add_argument("--voltage", type=str, metavar="CELLS", default="4S",
                         help="Battery voltage for --setup (4S/6S/8S/12S, default: 4S)")
+    parser.add_argument("--check", action="store_true",
+                        help="Pre-flight sanity check mode - catches dangerous misconfigurations")
+    parser.add_argument("--device", type=str, metavar="PORT", default=None,
+                        help="FC serial port for --check mode (use 'auto' to scan)")
+    parser.add_argument("--no-interactive", action="store_true",
+                        help="Skip interactive questions in --check mode")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable colored terminal output.")
+    args = parser.parse_args()
+
+    if args.no_color:
+        _disable_colors()
+
+    # ─── Sanity check mode ─────────────────────────────────────────────
+    if args.check:
+        if args.device:
+            text = _pull_diff_from_device(args.device, args.no_color)
+        elif args.difffile:
+            if args.difffile == "-":
+                text = sys.stdin.read()
+            else:
+                if not os.path.isfile(args.difffile):
+                    print(f"ERROR: File not found: {args.difffile}")
+                    sys.exit(1)
+                with open(args.difffile, "r", errors="replace") as f:
+                    text = f.read()
+        else:
+            parser.error("--check requires a diff file or --device")
+
+        parsed = parse_diff_all(text)
+        interactive = not args.no_interactive
+        items = run_sanity_check(parsed, frame_inches=args.frame,
+                                 interactive=interactive)
+
+        if args.json:
+            output = [{
+                "status": i.status,
+                "category": i.category,
+                "message": i.message,
+                "detail": i.detail,
+                "recommendation": i.recommendation,
+                "cli_fix": i.cli_fix,
+                "user_confirmed": i.user_confirmed,
+            } for i in items]
+            print(json.dumps(output, indent=2))
+        else:
+            n_fail = print_sanity_report(items, parsed, interactive=interactive)
+            sys.exit(1 if n_fail > 0 else 0)
+        return
     args = parser.parse_args()
 
     if args.no_color:

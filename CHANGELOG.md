@@ -2,6 +2,21 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-02-22] - v2.15.0
+
+### Added
+- **Log Quality Scorer** (`--check-log`): Pre-analysis validation that grades logs as GOOD, MARGINAL, or UNUSABLE. Checks duration, sample rate, field completeness, stick activity (ground-only detection), all-zeros sensors, corrupt frame ratio, and NaN data gaps. Exits with code 1 for unusable logs. Also runs automatically during normal analysis — unusable logs are rejected early, marginal logs show inline warnings.
+- **Markdown Report** (`--report md`): Forum/Discord-ready report with scores, findings, noise sources, PID response summary, and copy-pasteable CLI commands in a fenced code block. Includes settings change table with current/recommended/reason columns. Link back to GitHub project.
+- **PyPI Publishing**: GitHub Actions workflow (`.github/workflows/publish.yml`) for trusted publishing on tag push. Version-tag consistency check prevents mismatched releases. Install with `pip install inav-toolkit`.
+- **Comparative analysis improvements**: Craft/frame mismatch warnings when comparing flights from different aircraft. Motor balance comparison table in HTML report (per-motor avg, saturation, spread deltas). Large green/red score arrow with point delta for at-a-glance verdict.
+- **Replay rewrite — Plotly.js**: Complete rewrite from Chart.js to Plotly.js with WebGL rendering (`scattergl`) supporting 20k+ points. Sliding FFT spectrogram waterfall heatmap showing noise over time. Synced x-axis zoom/pan across all panels via `plotly_relayout` events. Flight mode overlay bar decoded from S-frame bitmask (ARM, ANGLE, POSHOLD, RTH, etc).
+- **New functions**: `assess_log_quality()`, `print_log_quality()`, `generate_markdown_report()`, `_compute_spectrogram()`, `_extract_flight_modes()`.
+- **10 new tests**: `TestLogQuality` (7 tests: good log, too short, no gyro, low sample rate, ground-only, corrupt frames, all-zeros), `TestMarkdownReport` (3 tests: basic report, quality info, deferred actions). Total: 80 tests.
+
+### Changed
+- **Decoder stats exposed**: `_decoder_stats` dict (i_frames, p_frames, errors) now stored in data dict for quality scoring.
+- **Replay data budget**: Increased from 6k to 20k points per series (Plotly WebGL handles this efficiently).
+
 ## [2026-02-22] - v2.14.1
 
 ### Added
