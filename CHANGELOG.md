@@ -5,21 +5,48 @@ All notable changes to INAV Toolkit.
 ## [2026-02-22] - Blackbox Analyzer v2.13.0
 
 ### Added
-- **Navigation health analysis** (`--nav` flag): Separate analysis mode for compass, GPS, barometer, and position estimator health. Runs independently from tuning - no PID/noise/filter output. Detects motor EMI on compass (throttle-heading correlation), GPS position jumps, baro noise, and estimator divergence. Weighted nav score (compass 30%, GPS 25%, baro 25%, estimator 20%).
-- **Compass EMI detector**: Correlates heading jitter with throttle changes to detect motor electromagnetic interference. Downsamples heading to compass update rate (~50Hz) to avoid quantization artifacts from 1000Hz logging.
-- **Toilet bowl / salad bowl detector**: For poshold flights only (phase-gated), detects circular drift from compass miscalibration. Uses angular rotation rate and spectral analysis of position error.
-- **GPS quality analyzer**: Tracks EPH, satellite count from decoded GPS frames, and position jumps.
-- **Barometer quality analyzer**: Measures baro noise RMS, propwash correlation, and altitude spikes.
-- **Position estimator health check**: Compares navPos altitude with barometer to detect estimator divergence.
-- **Altitude and position hold analysis**: Phase-gated - only runs during detected nav-controlled phases (navState > 1 for >5s), not during manual flight.
-- **Flight phase segmentation**: Segments flight using navState from I-frame data.
-- **Standalone nav HTML report**: `--nav` generates a dedicated `_nav_report.html` with dark theme, score card, and findings.
+- **Navigation health analyzer** (`--nav`): Standalone analysis mode checking compass, GPS, barometer, and estimator health from any flight. No poshold or RTH required - works on manual/acro hover data. Produces its own terminal output and HTML report with sensor scores and weighted nav score.
+- **Compass analysis**: Heading jitter (RMS rate), throttle-correlated EMI detection, heading drift rate. Penalties for jitter >2 deg/s, EMI correlation >0.3, drift >0.5 deg/s.
+- **GPS analysis**: Average/minimum satellite count, EPH accuracy, position jump detection. Penalties for <12 sats, EPH >300cm, jumps >5m.
+- **Barometer analysis**: Noise RMS after detrending, throttle-correlated propwash, spike detection. Penalties for noise >30cm, propwash correlation >0.3.
+- **Estimator analysis**: Baro-to-nav altitude correlation, max divergence tracking. Penalties for correlation <0.95 or divergence >200cm.
+- **Position hold analysis**: CEP (circular error probable), max drift, toilet bowl detection via spectral analysis of position error.
+- **Altitude hold analysis**: Oscillation amplitude and frequency detection.
+- **Phase gating**: Nav mode segments (poshold, althold, RTH, manual) are detected from nav_state field. Sensor scores use all data, hold scores use only relevant phases.
+- **Tuning prerequisite warning**: If PID tuning analysis detects oscillation, nav report warns that sensor readings (especially baro and compass) are affected by vibration.
+- **Config cross-referencing**: When FC config is available (via `--device` or `--diff`), combines flight sensor data with FC settings to produce findings neither source alone can provide:
+  - Baro noise + altitude PID gains = oscillation risk warning
+  - Compass jitter + mag calibration spread = recalibrate recommendation
+  - Compass jitter + heading P gain = amplification warning
+  - Low GPS satellites + disabled GNSS constellations = enable recommendation
+  - No compass configured = GPS-course-only warning for nav modes
+  - Estimator divergence + low baro weight = trust adjustment recommendation
+- **Nav HTML report with charts**: 5 embedded matplotlib charts (heading+jitter, baro+estimator altitude, GPS satellite count, EPH timeline, poshold scatter). Score cards with bar fills. FC config section. Matches tuning report visual style.
+- **Auto-diff pull**: `--device` now always pulls `diff all` from the FC automatically. No `--diff` flag needed when connected.
+- **Auto-diff discovery**: When analyzing from file, automatically finds `*_diff.txt`, `diff.txt`, or `diff_all.txt` in the same directory as the BBL.
+- **`--diff FILE`**: Provide a CLI diff file explicitly for offline analysis with config enrichment.
+- **Cross-platform serial port discovery**: Uses pyserial's `list_ports` for Windows COM port and macOS detection. STM32 VID 0x0483 prioritized. Falls back to glob patterns on Linux.
+- **Windows ANSI color support**: Enables VT100 processing via ctypes kernel32 on Windows 10+. Auto-disables colors when stdout is piped or redirected.
+- **Centralized color handling**: All ANSI escape codes go through `_colors()` function. No more scattered inline escape sequences.
+- **Navigation analyzer documentation** (`docs/NAV_ANALYZER.md`): Comprehensive guide covering blackbox config, analysis modules, scoring, cross-referencing, flight patterns, and troubleshooting.
+
+### Fixed
+- **Baro detrending bug**: `sosfilt` (one-pass, startup transient) replaced with `sosfiltfilt` (zero-phase). The one-pass filter ramped from 0 to baro altitude over the first few seconds, creating a large fake residual that inflated baro noise readings.
 
 ### Changed
-- **`--nav` is a separate mode**: No tuning output (PIDs, filters, noise, action plan, CLI commands) when `--nav` is used. Clean separation between tuning and navigation analysis.
-- **Multi-flight handling in nav mode**: Skips the tuning summary scan table, analyzes the last flight directly.
-- **Decoder: navigation field mapping**: Extended col_map in both binary and CSV decoders to extract 30+ navigation fields from I/P frames (navPos, navVel, navTgtPos, navTgtVel, navAcc, attitude, BaroAlt, navState, navFlags, navEPH/EPV, accSmooth, rcData, vbat, amperage, rssi).
-- **Decoder: S-frame and G-frame decoding**: Slow frames (flight mode flags) and GPS frames (satellite data) are now decoded and stored instead of skipped. Raw values returned (no I-frame predictor applied).
+- **`--diff` is now file-path only**: No longer a boolean flag. `--device` auto-pulls config, `--diff path.txt` is for offline use.
+- **Install instructions**: apt-first for Debian/Ubuntu/RPi, venv as universal fallback. Removed `--break-system-packages`.
+- **`--device` help text**: Shows cross-platform port examples (COM3, /dev/cu.usbmodem).
+- **Windows COM port handling**: Skips filesystem existence check for COM ports.
+- **requirements.txt**: Added matplotlib (was a hard dependency but missing from requirements).
+- **README**: Platform Support table, nav in workflow, updated project structure.
+
+## [2026-02-21] - Blackbox Analyzer v2.12.1
+
+### Fixed
+- **MSP hot-spin on disconnect**: Serial read loop could spin at 100% CPU if FC disconnected mid-transfer. Added timeout handling.
+- **Em dash cleanup**: Replaced Unicode em dashes with ASCII hyphens throughout all source files and docs for terminal compatibility.
+- **UI symbol consistency**: Standardized checkmarks and status symbols across terminal output.
 
 ## [2026-02-21] - Blackbox Analyzer v2.12.0
 

@@ -6,11 +6,9 @@ A suite of Python tools for analyzing, validating, and tuning INAV flight contro
 
 | Tool | Purpose |
 |------|---------|
-| **Blackbox Analyzer** | Decode blackbox logs, analyze PID performance, detect oscillation, recommend tuning changes |
+| **Blackbox Analyzer** | Decode blackbox logs, analyze PID/nav performance, detect oscillation, recommend tuning changes. `--nav` mode for compass/GPS/baro health. `--device` for direct FC communication. |
 | **Parameter Analyzer** | Validate `diff all` configs for safety, filter, PID, and navigation issues |
 | **VTOL Configurator** | Validate VTOL mixer profiles, motor/servo mixing, and transition setup |
-| **Flight Database** | SQLite storage for flight history, progression tracking across tuning sessions |
-| **MSP Communication** | Direct FC communication - download blackbox, pull config, identify hardware |
 
 ## Quick Start
 
@@ -20,14 +18,14 @@ Python 3.8+ required.
 
 ```bash
 # Debian / Ubuntu / Raspberry Pi (easiest)
-sudo apt install python3-numpy python3-scipy
+sudo apt install python3-numpy python3-scipy python3-matplotlib
 sudo apt install python3-serial              # optional: only for --device mode
 
 # Any platform (virtual environment)
 python3 -m venv .venv
 source .venv/bin/activate                    # Linux / macOS
 # .venv\Scripts\activate                     # Windows
-pip install numpy scipy
+pip install numpy scipy matplotlib
 pip install pyserial                         # optional: only for --device mode
 ```
 
