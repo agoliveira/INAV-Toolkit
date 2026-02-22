@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inav-toolkit"
-version = "2.15.0"
+version = "2.15.1"
 description = "Blackbox analyzer, parameter checker, and tuning wizard for INAV flight controllers"
 readme = "README.md"
 license = {text = "MIT"}
@@ -47,6 +47,9 @@ inav-msp = "inav_toolkit.msp:main"
 
 [tool.setuptools.packages.find]
 include = ["inav_toolkit*"]
+
+[tool.setuptools.package-data]
+inav_toolkit = ["locales/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

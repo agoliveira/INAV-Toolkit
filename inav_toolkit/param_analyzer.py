@@ -21,7 +21,7 @@ import sys
 import textwrap
 from datetime import datetime
 
-VERSION = "2.15.0"
+VERSION = "2.15.1"
 
 
 def _enable_ansi_colors():
@@ -2560,7 +2560,22 @@ def main():
                         help="Skip interactive questions in --check mode")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable colored terminal output.")
+    parser.add_argument("--lang", metavar="LANG",
+                        help="Language for output (en, pt_BR, es). "
+                             "Auto-detects from INAV_LANG env var or system locale.")
     args = parser.parse_args()
+
+    # Initialize localization
+    try:
+        from inav_toolkit.i18n import set_locale, detect_locale
+    except ImportError:
+        try:
+            from i18n import set_locale, detect_locale
+        except ImportError:
+            set_locale = detect_locale = None
+    if set_locale and detect_locale:
+        lang = getattr(args, 'lang', None) or detect_locale()
+        set_locale(lang)
 
     if args.no_color:
         _disable_colors()

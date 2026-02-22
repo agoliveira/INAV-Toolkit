@@ -1107,6 +1107,118 @@ class TestMarkdownReport:
         assert "rpm_filter_enabled" in md
 
 
+class TestI18n:
+    """Tests for localization system."""
+
+    def test_english_default(self):
+        """Test that English is the default locale."""
+        from inav_toolkit.i18n import t, set_locale, get_locale
+        set_locale("en")
+        assert get_locale() == "en"
+        assert t("verdict.dialed_in") != "verdict.dialed_in"  # not raw key
+        assert "fly" in t("verdict.dialed_in").lower()
+
+    def test_portuguese_translation(self):
+        """Test pt_BR translations load and work."""
+        from inav_toolkit.i18n import t, set_locale
+        set_locale("pt_BR")
+        result = t("verdict.dialed_in")
+        assert result != "verdict.dialed_in"
+        assert "voar" in result.lower() or "perfeito" in result.lower()
+        # Reset
+        set_locale("en")
+
+    def test_spanish_translation(self):
+        """Test es translations load and work."""
+        from inav_toolkit.i18n import t, set_locale
+        set_locale("es")
+        result = t("verdict.dialed_in")
+        assert result != "verdict.dialed_in"
+        assert "volar" in result.lower() or "perfecto" in result.lower()
+        set_locale("en")
+
+    def test_format_substitution(self):
+        """Test that {placeholders} are substituted."""
+        from inav_toolkit.i18n import t, set_locale
+        set_locale("en")
+        result = t("quality.too_short", duration="1.2")
+        assert "1.2" in result
+        assert "{duration}" not in result
+
+    def test_format_substitution_pt_br(self):
+        """Test substitution works in translated strings."""
+        from inav_toolkit.i18n import t, set_locale
+        set_locale("pt_BR")
+        result = t("quality.too_short", duration="3.5")
+        assert "3.5" in result
+        assert "{duration}" not in result
+        set_locale("en")
+
+    def test_missing_key_fallback(self):
+        """Test that missing keys fall back to key itself."""
+        from inav_toolkit.i18n import t, set_locale
+        set_locale("en")
+        result = t("nonexistent.key.that.does.not.exist")
+        assert result == "nonexistent.key.that.does.not.exist"
+
+    def test_locale_fallback_to_english(self):
+        """Test that unknown locale falls back to English."""
+        from inav_toolkit.i18n import t, set_locale
+        set_locale("xx_XX")  # nonexistent locale
+        result = t("verdict.dialed_in")
+        assert "fly" in result.lower()  # should get English
+        set_locale("en")
+
+    def test_available_locales(self):
+        """Test that locale listing works."""
+        from inav_toolkit.i18n import available_locales
+        locales = available_locales()
+        assert "en" in locales
+        assert "pt_BR" in locales
+        assert "es" in locales
+
+    def test_quality_messages_translated(self):
+        """Test that quality scorer messages use t() and translate."""
+        from inav_toolkit.blackbox_analyzer import assess_log_quality
+        from inav_toolkit.i18n import set_locale
+
+        set_locale("pt_BR")
+        n = 50
+        data = {
+            "time_s": np.arange(n) / 500.0,
+            "gyro_roll": np.random.randn(n),
+            "n_rows": n, "sample_rate": 500.0,
+            "found_columns": ["gyro_roll"],
+        }
+        q = assess_log_quality(data)
+        # Should have Portuguese messages
+        has_pt = any("apenas" in i["message"].lower() or "necessário" in i["message"].lower()
+                     or "análise" in i["message"].lower()
+                     for i in q["issues"])
+        assert has_pt, f"Expected Portuguese messages, got: {[i['message'] for i in q['issues']]}"
+        set_locale("en")
+
+    def test_markdown_report_translated(self):
+        """Test markdown report uses translated section headers."""
+        from inav_toolkit.blackbox_analyzer import generate_markdown_report, get_frame_profile
+        from inav_toolkit.i18n import set_locale
+
+        set_locale("pt_BR")
+        profile = get_frame_profile(5, 5, 3)
+        config = {"craft_name": "TestQuad", "firmware_revision": "INAV 9"}
+        data = {"time_s": np.arange(5000) / 500.0, "sample_rate": 500.0}
+        plan = {
+            "scores": {"overall": 72}, "verdict": "OK",
+            "verdict_text": "Test", "findings": [],
+            "noise_fingerprint": {}, "actions": [],
+        }
+        md = generate_markdown_report(plan, config, data, [None]*3, [None]*3,
+                                      None, profile)
+        assert "Pontuações" in md or "Pontuação" in md  # Portuguese "Scores"
+        assert "Analisador" in md  # Portuguese "Analyzer"
+        set_locale("en")
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Standalone runner (works without pytest)
 # ═════════════════════════════════════════════════════════════════════════════

@@ -12,7 +12,6 @@ A suite of Python tools for analyzing, validating, and tuning INAV flight contro
 | **Guided Wizard** | Interactive session manager - connects to FC, backs up config, runs analysis, applies changes |
 | **Parameter Analyzer** | Validate `diff all` configs for safety, filter, PID, and navigation issues |
 | **VTOL Configurator** | Validate VTOL mixer profiles, motor/servo mixing, and transition setup |
-| **Flight Database** | SQLite storage for flight history, progression tracking across tuning sessions |
 | **MSP Communication** | Direct FC communication - download blackbox, pull config, identify hardware |
 
 ## Quick Start
@@ -88,6 +87,10 @@ inav-analyze flight.bbl --check-log
 # Generate Markdown report for forum/Discord
 inav-analyze flight.bbl --report md
 
+# Output in Portuguese or Spanish
+inav-analyze flight.bbl --lang pt_BR
+inav-analyze flight.bbl --lang es
+
 # Skip database storage for one-off analysis
 inav-analyze flight.bbl --no-db
 
@@ -112,11 +115,11 @@ inav-analyze flight.bbl --db-path ~/my_flights.db
 
 **Markdown reports** (`--report md`): Generates a forum/Discord-pasteable report with scores, findings, noise sources, PID metrics, and CLI commands in a fenced code block.
 
+**Localization** (`--lang`): Output in English (default), Brazilian Portuguese (`pt_BR`), or Spanish (`es`). Auto-detects from `INAV_LANG` environment variable or system locale. Technical terms (PID, Hz, Roll/Pitch/Yaw, CLI commands) stay untranslated. Add new languages by creating a JSON file in `inav_toolkit/locales/`.
+
 **Multi-log splitting:** Dataflash dumps containing multiple arm/disarm cycles are automatically detected and split. Each flight is analyzed individually with per-flight progression tracking.
 
 **CLI diff merge:** When connected to the FC via `--device`, the analyzer automatically pulls the full `diff all` configuration. Settings not present in blackbox headers (motor_poles, nav PIDs, rates, level mode, antigravity) are enriched from the diff. Mismatches between what was flying and the current FC config are detected and displayed.
-
-**Flight database:** Every analysis is stored in a SQLite database (`inav_flights.db`). Scores, per-axis oscillation data, PID values, filter config, motor balance, and recommended actions are tracked per flight. The `--history` flag shows a progression table.
 
 **Auto-detection:** Frame size from craft name, battery cells from vbatref, platform type (quad/hex/tri) from motor count. Warns on conflicts between detected and user-specified values.
 
@@ -287,12 +290,13 @@ inav-toolkit/
 ├── CHANGELOG.md
 ├── LICENSE
 ├── inav_toolkit/                    # Python package
-│   ├── __init__.py                  # Version: 2.14.1
+│   ├── __init__.py                  # Version: 2.15.1
 │   ├── blackbox_analyzer.py         # Blackbox log analyzer
 │   ├── param_analyzer.py            # Config validator + setup generator
 │   ├── msp.py                       # MSP v2 serial communication
 │   ├── wizard.py                    # Guided session manager
-│   ├── flight_db.py                 # SQLite flight history database
+│   ├── i18n.py                      # Localization system
+│   ├── locales/                     # Translation catalogs (en, pt_BR, es)
 │   ├── autotune.py                  # Experimental auto-tuning
 │   └── vtol_configurator.py         # VTOL mixer profile validator
 ├── docs/
@@ -302,7 +306,7 @@ inav-toolkit/
 │   ├── VTOL_CONFIGURATOR.md         # Detailed VTOL configurator docs
 │   └── TUNING_WORKFLOW.md           # Step-by-step tuning guide
 ├── tests/
-│   ├── test_smoke.py                # 50 tests across 11 test classes
+│   ├── test_smoke.py                # 90 tests across 13 test classes
 │   ├── conftest.py                  # Shared pytest fixtures
 │   ├── generate_fixtures.py         # Synthetic blackbox CSV generator
 │   ├── test_basic_diff.txt          # Sample diff for param_analyzer tests
@@ -338,6 +342,7 @@ GPL-3.0 License. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
+- [UAV Tech](https://www.youtube.com/@uavtech) — the YouTube channel that inspired this project
 - The INAV development team and community
 - QuadMeUp (Paweł Spychalski) for filter and RPM analysis research
 - The INAV Fixed Wing Group for modes documentation

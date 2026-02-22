@@ -2,6 +2,16 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-02-22] - v2.15.1
+
+### Added
+- **Localization (i18n)**: Lightweight JSON-based translation system (`inav_toolkit/i18n.py`). Three locales: English, Brazilian Portuguese (pt_BR), Spanish (es). Covers ~120 user-facing strings: quality checks, verdicts, section headers, banner labels, comparison output, report text. Auto-detects from `INAV_LANG` env var or system locale. Use `--lang pt_BR` or `--lang es` on any command. Technical terms (PID, Hz, Roll/Pitch/Yaw, CLI commands) stay untranslated.
+- **`--lang` flag**: Added to `inav-analyze` and `inav-params`. Accepts `en`, `pt_BR`, `es`.
+- **10 new i18n tests**: Locale loading, translation, format substitution, fallback chain, available locales, translated quality/markdown output. Total: 90 tests.
+
+### Changed
+- **pyproject.toml**: Added `package-data` for locale JSON files in wheel.
+
 ## [2026-02-22] - v2.15.0
 
 ### Added
@@ -11,7 +21,7 @@ All notable changes to INAV Toolkit.
 - **Comparative analysis improvements**: Craft/frame mismatch warnings when comparing flights from different aircraft. Motor balance comparison table in HTML report (per-motor avg, saturation, spread deltas). Large green/red score arrow with point delta for at-a-glance verdict.
 - **Replay rewrite — Plotly.js**: Complete rewrite from Chart.js to Plotly.js with WebGL rendering (`scattergl`) supporting 20k+ points. Sliding FFT spectrogram waterfall heatmap showing noise over time. Synced x-axis zoom/pan across all panels via `plotly_relayout` events. Flight mode overlay bar decoded from S-frame bitmask (ARM, ANGLE, POSHOLD, RTH, etc).
 - **New functions**: `assess_log_quality()`, `print_log_quality()`, `generate_markdown_report()`, `_compute_spectrogram()`, `_extract_flight_modes()`.
-- **10 new tests**: `TestLogQuality` (7 tests: good log, too short, no gyro, low sample rate, ground-only, corrupt frames, all-zeros), `TestMarkdownReport` (3 tests: basic report, quality info, deferred actions). Total: 80 tests.
+- **10 new tests**: `TestLogQuality` (7 tests), `TestMarkdownReport` (3 tests). Total: 80 tests.
 
 ### Changed
 - **Decoder stats exposed**: `_decoder_stats` dict (i_frames, p_frames, errors) now stored in data dict for quality scoring.

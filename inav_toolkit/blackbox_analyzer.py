@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.15.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.15.1
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -33,6 +33,23 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", message=".*tight_layout.*")
+
+# ─── Localization ──────────────────────────────────────────────────────────────
+try:
+    from inav_toolkit.i18n import t
+except ImportError:
+    try:
+        from i18n import t
+    except ImportError:
+        # Fallback: no-op translation if i18n module is missing
+        def t(key, **kwargs):
+            text = key
+            if kwargs:
+                try:
+                    text = text.format(**kwargs)
+                except (KeyError, IndexError, ValueError):
+                    pass
+            return text
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -87,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.15.0"
+REPORT_VERSION = "2.15.1"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1797,25 +1814,25 @@ def assess_log_quality(data, config=None, filepath=None):
     # ── Check 1: Duration ──
     if duration < 2.0:
         issues.append({"severity": "FAIL", "check": "duration",
-                       "message": f"Log is only {duration:.1f}s — need at least 5s for analysis"})
+                       "message": t("quality.too_short", duration=f"{duration:.1f}")})
     elif duration < 5.0:
         issues.append({"severity": "WARN", "check": "duration",
-                       "message": f"Log is short ({duration:.1f}s) — results may be unreliable, 10s+ recommended"})
+                       "message": t("quality.short", duration=f"{duration:.1f}")})
 
     # ── Check 2: Sample rate ──
     if sr < 50:
         issues.append({"severity": "FAIL", "check": "sample_rate",
-                       "message": f"Sample rate {sr:.0f}Hz is too low for spectral analysis (need 100Hz+)"})
+                       "message": t("quality.low_sr_fail", sr=f"{sr:.0f}")})
     elif sr < 200:
         issues.append({"severity": "WARN", "check": "sample_rate",
-                       "message": f"Sample rate {sr:.0f}Hz limits noise analysis to {sr/2:.0f}Hz (500Hz+ preferred)"})
+                       "message": t("quality.low_sr_warn", sr=f"{sr:.0f}", nyquist=f"{sr/2:.0f}")})
     stats["nyquist_hz"] = sr / 2 if sr > 0 else 0
 
     # ── Check 3: Sample count ──
     min_samples_for_fft = 512
     if n_rows < min_samples_for_fft:
         issues.append({"severity": "FAIL", "check": "sample_count",
-                       "message": f"Only {n_rows} samples — need at least {min_samples_for_fft} for FFT"})
+                       "message": t("quality.few_samples", n=n_rows, min=min_samples_for_fft)})
 
     # ── Check 4: Required fields ──
     has_gyro = any(f"gyro_{ax}" in data for ax in ["roll", "pitch", "yaw"])
@@ -1828,13 +1845,13 @@ def assess_log_quality(data, config=None, filepath=None):
 
     if not has_gyro:
         issues.append({"severity": "FAIL", "check": "missing_gyro",
-                       "message": "No gyro data found — cannot perform noise or PID analysis"})
+                       "message": t("quality.no_gyro")})
     if not has_motors:
         issues.append({"severity": "WARN", "check": "missing_motors",
-                       "message": "No motor data — motor balance analysis unavailable"})
+                       "message": t("quality.no_motors")})
     if not has_setpoint:
         issues.append({"severity": "WARN", "check": "missing_setpoint",
-                       "message": "No setpoint/rcCommand data — PID response analysis unavailable"})
+                       "message": t("quality.no_setpoint")})
 
     # ── Check 5: Stick activity (was the pilot actually flying?) ──
     stick_active = False
@@ -1864,7 +1881,7 @@ def assess_log_quality(data, config=None, filepath=None):
 
     if not stick_active and not throttle_active:
         issues.append({"severity": "WARN", "check": "no_stick_activity",
-                       "message": "No stick movement detected — log may be ground-only (armed but not flying)"})
+                       "message": t("quality.no_stick")})
 
     # ── Check 6: All-zeros channels (dead/disconnected sensors) ──
     for ax in ["roll", "pitch", "yaw"]:
@@ -1873,7 +1890,7 @@ def assess_log_quality(data, config=None, filepath=None):
             g = data[gk]
             if np.all(g == 0) or (np.std(g) < 0.01 and np.mean(np.abs(g)) < 0.01):
                 issues.append({"severity": "FAIL", "check": f"zeros_{ax}",
-                               "message": f"Gyro {ax} is all zeros — sensor may be dead or not logging"})
+                               "message": t("quality.zeros_gyro", axis=ax)})
 
     for i in range(4):
         mk = f"motor{i}"
@@ -1881,7 +1898,7 @@ def assess_log_quality(data, config=None, filepath=None):
             m = data[mk]
             if np.all(m == 0):
                 issues.append({"severity": "WARN", "check": f"motor{i}_zeros",
-                               "message": f"Motor {i} output is all zeros — motor disabled or not armed?"})
+                               "message": t("quality.zeros_motor", n=i)})
 
     # ── Check 7: Corrupt frame ratio (if decoder stats available) ──
     decoder_stats = data.get("_decoder_stats", {})
@@ -1895,10 +1912,10 @@ def assess_log_quality(data, config=None, filepath=None):
             stats["error_pct"] = error_pct
             if error_pct > 20:
                 issues.append({"severity": "FAIL", "check": "corrupt_frames",
-                               "message": f"{error_pct:.0f}% of frames corrupt — log may be damaged"})
+                               "message": t("quality.corrupt_fail", pct=f"{error_pct:.0f}")})
             elif error_pct > 5:
                 issues.append({"severity": "WARN", "check": "corrupt_frames",
-                               "message": f"{error_pct:.1f}% of frames had decode errors"})
+                               "message": t("quality.corrupt_warn", pct=f"{error_pct:.1f}")})
 
     # ── Check 8: NaN ratio in gyro data ──
     for ax in ["roll", "pitch", "yaw"]:
@@ -1907,10 +1924,10 @@ def assess_log_quality(data, config=None, filepath=None):
             nan_pct = np.sum(np.isnan(data[gk])) / len(data[gk]) * 100
             if nan_pct > 50:
                 issues.append({"severity": "FAIL", "check": f"nan_{ax}",
-                               "message": f"Gyro {ax} has {nan_pct:.0f}% NaN values — data largely missing"})
+                               "message": t("quality.nan_fail", axis=ax, pct=f"{nan_pct:.0f}")})
             elif nan_pct > 10:
                 issues.append({"severity": "WARN", "check": f"nan_{ax}",
-                               "message": f"Gyro {ax} has {nan_pct:.1f}% NaN values — some data gaps"})
+                               "message": t("quality.nan_warn", axis=ax, pct=f"{nan_pct:.1f}")})
             stats[f"nan_pct_{ax}"] = nan_pct
 
     # ── Compute overall grade ──
@@ -1958,11 +1975,12 @@ def print_log_quality(quality, verbose=False):
     R, B, C, G, Y, RED, DIM = _colors()
     grade = quality["grade"]
     gc = G if grade == "GOOD" else Y if grade == "MARGINAL" else RED
+    grade_text = t(f"quality.{grade.lower()}")
 
-    print(f"\n  {B}Log Quality: {gc}{grade}{R}")
+    print(f"\n  {B}{t('quality.title')}: {gc}{grade_text}{R}")
     stats = quality["stats"]
     print(f"  {DIM}{stats['duration_s']:.1f}s | {stats['sample_rate_hz']:.0f}Hz | "
-          f"{stats['n_rows']} rows | {stats['field_count']} fields{R}")
+          f"{stats['n_rows']} rows | {stats['field_count']} {t('quality.fields_label').lower()}{R}")
 
     if quality["issues"]:
         for issue in quality["issues"]:
@@ -1971,14 +1989,17 @@ def print_log_quality(quality, verbose=False):
             sym = "✗" if sev == "FAIL" else "⚠"
             print(f"  {sc}{sym} {sev}: {issue['message']}{R}")
     else:
-        print(f"  {G}✓ All quality checks passed{R}")
+        print(f"  {G}✓ {t('quality.all_passed')}{R}")
 
     if verbose:
-        print(f"\n  {DIM}Fields: gyro={'✓' if stats.get('has_gyro') else '✗'} "
-              f"motors={'✓' if stats.get('has_motors') else '✗'} "
-              f"setpoint={'✓' if stats.get('has_setpoint') else '✗'} "
-              f"stick={'active' if stats.get('stick_active') else 'idle'} "
-              f"throttle={'active' if stats.get('throttle_active') else 'idle'}{R}")
+        gyro_sym = '✓' if stats.get('has_gyro') else '✗'
+        motor_sym = '✓' if stats.get('has_motors') else '✗'
+        sp_sym = '✓' if stats.get('has_setpoint') else '✗'
+        stick_st = t('quality.active') if stats.get('stick_active') else t('quality.idle')
+        thr_st = t('quality.active') if stats.get('throttle_active') else t('quality.idle')
+        print(f"\n  {DIM}{t('quality.fields_label')}: gyro={gyro_sym} "
+              f"motors={motor_sym} setpoint={sp_sym} "
+              f"stick={stick_st} throttle={thr_st}{R}")
     print()
 
 
@@ -4404,19 +4425,19 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
     if not pid_measurable:
         # Can't verify tune - need more stick data
         if overall >= 50:
-            verdict, vtext = "NEED_DATA", "Noise and motors look good, but PID performance could not be measured. Fly with stick inputs (rolls, pitches, yaw sweeps) for tuning data."
+            verdict, vtext = "NEED_DATA", t("verdict.need_data_good")
         else:
-            verdict, vtext = "NEED_DATA", "PID performance could not be measured. Fly with deliberate stick inputs for tuning data."
+            verdict, vtext = "NEED_DATA", t("verdict.need_data_bad")
     elif overall >= 85 and len(critical_actions) == 0:
-        verdict, vtext = "DIALED_IN", "This tune is dialed in. You're done - go fly!"
+        verdict, vtext = "DIALED_IN", t("verdict.dialed_in")
     elif overall >= 75 and len(critical_actions) == 0:
-        verdict, vtext = "NEARLY_THERE", "Almost there - just minor tweaks left."
+        verdict, vtext = "NEARLY_THERE", t("verdict.nearly_there")
     elif overall >= 60:
-        verdict, vtext = "GETTING_BETTER", "Making progress. Apply the changes below and fly again."
+        verdict, vtext = "GETTING_BETTER", t("verdict.getting_better")
     elif overall >= 40:
-        verdict, vtext = "NEEDS_WORK", "Significant tuning needed. Start with the top priorities."
+        verdict, vtext = "NEEDS_WORK", t("verdict.needs_work")
     else:
-        verdict, vtext = "ROUGH", "Needs attention. Focus on filters first, then PIDs."
+        verdict, vtext = "ROUGH", t("verdict.rough")
 
     return {"actions": actions, "info": info_items, "scores": scores, "verdict": verdict, "verdict_text": vtext}
 
@@ -4872,9 +4893,9 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
 
     if not active_actions and not deferred_actions:
         if plan["scores"].get("pid_measurable", True):
-            print(f"\n  {G}{B}  ✓ No changes needed - go fly!{R}")
+            print(f"\n  {G}{B}  ✓ {t('terminal.no_changes')}{R}")
         else:
-            print(f"\n  {Y}{B}  ⚠ Need flight data with stick inputs to measure PID response.{R}")
+            print(f"\n  {Y}{B}  ⚠ {t('terminal.need_stick_data')}{R}")
             print(f"  {DIM}  Fly with deliberate roll/pitch/yaw moves, then re-analyze.{R}")
 
     print(f"\n{B}{C}{'─'*70}{R}")
@@ -5594,46 +5615,47 @@ def generate_markdown_report(plan, config, data, noise_results, pid_results,
     duration = data["time_s"][-1] if "time_s" in data and len(data.get("time_s", [])) > 0 else 0
 
     lines = []
-    lines.append(f"## INAV Blackbox Analysis — {craft}")
+    lines.append(f"## {t('banner.analyzer')} — {craft}")
     lines.append(f"")
-    lines.append(f"**Firmware:** {fw}  ")
-    lines.append(f"**Duration:** {duration:.1f}s @ {sr:.0f}Hz  ")
-    lines.append(f"**Frame profile:** {profile['name']}  ")
-    lines.append(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
+    lines.append(f"**{t('banner.firmware')}:** {fw}  ")
+    lines.append(f"**{t('section.duration')}:** {duration:.1f}s @ {sr:.0f}Hz  ")
+    lines.append(f"**{t('banner.profile')}:** {profile['name']}  ")
+    lines.append(f"**{t('label.date')}:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
     lines.append(f"")
 
     # Log quality (if available)
     if quality:
         grade = quality["grade"]
+        grade_text = t(f"quality.{grade.lower()}")
         emoji = "✅" if grade == "GOOD" else "⚠️" if grade == "MARGINAL" else "❌"
-        lines.append(f"**Log quality:** {emoji} {grade}")
+        lines.append(f"**{t('quality.title')}:** {emoji} {grade_text}")
         for issue in quality.get("issues", []):
             sym = "❌" if issue["severity"] == "FAIL" else "⚠️"
             lines.append(f"- {sym} {issue['message']}")
         lines.append(f"")
 
     # Scores
-    lines.append(f"### Scores")
+    lines.append(f"### {t('section.scores')}")
     lines.append(f"")
-    lines.append(f"| Metric | Score |")
+    lines.append(f"| {t('compare.metric')} | {t('label.score')} |")
     lines.append(f"|--------|-------|")
-    lines.append(f"| **Overall** | **{scores.get('overall', 0):.0f}/100** |")
-    for key, label in [("noise", "Noise"), ("pid", "PID Response"),
-                       ("motor", "Motor Balance"), ("osc", "Oscillation")]:
+    lines.append(f"| **{t('section.overall')}** | **{scores.get('overall', 0):.0f}/100** |")
+    for key, tkey in [("noise", "section.noise"), ("pid", "section.pid"),
+                       ("motor", "section.motor"), ("osc", "section.oscillation")]:
         val = scores.get(key)
         if val is not None:
-            lines.append(f"| {label} | {val:.0f}/100 |")
+            lines.append(f"| {t(tkey)} | {val:.0f}/100 |")
     lines.append(f"")
 
     # Verdict
     verdict = plan.get("verdict_text", plan.get("verdict", "?"))
-    lines.append(f"**Verdict:** {verdict}")
+    lines.append(f"**{t('section.verdict')}:** {verdict}")
     lines.append(f"")
 
     # Findings
     findings = plan.get("findings", [])
     if findings:
-        lines.append(f"### Findings")
+        lines.append(f"### {t('section.findings')}")
         lines.append(f"")
         for f in findings:
             sev = f.get("severity", "info")
@@ -5676,7 +5698,7 @@ def generate_markdown_report(plan, config, data, noise_results, pid_results,
     # Recommended actions (the CLI commands)
     actions = [a for a in plan.get("actions", []) if not a.get("deferred")]
     if actions:
-        lines.append(f"### Recommended Changes")
+        lines.append(f"### {t('section.recommended')}")
         lines.append(f"")
         lines.append(f"```")
         for a in actions:
@@ -5689,7 +5711,7 @@ def generate_markdown_report(plan, config, data, noise_results, pid_results,
         lines.append(f"")
 
         # Show what changed
-        lines.append(f"| Setting | Current | Recommended | Reason |")
+        lines.append(f"| {t('label.setting')} | {t('label.current')} | {t('label.recommended')} | {t('label.reason')} |")
         lines.append(f"|---------|---------|-------------|--------|")
         for a in actions:
             param = a.get("param", "")
@@ -5700,14 +5722,14 @@ def generate_markdown_report(plan, config, data, noise_results, pid_results,
 
     deferred = [a for a in plan.get("actions", []) if a.get("deferred")]
     if deferred:
-        lines.append(f"### Deferred (apply after test flight)")
+        lines.append(f"### {t('section.deferred')}")
         lines.append(f"")
         for a in deferred:
             lines.append(f"- `set {a.get('param', '?')} = {a.get('new', '?')}` — {a.get('action', '')}")
         lines.append(f"")
 
     lines.append(f"---")
-    lines.append(f"*Generated by [INAV Toolkit v{REPORT_VERSION}]"
+    lines.append(f"*{t('report.generated_by')} [INAV Toolkit v{REPORT_VERSION}]"
                 f"(https://github.com/agoliveira/INAV-Toolkit)*")
 
     return "\n".join(lines)
@@ -5826,7 +5848,7 @@ def count_blackbox_logs(filepath):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.15.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.15.1 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -5894,7 +5916,18 @@ def main():
     parser.add_argument("--report", metavar="FORMAT", choices=["md", "markdown"],
                         help="Generate Markdown report alongside HTML. "
                              "Usage: inav-analyze flight.bbl --report md")
+    parser.add_argument("--lang", metavar="LANG",
+                        help="Language for output (en, pt_BR, es). "
+                             "Auto-detects from INAV_LANG env var or system locale.")
     args = parser.parse_args()
+
+    # Initialize localization
+    try:
+        from inav_toolkit.i18n import set_locale, detect_locale
+    except ImportError:
+        from i18n import set_locale, detect_locale
+    lang = args.lang or detect_locale()
+    set_locale(lang)
 
     if args.no_color:
         _disable_colors()
@@ -6951,7 +6984,7 @@ def _run_comparison(file_a, file_b, args, diff_raw):
     """Run comparative analysis on two flight logs."""
     R, B, C, G, Y, RED, DIM = _colors()
 
-    print(f"\n  ▲ INAV Flight Comparison v{REPORT_VERSION}")
+    print(f"\n  ▲ {t('banner.compare')} v{REPORT_VERSION}")
     print(f"  Flight A: {file_a}")
     print(f"  Flight B: {file_b}")
     print()
@@ -6973,27 +7006,27 @@ def _run_comparison(file_a, file_b, args, diff_raw):
     craft_a = res_a["config"].get("craft_name", "")
     craft_b = res_b["config"].get("craft_name", "")
     if craft_a and craft_b and craft_a != craft_b:
-        print(f"  {Y}⚠ Different craft names: \"{craft_a}\" vs \"{craft_b}\"{R}")
-        print(f"  {DIM}  Comparison still works but thresholds may differ.{R}")
+        print(f"  {Y}⚠ {t('compare.diff_craft', a=craft_a, b=craft_b)}{R}")
+        print(f"  {DIM}  {t('compare.diff_craft_note')}{R}")
     profile_a = res_a["profile"]["name"]
     profile_b = res_b["profile"]["name"]
     if profile_a != profile_b:
-        print(f"  {Y}⚠ Different frame profiles: {profile_a} vs {profile_b}{R}")
-        print(f"  {DIM}  Score thresholds differ — deltas may reflect profile, not tuning.{R}")
+        print(f"  {Y}⚠ {t('compare.diff_profile', a=profile_a, b=profile_b)}{R}")
+        print(f"  {DIM}  {t('compare.diff_profile_note')}{R}")
 
     # Terminal comparison
     print(f"\n  {B}{'═' * 60}{R}")
-    print(f"  {B}COMPARISON: {label_a} → {label_b}{R}")
+    print(f"  {B}{t('section.comparison').upper()}: {label_a} → {label_b}{R}")
     print(f"  {B}{'═' * 60}{R}")
 
     metrics = [
-        ("Overall", sa.get("overall"), sb.get("overall")),
-        ("Noise", sa.get("noise"), sb.get("noise")),
+        (t("section.overall"), sa.get("overall"), sb.get("overall")),
+        (t("section.noise"), sa.get("noise"), sb.get("noise")),
         ("PID", sa.get("pid"), sb.get("pid")),
-        ("Motor", sa.get("motor"), sb.get("motor")),
+        (t("label.motor"), sa.get("motor"), sb.get("motor")),
     ]
 
-    print(f"\n  {'Metric':<16} {'A':>8} {'B':>8} {'Δ':>8}")
+    print(f"\n  {t('compare.metric'):<16} {'A':>8} {'B':>8} {'Δ':>8}")
     print(f"  {'─' * 44}")
 
     for name, va, vb in metrics:
@@ -7012,8 +7045,8 @@ def _run_comparison(file_a, file_b, args, diff_raw):
         print(f"  {name:<16} {va_str:>8} {vb_str:>8} {delta_str}")
 
     # PID response comparison
-    print(f"\n  {B}PID Response:{R}")
-    print(f"  {'Axis':<8} {'Delay A':>10} {'Delay B':>10} {'OS A':>8} {'OS B':>8}")
+    print(f"\n  {B}{t('section.pid')}:{R}")
+    print(f"  {t('label.axis'):<8} {t('label.delay')+' A':>10} {t('label.delay')+' B':>10} {'OS A':>8} {'OS B':>8}")
     print(f"  {'─' * 50}")
     for i in range(3):
         pa = res_a["pid_results"][i]
@@ -7028,33 +7061,33 @@ def _run_comparison(file_a, file_b, args, diff_raw):
     ma_a = res_a["motor_analysis"]
     ma_b = res_b["motor_analysis"]
     if ma_a and ma_b and not ma_a.get("idle_detected") and not ma_b.get("idle_detected"):
-        print(f"\n  {B}Motor Balance:{R}")
-        print(f"  {'':12} {'Spread A':>10} {'Spread B':>10} {'Δ':>8}")
+        print(f"\n  {B}{t('section.motor_balance')}:{R}")
+        print(f"  {'':12} {t('compare.spread')+' A':>10} {t('compare.spread')+' B':>10} {'Δ':>8}")
         print(f"  {'─' * 44}")
         sp_a = ma_a.get("balance_spread_pct", 0)
         sp_b = ma_b.get("balance_spread_pct", 0)
         d = sp_b - sp_a
         dc = G if d < -0.5 else RED if d > 0.5 else DIM
-        print(f"  {'Spread':<12} {sp_a:>9.1f}% {sp_b:>9.1f}% {dc}{d:>+.1f}%{R}")
+        print(f"  {t('compare.spread'):<12} {sp_a:>9.1f}% {sp_b:>9.1f}% {dc}{d:>+.1f}%{R}")
 
         sat_a = max(m["saturation_pct"] for m in ma_a["motors"])
         sat_b = max(m["saturation_pct"] for m in ma_b["motors"])
         d = sat_b - sat_a
         dc = G if d < -0.5 else RED if d > 0.5 else DIM
-        print(f"  {'Peak Sat':<12} {sat_a:>9.1f}% {sat_b:>9.1f}% {dc}{d:>+.1f}%{R}")
+        print(f"  {t('compare.peak_sat'):<12} {sat_a:>9.1f}% {sat_b:>9.1f}% {dc}{d:>+.1f}%{R}")
 
     overall_delta = (sb.get("overall", 0) or 0) - (sa.get("overall", 0) or 0)
     print(f"\n  {B}{'═' * 60}{R}")
     if overall_delta > 5:
-        print(f"  {G}▲ Overall improved by {overall_delta:.0f} points{R}")
+        print(f"  {G}▲ {t('compare.improved_by', delta=f'{overall_delta:.0f}')}{R}")
     elif overall_delta < -5:
-        print(f"  {RED}▼ Overall degraded by {abs(overall_delta):.0f} points{R}")
+        print(f"  {RED}▼ {t('compare.degraded_by', delta=f'{abs(overall_delta):.0f}')}{R}")
     else:
-        print(f"  {Y}→ Overall score roughly the same{R}")
+        print(f"  {Y}→ {t('compare.score_same')}{R}")
 
     # Generate HTML report
     if not args.no_html:
-        print(f"\n  Generating comparison report...")
+        print(f"\n  {t('compare.generating')}")
         charts = {}
         charts["noise"] = _create_comparison_noise_chart(
             res_a["noise_results"], res_b["noise_results"], label_a, label_b)
@@ -7067,7 +7100,7 @@ def _run_comparison(file_a, file_b, args, diff_raw):
         op = os.path.join(os.path.dirname(file_a) or ".", on)
         with open(op, "w", encoding="utf-8") as f:
             f.write(html)
-        print(f"  ✓ Report: {op}")
+        print(f"  ✓ {t('report.html_saved', path=op)}")
 
     print()
 
@@ -7476,7 +7509,7 @@ def _run_replay(logfile, args, diff_raw):
     """Generate interactive replay HTML for a single flight."""
     R, B, C, G, Y, RED, DIM = _colors()
 
-    print(f"\n  ▲ INAV Flight Replay v{REPORT_VERSION}")
+    print(f"\n  ▲ {t('banner.replay')} v{REPORT_VERSION}")
     print(f"  Loading: {logfile}")
 
     raw_params = parse_headers_from_bbl(logfile)
@@ -7659,10 +7692,10 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     nav_mode = getattr(args, 'nav', False)
     if not summary_only:
         if nav_mode:
-            print(f"\n  ▲ INAV Nav Analyzer v{REPORT_VERSION}")
+            print(f"\n  ▲ {t('banner.nav_analyzer')} v{REPORT_VERSION}")
         else:
-            print(f"\n  ▲ INAV Blackbox Analyzer v{REPORT_VERSION}")
-        print(f"  Loading: {logfile}")
+            print(f"\n  ▲ {t('banner.analyzer')} v{REPORT_VERSION}")
+        print(f"  {t('banner.loading', file=logfile)}")
 
         fw_rev = config.get("firmware_revision", "")
         fw_date = config.get("firmware_date", "")
@@ -7670,13 +7703,13 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
         # Aircraft identification banner
         print(f"\n  {'─'*66}")
         if craft:
-            print(f"  Aircraft:  {craft}")
+            print(f"  {t('banner.craft')}:  {craft}")
         if fw_rev:
             fw_str = fw_rev
             if fw_date:
                 fw_str += f" ({fw_date})"
-            print(f"  Firmware:  {fw_str}")
-        print(f"  Platform:  {platform_type} ({n_motors} motors{f', {n_servos} servos' if n_servos else ''})")
+            print(f"  {t('banner.firmware')}:  {fw_str}")
+        print(f"  {t('banner.platform')}:  {platform_type} ({n_motors} motors{f', {n_servos} servos' if n_servos else ''})")
 
         if not nav_mode:
             frame_str = f"{frame_inches}\"" if frame_inches else "5\" (default)"
@@ -7685,14 +7718,14 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
                 frame_str += f" (detected from craft name)"
             elif frame_source == "conflict":
                 frame_str += f" (user override)"
-            print(f"  Frame:     {frame_str}")
-            print(f"  Props:     {prop_str}")
+            print(f"  {t('banner.frame')}:     {frame_str}")
+            print(f"  {t('banner.props')}:     {prop_str}")
 
         if detected_cells:
             cell_str = f"{detected_cells}S"
             if not args.cells and vbatref:
                 cell_str += f" (detected from vbatref={int(vbatref)/100:.1f}V)"
-            print(f"  Battery:   {cell_str}")
+            print(f"  {t('banner.battery')}:   {cell_str}")
 
         if not nav_mode:
             if args.kv:
@@ -7723,12 +7756,12 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     # ── Decode data ──
     if is_blackbox:
         if not summary_only:
-            print(f"\n  Parsing {len(raw_params)} header parameters...")
-            print("  Decoding binary log (native)...")
+            print(f"\n  {t('terminal.parsing_headers', n=len(raw_params))}")
+            print(f"  {t('terminal.decoding')}")
         data = decode_blackbox_native(logfile, raw_params, quiet=summary_only)
     else:
         if not summary_only:
-            print("\n  Parsing CSV...")
+            print(f"\n  {t('terminal.parsing_csv')}")
         data = parse_csv_log(logfile)
 
     sr = data["sample_rate"]
@@ -7766,7 +7799,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
         if parts:
             print(f"  Nav data: {', '.join(parts)}")
         else:
-            print("  Warning: No navigation fields found in this log")
+            print(f"  {t('terminal.no_nav_fields')}")
 
     if not summary_only and not nav_mode:
         if config_has_pid(config):
@@ -7775,7 +7808,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
                 ff_str = f" FF={ff}" if ff else ""
                 print(f"  {ax.capitalize()} PID: P={config.get(f'{ax}_p','?')} I={config.get(f'{ax}_i','?')} D={config.get(f'{ax}_d','?')}{ff_str}")
         else:
-            print("  Warning: No PID values in headers - use .bbl for exact recommendations")
+            print(f"  {t('terminal.no_pid_values')}")
 
     if not summary_only and not nav_mode and config_has_filters(config):
         filt_parts = []
@@ -7870,7 +7903,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
                     f.write(nav_html)
                 print(f"\n  ✓ Nav report: {op}")
         else:
-            print("\n  No navigation fields found in this log.")
+            print(f"\n  {t('terminal.no_nav_fields')}")
             print("  Enable NAV_POS, NAV_ACC, and Attitude in blackbox settings.")
         return None
 
@@ -7952,7 +7985,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
         on = args.output or os.path.splitext(os.path.basename(logfile))[0] + "_report.html"
         op = os.path.join(os.path.dirname(logfile) or ".", on)
         with open(op, "w", encoding="utf-8") as f: f.write(html)
-        print(f"\n  ✓ Report: {op}")
+        print(f"\n  ✓ {t('report.html_saved', path=op)}")
 
     # ── Save state with profile ──
     config["_profile_name"] = profile["name"]
@@ -7966,7 +7999,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     config["_platform_type"] = platform_type
 
     sp = save_state(logfile, plan, config, data)
-    print(f"  ✓ State: {sp} (use --previous on next run)")
+    print(f"  ✓ {t('report.state_saved', path=sp)}")
 
     # ── Store in flight database ──
     if not args.no_db:
@@ -8009,7 +8042,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
         md_path = os.path.join(os.path.dirname(logfile) or ".", md_name)
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md)
-        print(f"  ✓ Markdown: {md_path} (paste into forum/Discord)")
+        print(f"  ✓ {t('report.markdown_saved', path=md_path)}")
 
     print()
 
