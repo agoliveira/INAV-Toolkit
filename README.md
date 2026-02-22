@@ -1,5 +1,7 @@
 # INAV Toolkit
 
+[![CI](https://github.com/agoliveira/INAV-Toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/agoliveira/INAV-Toolkit/actions/workflows/ci.yml)
+
 A suite of Python tools for analyzing, validating, and tuning INAV flight controller configurations. Built for the INAV long-range community - 7" to 15" multirotors with GPS navigation.
 
 ## Tools
@@ -35,8 +37,8 @@ pip install inav-toolkit
 pipx install inav-toolkit
 
 # From source (development)
-git clone https://github.com/iNavFlight/inav-toolkit
-cd inav-toolkit
+git clone https://github.com/agoliveira/INAV-Toolkit
+cd INAV-Toolkit
 pip install -e .
 ```
 
@@ -265,7 +267,7 @@ inav-toolkit/
 ├── CHANGELOG.md
 ├── LICENSE
 ├── inav_toolkit/                    # Python package
-│   ├── __init__.py                  # Version: 2.14.0
+│   ├── __init__.py                  # Version: 2.14.1
 │   ├── blackbox_analyzer.py         # Blackbox log analyzer
 │   ├── param_analyzer.py            # Config validator + setup generator
 │   ├── msp.py                       # MSP v2 serial communication
@@ -275,11 +277,36 @@ inav-toolkit/
 │   └── vtol_configurator.py         # VTOL mixer profile validator
 ├── docs/
 │   ├── BLACKBOX_ANALYZER.md         # Detailed blackbox analyzer docs
+│   ├── NAV_ANALYZER.md              # Navigation health analysis docs
 │   ├── PARAM_ANALYZER.md            # Detailed parameter analyzer docs
 │   ├── VTOL_CONFIGURATOR.md         # Detailed VTOL configurator docs
 │   └── TUNING_WORKFLOW.md           # Step-by-step tuning guide
-└── tests/                           # Test diff files and smoke tests
+├── tests/
+│   ├── test_smoke.py                # 50 tests across 11 test classes
+│   ├── conftest.py                  # Shared pytest fixtures
+│   ├── generate_fixtures.py         # Synthetic blackbox CSV generator
+│   ├── test_basic_diff.txt          # Sample diff for param_analyzer tests
+│   └── test_vtol_diff.txt           # Sample diff for VTOL tests
+└── .github/workflows/ci.yml        # CI: Python 3.8-3.13 test matrix
 ```
+
+## Development
+
+```bash
+git clone https://github.com/agoliveira/INAV-Toolkit
+cd INAV-Toolkit
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[test]"
+
+# Generate synthetic test fixtures
+python3 tests/generate_fixtures.py
+
+# Run tests
+python3 -m pytest tests/ -v
+```
+
+CI runs automatically on every push and PR across Python 3.8-3.13.
 
 ## Contributing
 
@@ -287,7 +314,7 @@ This is an active project. Contributions welcome.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+GPL-3.0 License. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 

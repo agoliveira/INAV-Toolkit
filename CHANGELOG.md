@@ -2,6 +2,21 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-02-22] - v2.14.1
+
+### Added
+- **Pytest test suite**: Full rewrite with 50 tests across 11 test classes. Parametrized tests for filter math, frame profiles, version flags. Session-scoped fixtures for lazy module loading.
+- **Synthetic blackbox fixtures**: `tests/generate_fixtures.py` creates 5 flight scenario CSVs (clean hover, noisy motors, over-tuned, under-tuned, short flight) for end-to-end pipeline testing.
+- **GitHub Actions CI**: Automated testing across Python 3.8-3.13 on every push and PR. Separate build job verifies wheel installation and entry points.
+- **Noise source remedies**: `fingerprint_noise()` now includes prescriptive fix advice for each detected noise source (prop harmonics, motor imbalance, structural resonance, electrical noise, bearing wear, propwash). Severity-aware prefixes for critical issues.
+- **Filter recommendation engine**: New `compute_filter_recommendations()` returns comprehensive filter settings from noise spectrum analysis -- gyro LPF, D-term LPF, dynamic notch range, notch count, and per-axis signal-to-noise crossover frequencies with human-readable reasoning.
+- **Multi-flight trend report**: New `generate_trend_report()` produces standalone HTML with interactive Chart.js charts showing score progression and component breakdown across flights.
+- **`--version` flag on all entry points**: Added to `inav-params`, `inav-msp`, `inav-toolkit`, `inav-vtol`, `inav-autotune`. Was already present on `inav-analyze`.
+
+### Changed
+- **pyproject.toml**: Added `[project.optional-dependencies]` for test extra (`pip install -e ".[test]"`), `[tool.pytest.ini_options]` for test configuration.
+- **License**: Changed from MIT to GPL-3.0.
+
 ## [2026-02-22] - v2.14.0
 
 ### Added

@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inav-toolkit"
-version = "2.14.1"
+version = "2.14.0"
 description = "Blackbox analyzer, parameter checker, and tuning wizard for INAV flight controllers"
 readme = "README.md"
-license = {text = "GPL3"}
+license = {text = "MIT"}
 requires-python = ">=3.8"
 keywords = ["inav", "drone", "blackbox", "pid", "tuning", "flight-controller", "multirotor"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -36,8 +36,8 @@ dependencies = [
 test = ["pytest>=7.0"]
 
 [project.urls]
-Homepage = "https://github.com/iNavFlight/inav-toolkit"
-Issues = "https://github.com/iNavFlight/inav-toolkit/issues"
+Homepage = "https://github.com/agoliveira/INAV-Toolkit"
+Issues = "https://github.com/agoliveira/INAV-Toolkit/issues"
 
 [project.scripts]
 inav-analyze = "inav_toolkit.blackbox_analyzer:main"
