@@ -20,38 +20,35 @@ import locale as _locale_mod
 
 _catalogs = {}       # lang -> {key: translated_string}
 _active_locale = "en"
+_locales_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locales")
 
 
-def _find_locales_dir():
-    """Find the locales directory, trying multiple strategies."""
-    # Strategy 1: relative to this file (works for editable installs and source runs)
-    candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locales")
-    if os.path.isdir(candidate) and any(f.endswith(".json") for f in os.listdir(candidate)):
-        return candidate
+def _read_json_resource(filename):
+    """Read a JSON file from the locales directory.
 
-    # Strategy 2: importlib.resources (works for installed wheels, Python 3.9+)
+    Tries importlib.resources first (works in all install modes),
+    then falls back to direct filesystem access.
+    Returns parsed dict or None on failure.
+    """
+    # Strategy 1: importlib.resources (Python 3.9+, works for wheels/eggs/editable)
     try:
         from importlib.resources import files
-        pkg_dir = str(files("inav_toolkit"))
-        candidate = os.path.join(pkg_dir, "locales")
-        if os.path.isdir(candidate):
-            return candidate
-    except (ImportError, TypeError, ModuleNotFoundError):
+        ref = files("inav_toolkit").joinpath("locales", filename)
+        text = ref.read_text(encoding="utf-8")
+        return json.loads(text)
+    except Exception:
         pass
 
-    # Strategy 3: walk up from __file__ looking for locales/en.json
-    here = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(3):
-        candidate = os.path.join(here, "locales")
-        if os.path.isdir(candidate):
-            return candidate
-        here = os.path.dirname(here)
+    # Strategy 2: direct filesystem path relative to this file
+    path = os.path.join(_locales_dir, filename)
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
 
-    # Fallback: return the expected path even if missing (will just produce empty catalogs)
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "locales")
-
-
-_locales_dir = _find_locales_dir()
+    return None
 
 
 def _load_catalog(lang):
@@ -59,16 +56,8 @@ def _load_catalog(lang):
     if lang in _catalogs:
         return _catalogs[lang]
 
-    path = os.path.join(_locales_dir, f"{lang}.json")
-    if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                _catalogs[lang] = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            _catalogs[lang] = {}
-    else:
-        _catalogs[lang] = {}
-
+    data = _read_json_resource(f"{lang}.json")
+    _catalogs[lang] = data if data is not None else {}
     return _catalogs[lang]
 
 
@@ -81,7 +70,7 @@ def set_locale(lang):
     """
     global _active_locale
 
-    # Normalize: "pt-BR" → "pt_BR", "pt_BR.UTF-8" → "pt_BR"
+    # Normalize: "pt-BR" -> "pt_BR", "pt_BR.UTF-8" -> "pt_BR"
     lang = lang.replace("-", "_").split(".")[0]
 
     _load_catalog(lang)
@@ -105,7 +94,7 @@ def get_locale():
 def detect_locale():
     """Auto-detect locale from environment.
 
-    Priority: INAV_LANG env var → LANG/LC_ALL → "en"
+    Priority: INAV_LANG env var -> LANG/LC_ALL -> "en"
     """
     # Check INAV-specific env var first
     env_lang = os.environ.get("INAV_LANG", "")
@@ -131,6 +120,21 @@ def detect_locale():
 def available_locales():
     """List available locale codes (based on JSON files in locales/)."""
     locales = []
+
+    # Strategy 1: importlib.resources
+    try:
+        from importlib.resources import files
+        locales_ref = files("inav_toolkit").joinpath("locales")
+        for item in locales_ref.iterdir():
+            name = item.name if hasattr(item, 'name') else str(item).rsplit("/", 1)[-1]
+            if name.endswith(".json"):
+                locales.append(name[:-5])
+        if locales:
+            return sorted(locales)
+    except Exception:
+        pass
+
+    # Strategy 2: filesystem
     if os.path.isdir(_locales_dir):
         for f in sorted(os.listdir(_locales_dir)):
             if f.endswith(".json"):
@@ -141,7 +145,7 @@ def available_locales():
 def t(key, **kwargs):
     """Translate a key, with optional format substitution.
 
-    Fallback chain: active locale → base language → English → key itself.
+    Fallback chain: active locale -> base language -> English -> key itself.
 
     Args:
         key: Dotted translation key, e.g., "verdict.dialed_in"

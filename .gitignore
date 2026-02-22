@@ -15,6 +15,7 @@ venv/
 *.html
 *.json
 !package.json
+!inav_toolkit/locales/*.json
 
 # Blackbox logs (large binary files)
 blackbox/
