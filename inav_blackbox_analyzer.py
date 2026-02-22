@@ -4225,12 +4225,177 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
 
 # ─── HTML Report ──────────────────────────────────────────────────────────────
 
+def _create_nav_charts(nav_results, data, sr):
+    """Generate matplotlib charts for nav HTML report.
+
+    Returns dict of {name: base64_png_string}.
+    """
+    setup_dark_style()
+    charts = {}
+
+    # ─── 1. Heading timeline + jitter ───
+    if "att_heading" in data:
+        hdg = data["att_heading"] / 10.0  # decideg -> deg
+        t = data["time_s"]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 5), sharex=True,
+                                        gridspec_kw={"height_ratios": [2, 1]})
+        fig.suptitle("Compass - Heading", fontsize=13, color="#c0caf5", fontweight="bold", y=0.98)
+
+        ax1.plot(t, hdg, color="#7aa2f7", linewidth=0.6, alpha=0.9)
+        ax1.set_ylabel("Heading (deg)")
+        ax1.set_ylim(np.nanmin(hdg) - 10, np.nanmax(hdg) + 10)
+
+        # Heading rate (downsampled to compass update rate)
+        ds = max(1, int(sr / 50))
+        hdg_ds = hdg[::ds]
+        t_ds = t[::ds]
+        hdg_unwrap = np.unwrap(np.deg2rad(hdg_ds))
+        hdg_rate = np.abs(np.diff(hdg_unwrap) * (sr / ds)) * 180 / np.pi
+        ax2.plot(t_ds[1:], hdg_rate, color="#f7768e", linewidth=0.5, alpha=0.8)
+        jitter = nav_results.get("compass", {}).get("heading_jitter_deg")
+        if jitter is not None:
+            ax2.axhline(jitter, color="#e0af68", linestyle="--", linewidth=1, alpha=0.7,
+                        label=f"RMS: {jitter:.1f} deg/s")
+            ax2.legend(loc="upper right", fontsize=8, facecolor="#1a1b26", edgecolor="#565f89")
+        ax2.set_ylabel("Rate (deg/s)")
+        ax2.set_xlabel("Time (s)")
+        ax2.set_ylim(0, min(max(hdg_rate) * 1.2 if len(hdg_rate) > 0 else 20, 60))
+
+        fig.tight_layout()
+        charts["heading"] = fig_to_base64(fig)
+
+    # ─── 2. Baro altitude + nav altitude ───
+    if "baro_alt" in data:
+        baro = data["baro_alt"] / 100.0  # cm -> m
+        t = data["time_s"]
+
+        fig, ax = plt.subplots(1, 1, figsize=(14, 3.5))
+        fig.suptitle("Barometer & Estimator Altitude", fontsize=13, color="#c0caf5",
+                     fontweight="bold", y=1.0)
+
+        ax.plot(t, baro, color="#e0af68", linewidth=0.8, alpha=0.9, label="Baro")
+
+        if "nav_pos_u" in data:
+            nav_u = data["nav_pos_u"] / 100.0
+            ax.plot(t, nav_u, color="#9ece6a", linewidth=0.8, alpha=0.8, label="Nav Estimate")
+
+        ax.set_ylabel("Altitude (m)")
+        ax.set_xlabel("Time (s)")
+        ax.legend(loc="upper right", fontsize=8, facecolor="#1a1b26", edgecolor="#565f89")
+
+        noise = nav_results.get("baro", {}).get("noise_cm")
+        if noise is not None:
+            ax.text(0.01, 0.95, f"Baro noise: {noise:.0f}cm RMS", transform=ax.transAxes,
+                    fontsize=9, color="#e0af68", va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="#1a1b26", edgecolor="#565f89", alpha=0.8))
+
+        fig.tight_layout()
+        charts["altitude"] = fig_to_base64(fig)
+
+    # ─── 3. GPS satellite count ───
+    gps_frames = data.get("_gps_frames", [])
+    if gps_frames and len(gps_frames) > 5:
+        gps_t = []
+        gps_sats = []
+        for idx, fields in gps_frames:
+            if "GPS_numSat" in fields:
+                gps_t.append(idx / sr if sr > 0 else idx)
+                gps_sats.append(fields["GPS_numSat"])
+
+        if gps_sats:
+            fig, ax = plt.subplots(1, 1, figsize=(14, 2.5))
+            fig.suptitle("GPS Satellite Count", fontsize=13, color="#c0caf5",
+                         fontweight="bold", y=1.02)
+
+            ax.fill_between(gps_t, gps_sats, alpha=0.2, color="#9ece6a")
+            ax.plot(gps_t, gps_sats, color="#9ece6a", linewidth=1.2)
+            ax.axhline(6, color="#f7768e", linestyle="--", linewidth=0.8, alpha=0.5, label="Min safe (6)")
+            ax.set_ylabel("Satellites")
+            ax.set_xlabel("Time (s)")
+            ax.set_ylim(0, max(gps_sats) + 3)
+            ax.legend(loc="lower right", fontsize=8, facecolor="#1a1b26", edgecolor="#565f89")
+
+            avg_sats = nav_results.get("gps", {}).get("avg_sats")
+            if avg_sats is not None:
+                ax.text(0.01, 0.9, f"Avg: {avg_sats:.0f} sats", transform=ax.transAxes,
+                        fontsize=9, color="#9ece6a", va="top",
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor="#1a1b26", edgecolor="#565f89", alpha=0.8))
+
+            fig.tight_layout()
+            charts["gps"] = fig_to_base64(fig)
+
+    # ─── 4. EPH timeline ───
+    if "nav_eph" in data:
+        eph = data["nav_eph"]
+        valid = ~np.isnan(eph) & (eph > 0)
+        if np.sum(valid) > 50:
+            t = data["time_s"]
+            fig, ax = plt.subplots(1, 1, figsize=(14, 2.5))
+            fig.suptitle("GPS Accuracy (EPH)", fontsize=13, color="#c0caf5",
+                         fontweight="bold", y=1.02)
+
+            ax.plot(t[valid], eph[valid], color="#bb9af7", linewidth=0.8, alpha=0.9)
+            ax.fill_between(t[valid], eph[valid], alpha=0.15, color="#bb9af7")
+            ax.axhline(300, color="#e0af68", linestyle="--", linewidth=0.8, alpha=0.5, label="Marginal (300cm)")
+            ax.axhline(500, color="#f7768e", linestyle="--", linewidth=0.8, alpha=0.5, label="Poor (500cm)")
+            ax.set_ylabel("EPH (cm)")
+            ax.set_xlabel("Time (s)")
+            ax.legend(loc="upper right", fontsize=8, facecolor="#1a1b26", edgecolor="#565f89")
+
+            fig.tight_layout()
+            charts["eph"] = fig_to_base64(fig)
+
+    # ─── 5. Position scatter (poshold only) ───
+    poshold = nav_results.get("poshold")
+    if poshold and poshold.get("score") is not None:
+        if "nav_pos_n" in data and "nav_pos_e" in data:
+            fig, ax = plt.subplots(1, 1, figsize=(5.5, 5.5))
+            fig.suptitle("Position Hold Scatter", fontsize=13, color="#c0caf5",
+                         fontweight="bold", y=0.98)
+
+            n = data["nav_pos_n"] / 100.0  # cm -> m
+            e = data["nav_pos_e"] / 100.0
+            tn = data.get("nav_tgt_n", np.zeros_like(n)) / 100.0
+            te = data.get("nav_tgt_e", np.zeros_like(e)) / 100.0
+
+            dn = n - tn
+            de = e - te
+
+            # Color by time
+            colors = np.linspace(0, 1, len(dn))
+            ax.scatter(de, dn, c=colors, cmap="cool", s=1, alpha=0.5)
+            ax.plot(0, 0, "x", color="#f7768e", markersize=12, markeredgewidth=2, label="Target")
+
+            cep = poshold.get("cep_cm")
+            if cep is not None:
+                circle = plt.Circle((0, 0), cep / 100.0, fill=False, color="#e0af68",
+                                    linestyle="--", linewidth=1, label=f"CEP: {cep:.0f}cm")
+                ax.add_patch(circle)
+
+            ax.set_xlabel("East error (m)")
+            ax.set_ylabel("North error (m)")
+            ax.set_aspect("equal")
+            lim = max(abs(dn).max(), abs(de).max(), 2) * 1.2
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.legend(loc="upper right", fontsize=8, facecolor="#1a1b26", edgecolor="#565f89")
+
+            fig.tight_layout()
+            charts["position"] = fig_to_base64(fig)
+
+    return charts
+
+
 def _generate_nav_only_html(nav_results, config, data):
     """Generate a standalone HTML report for nav-only analysis."""
     craft = config.get("craft_name", "Unknown")
     fw = config.get("firmware_revision", "")
     duration = data["time_s"][-1] if "time_s" in data and len(data["time_s"]) > 0 else 0
     sr = data.get("sample_rate", 0)
+
+    # Generate charts
+    nav_charts = _create_nav_charts(nav_results, data, sr)
 
     # Score color helper
     def sc(v):
@@ -4245,14 +4410,26 @@ def _generate_nav_only_html(nav_results, config, data):
     nav_score = nav_results.get("nav_score")
     ns_class, ns_text = sc(nav_score)
 
+    # Score gradient
+    if nav_score is not None:
+        sg = ("linear-gradient(90deg, #9ece6a, #73daca)" if nav_score >= 80
+              else "linear-gradient(90deg, #e0af68, #ff9e64)" if nav_score >= 60
+              else "linear-gradient(90deg, #f7768e, #ff6b6b)")
+    else:
+        sg = "linear-gradient(90deg, #565f89, #565f89)"
+
     # Build score rows
     rows = ""
-    for key, label in [("compass", "Compass"), ("gps", "GPS"),
-                       ("baro", "Barometer"), ("estimator", "Estimator")]:
+    for key, label, icon in [("compass", "Compass", "&#x1F9ED;"),
+                              ("gps", "GPS", "&#x1F6F0;"),
+                              ("baro", "Barometer", "&#x1F321;"),
+                              ("estimator", "Estimator", "&#x1F4CA;")]:
         r = nav_results.get(key)
         if r and r.get("score") is not None:
             s = r["score"]
             css, txt = sc(s)
+            bar_w = s
+            bar_color = "#9ece6a" if s >= 80 else "#e0af68" if s >= 60 else "#f7768e"
             details = []
             if key == "compass":
                 if r.get("heading_jitter_deg") is not None:
@@ -4267,7 +4444,7 @@ def _generate_nav_only_html(nav_results, config, data):
                 if r.get("min_sats") is not None:
                     details.append(f"min {r['min_sats']}")
                 if r.get("avg_eph") is not None:
-                    details.append(f"EPH: {r['avg_eph']:.0f}cm avg")
+                    details.append(f"EPH: {r['avg_eph']:.0f}cm")
                 if r.get("position_jumps", 0) > 0:
                     details.append(f"{r['position_jumps']} jumps")
             elif key == "baro":
@@ -4279,11 +4456,43 @@ def _generate_nav_only_html(nav_results, config, data):
                     details.append(f"Throttle corr: {r['throttle_correlation']:.2f}")
             elif key == "estimator":
                 if r.get("baro_vs_nav_corr") is not None:
-                    details.append(f"Baro correlation: {r['baro_vs_nav_corr']:.3f}")
+                    details.append(f"Baro corr: {r['baro_vs_nav_corr']:.3f}")
                 if r.get("max_divergence_cm") is not None:
-                    details.append(f"Max divergence: {r['max_divergence_cm']:.0f}cm")
-            detail_str = ", ".join(details)
-            rows += f'<tr><td>{label}</td><td class="{css}">{txt}</td><td>{detail_str}</td></tr>\n'
+                    details.append(f"Max div: {r['max_divergence_cm']:.0f}cm")
+            detail_str = " | ".join(details)
+            rows += f'''<div class="sc-row">
+  <div class="sc-label">{icon} {label}</div>
+  <div class="sc-score {css}">{txt}</div>
+  <div class="sc-bar"><div class="sc-fill" style="width:{bar_w}%;background:{bar_color}"></div></div>
+  <div class="sc-detail">{detail_str}</div>
+</div>\n'''
+
+    # Althold/poshold rows
+    for key, label, icon in [("althold", "Alt Hold", "&#x2195;"), ("poshold", "Pos Hold", "&#x1F4CD;")]:
+        r = nav_results.get(key)
+        if r and r.get("score") is not None:
+            s = r["score"]
+            css, txt = sc(s)
+            bar_w = s
+            bar_color = "#9ece6a" if s >= 80 else "#e0af68" if s >= 60 else "#f7768e"
+            details = []
+            if key == "althold":
+                if r.get("oscillation_cm") is not None:
+                    details.append(f"Osc: {r['oscillation_cm']:.0f}cm")
+            elif key == "poshold":
+                if r.get("cep_cm") is not None:
+                    details.append(f"CEP: {r['cep_cm']:.0f}cm")
+                if r.get("max_drift_cm") is not None:
+                    details.append(f"Max drift: {r['max_drift_cm']:.0f}cm")
+                if r.get("toilet_bowl"):
+                    details.append("TOILET BOWL")
+            detail_str = " | ".join(details)
+            rows += f'''<div class="sc-row">
+  <div class="sc-label">{icon} {label}</div>
+  <div class="sc-score {css}">{txt}</div>
+  <div class="sc-bar"><div class="sc-fill" style="width:{bar_w}%;background:{bar_color}"></div></div>
+  <div class="sc-detail">{detail_str}</div>
+</div>\n'''
 
     # Build findings
     findings_html = ""
@@ -4293,42 +4502,101 @@ def _generate_nav_only_html(nav_results, config, data):
         if r and r.get("findings"):
             all_findings.extend(r["findings"])
     if all_findings:
-        findings_html = '<div class="findings">'
+        findings_html = '<section><h2>Findings</h2>\n'
         for severity, msg in all_findings:
             css = "warning" if severity == "WARNING" else "info"
             icon = "!" if severity == "WARNING" else "*"
-            findings_html += f'<div class="finding {css}">{icon} {msg}</div>\n'
-        findings_html += '</div>'
+            findings_html += f'<div class="fd {css}"><span class="fd-icon">{icon}</span> {msg}</div>\n'
+        findings_html += '</section>'
 
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<title>Nav Health - {craft}</title>
-<style>
-:root{{--bg:#0d1117;--cd:#161b22;--bd:#30363d;--tx:#e6edf3;--dm:#8b949e;--gn:#3fb950;--yl:#d29922;--rd:#f85149;--pp:#8b949e}}
-*{{margin:0;padding:0;box-sizing:border-box}}body{{background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,sans-serif;max-width:800px;margin:0 auto;padding:24px}}
-header{{text-align:center;padding:20px 0;border-bottom:1px solid var(--bd);margin-bottom:24px}}
-h1{{font-size:1.4rem;margin-bottom:4px}}
-.mt{{color:var(--dm);font-size:.85rem}}
-.score-box{{text-align:center;padding:20px;margin:20px 0;background:var(--cd);border:1px solid var(--bd);border-radius:8px}}
-.score-box .val{{font-size:2.5rem;font-weight:700}}
-.score-box .val.good{{color:var(--gn)}}.score-box .val.warn{{color:var(--yl)}}.score-box .val.bad{{color:var(--rd)}}.score-box .val.dim{{color:var(--dm)}}
-table{{width:100%;border-collapse:collapse;margin:16px 0}}
-th{{text-align:left;padding:8px 12px;border-bottom:2px solid var(--bd);font-size:.8rem;color:var(--dm)}}
-td{{padding:8px 12px;border-bottom:1px solid var(--bd);font-size:.85rem}}
-.good{{color:var(--gn);font-weight:600}}.warn{{color:var(--yl);font-weight:600}}.bad{{color:var(--rd);font-weight:600}}.dim{{color:var(--dm)}}
-.findings{{margin:20px 0}}.finding{{padding:8px 14px;margin:6px 0;border-radius:4px;font-size:.85rem}}
-.warning{{background:rgba(255,215,0,0.08);border-left:3px solid var(--yl)}}
-.info{{background:rgba(100,149,237,0.08);border-left:3px solid var(--pp)}}
+    # Build charts HTML
+    charts_html = ""
+    chart_order = [("heading", "Compass"), ("altitude", "Altitude"),
+                   ("gps", "GPS"), ("eph", "EPH"), ("position", "Position")]
+    chart_sections = []
+    for key, label in chart_order:
+        if key in nav_charts:
+            chart_sections.append(
+                f'<div class="chart-card"><img src="data:image/png;base64,{nav_charts[key]}"></div>')
+
+    if chart_sections:
+        charts_html = '<section><h2>Charts</h2>\n' + "\n".join(chart_sections) + '\n</section>'
+
+    # Config info
+    config_html = ""
+    config_items = []
+    for k, label in [("mag_hardware", "Compass"), ("gps_provider", "GPS"),
+                      ("nav_alt_p", "Alt P"), ("nav_pos_p", "Pos P"),
+                      ("nav_heading_p", "Hdg P"), ("nav_hover_thr", "Hover Thr")]:
+        v = config.get(k)
+        if v is not None:
+            config_items.append(f'<span class="cfg-item">{label}: {v}</span>')
+    if config.get("gps_use_galileo") is not None:
+        gnss = []
+        if config.get("gps_use_galileo"): gnss.append("GAL")
+        if config.get("gps_use_beidou"): gnss.append("BDS")
+        if config.get("gps_use_glonass"): gnss.append("GLO")
+        config_items.append(f'<span class="cfg-item">GNSS: GPS{" + " + "+".join(gnss) if gnss else " only"}</span>')
+    if config_items:
+        config_html = '<section><h2>FC Config</h2><div class="cfg-grid">' + "".join(config_items) + '</div></section>'
+
+    # Tune warning
+    tune_warn = ""
+    if nav_results.get("_tune_warning"):
+        tune_warn = '''<div class="tune-warn">
+  <div class="tw-icon">!</div>
+  <div class="tw-text"><strong>PID tuning incomplete</strong> - oscillation detected.
+  Nav readings (especially baro and compass) are affected by vibration. Fix PIDs first, then re-check nav health.</div>
+</div>'''
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nav Health - {craft}</title><style>
+:root{{--bg:#0f1117;--cd:#1a1b26;--ca:#1e2030;--bd:#2a2d3e;--tx:#c0caf5;--dm:#7982a9;--bl:#7aa2f7;--gn:#9ece6a;--rd:#f7768e;--yl:#e0af68;--tl:#4ecdc4;--pp:#bb9af7;--or:#ff9e64}}
+*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:'SF Mono','Cascadia Code','JetBrains Mono',monospace;background:var(--bg);color:var(--tx);line-height:1.6}}
+.ct{{max-width:1000px;margin:0 auto;padding:24px}}
+header{{background:linear-gradient(135deg,#1a1b26,#24283b);border-bottom:2px solid var(--bl);padding:24px 0;text-align:center}}
+header h1{{font-size:1.5rem;letter-spacing:3px;text-transform:uppercase;color:var(--bl)}}
+.mt{{color:var(--dm);font-size:.8rem;margin-top:8px}}
+.hero{{text-align:center;padding:28px 0}}
+.hero-score{{font-size:3rem;font-weight:700;background:{sg};-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}}
+.hero-label{{font-size:.75rem;color:var(--dm);text-transform:uppercase;letter-spacing:2px;margin-top:4px}}
+.hero-bar{{width:300px;height:8px;background:var(--cd);border-radius:4px;margin:12px auto;overflow:hidden;border:1px solid var(--bd)}}
+.hero-fill{{height:100%;background:{sg};border-radius:4px;width:{nav_score or 0}%}}
+section{{margin:28px 0}}
+h2{{font-size:.85rem;color:var(--bl);letter-spacing:2px;text-transform:uppercase;border-bottom:1px solid var(--bd);padding-bottom:8px;margin-bottom:16px}}
+.sc-row{{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--cd);border:1px solid var(--bd);border-radius:6px;margin:6px 0}}
+.sc-label{{min-width:130px;font-weight:600;font-size:.85rem}}
+.sc-score{{min-width:60px;font-weight:700;font-size:.85rem;text-align:right}}
+.sc-bar{{flex:0 0 120px;height:6px;background:var(--bg);border-radius:3px;overflow:hidden}}
+.sc-fill{{height:100%;border-radius:3px}}
+.sc-detail{{flex:1;color:var(--dm);font-size:.8rem}}
+.good{{color:var(--gn)}}.warn{{color:var(--yl)}}.bad{{color:var(--rd)}}.dim{{color:var(--dm)}}
+.fd{{padding:10px 16px;margin:6px 0;border-radius:6px;font-size:.83rem;line-height:1.5}}
+.fd.warning{{background:rgba(224,175,104,.06);border-left:3px solid var(--yl)}}
+.fd.info{{background:rgba(122,162,247,.06);border-left:3px solid var(--dm)}}
+.fd-icon{{font-weight:700;margin-right:4px}}
+.chart-card{{background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:12px;margin:12px 0;overflow:hidden}}
+.chart-card img{{width:100%;height:auto;display:block;border-radius:4px}}
+.cfg-grid{{display:flex;flex-wrap:wrap;gap:8px}}
+.cfg-item{{background:var(--cd);border:1px solid var(--bd);border-radius:4px;padding:4px 12px;font-size:.8rem;color:var(--dm)}}
+.tune-warn{{display:flex;gap:16px;background:rgba(247,118,142,.06);border:1px solid rgba(247,118,142,.3);border-radius:8px;padding:16px 20px;margin:16px 0;align-items:flex-start}}
+.tw-icon{{font-size:1.4rem;font-weight:700;color:var(--rd);min-width:28px;text-align:center}}
+.tw-text{{font-size:.85rem;color:var(--tx)}}
 footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-top:1px solid var(--bd);margin-top:40px}}
 </style></head><body>
+<div class="ct">
 <header><h1>Nav Health Report</h1>
 <div class="mt">{craft} | {fw} | {duration:.1f}s | {sr:.0f}Hz | {datetime.now().strftime('%Y-%m-%d %H:%M')}</div></header>
-<div class="score-box"><div>Nav Score</div><div class="val {ns_class}">{ns_text}</div></div>
-{'<div class="finding warning" style="margin:16px 0;padding:12px 16px;font-size:.9rem">! PID tuning incomplete - oscillation detected. Nav readings (especially baro and compass) are affected by vibration. Fix PIDs first, then re-check nav health.</div>' if nav_results.get('_tune_warning') else ''}
-<table><tr><th>Check</th><th>Score</th><th>Details</th></tr>
-{rows}</table>
+<div class="hero"><div class="hero-label">Nav Score</div><div class="hero-score">{ns_text}</div>
+<div class="hero-bar"><div class="hero-fill"></div></div></div>
+{tune_warn}
+<section><h2>Sensor Scores</h2>
+{rows}</section>
 {findings_html}
-<footer>INAV Nav Analyzer v{REPORT_VERSION} - Fly safe</footer>
-</body></html>"""
+{charts_html}
+{config_html}
+<footer>INAV Nav Analyzer v{REPORT_VERSION}</footer>
+</div></body></html>"""
 
 
 def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm_results, config, data, charts, nav_results=None):

@@ -16,12 +16,22 @@ A suite of Python tools for analyzing, validating, and tuning INAV flight contro
 
 ### Requirements
 
+Python 3.8+ required.
+
 ```bash
-pip install numpy scipy --break-system-packages  # core dependency
-pip install pyserial --break-system-packages      # optional: for --device mode
+# Debian / Ubuntu / Raspberry Pi (easiest)
+sudo apt install python3-numpy python3-scipy
+sudo apt install python3-serial              # optional: only for --device mode
+
+# Any platform (virtual environment)
+python3 -m venv .venv
+source .venv/bin/activate                    # Linux / macOS
+# .venv\Scripts\activate                     # Windows
+pip install numpy scipy
+pip install pyserial                         # optional: only for --device mode
 ```
 
-Python 3.8+ required. All tools are standalone scripts with no external dependencies beyond numpy/scipy. `pyserial` is only needed when downloading blackbox logs directly from the flight controller. The flight database uses Python's built-in sqlite3.
+All tools are standalone scripts. `pyserial` is only needed when downloading blackbox logs directly from the flight controller. The flight database uses Python's built-in sqlite3.
 
 ### Blackbox Analyzer
 
@@ -235,29 +245,40 @@ inav-toolkit/
 ├── README.md                        # This file
 ├── CHANGELOG.md                     # Version history
 ├── requirements.txt                 # Python dependencies
-├── inav_blackbox_analyzer.py        # Blackbox log analyzer (v2.12.0)
+├── inav_blackbox_analyzer.py        # Blackbox log analyzer (v2.13.0)
 ├── inav_msp.py                      # MSP v2 serial communication with FC
 ├── inav_flight_db.py                # SQLite flight history database
 ├── inav_param_analyzer.py           # Config validator + setup generator
 ├── inav_vtol_configurator.py        # VTOL mixer profile validator
 ├── docs/
 │   ├── BLACKBOX_ANALYZER.md         # Detailed blackbox analyzer docs
+│   ├── NAV_ANALYZER.md              # Navigation health analyzer docs
 │   ├── PARAM_ANALYZER.md            # Detailed parameter analyzer docs
 │   ├── VTOL_CONFIGURATOR.md         # Detailed VTOL configurator docs
 │   └── TUNING_WORKFLOW.md           # Step-by-step tuning guide
 └── tests/                           # Test diff files and logs
 ```
 
+## Platform Support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| **Linux** | Primary | Developed and tested daily on real hardware. Full support for `--device auto`, serial port discovery, ANSI terminal colors. |
+| **Windows** | Experimental | Serial port discovery via pyserial's `list_ports`, ANSI colors via VT100 mode (Windows 10+), COM port auto-detection. Tested minimally at the bench only - not validated in real flight workflows. |
+| **macOS** | Untested | Should work - serial port patterns cover common USB-serial chips (usbmodem, usbserial, SLAB, CH340). I don't have a Mac so this is completely untested. |
+
+**Important:** Linux is my main platform. Windows has only been bench-tested (no real flights analyzed), and macOS has not been tested at all. If you find a platform-specific bug, please report it, but I may not be able to reproduce or verify fixes on Windows or macOS.
+
 ## Contributing
 
-This is an active project. The navigation analyzer module is planned for future development, along with potential Raspberry Pi-based autonomous tuning.
+This is an active project. Roadmap: per-phase nav analysis, RTH tracking, nav PID tuning recommendations.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+GPL-3.0 License. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
 - The INAV development team and community
-- QuadMeUp (Paweł Spychalski) for filter and RPM analysis research
+- QuadMeUp (Pawel Spychalski) for filter and RPM analysis research
 - The INAV Fixed Wing Group for modes documentation
