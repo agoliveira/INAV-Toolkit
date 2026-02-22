@@ -46,6 +46,20 @@ MSP_NAME                = 10
 MSP_DATAFLASH_SUMMARY   = 70
 MSP_DATAFLASH_READ      = 71
 MSP_DATAFLASH_ERASE     = 72
+MSP_BLACKBOX_CONFIG     = 80
+
+# Blackbox device types (from MSP_BLACKBOX_CONFIG byte 0)
+BB_DEVICE_NONE     = 0
+BB_DEVICE_SERIAL   = 1
+BB_DEVICE_SPIFLASH = 2
+BB_DEVICE_SDCARD   = 3
+
+BB_DEVICE_NAMES = {
+    BB_DEVICE_NONE: "NONE",
+    BB_DEVICE_SERIAL: "SERIAL",
+    BB_DEVICE_SPIFLASH: "SPIFLASH",
+    BB_DEVICE_SDCARD: "SDCARD",
+}
 
 # ─── MSP v2 CRC-8 DVB-S2 ─────────────────────────────────────────────────────
 
@@ -448,6 +462,26 @@ class INAVDevice:
             "used_size": used_size,
         }
 
+    def get_blackbox_config(self):
+        """Get blackbox configuration including storage device type.
+
+        Returns dict with:
+            device (int): Blackbox device type (BB_DEVICE_* constants)
+            device_name (str): Human-readable device name
+            rate_num (int): Blackbox rate numerator
+            rate_denom (int): Blackbox rate denominator
+        Or None on error.
+        """
+        payload = self._request(MSP_BLACKBOX_CONFIG)
+        if not payload or len(payload) < 3:
+            return None
+        return {
+            "device": payload[0],
+            "device_name": BB_DEVICE_NAMES.get(payload[0], f"UNKNOWN({payload[0]})"),
+            "rate_num": payload[1],
+            "rate_denom": payload[2],
+        }
+
     def read_dataflash_chunk(self, address, size=4096):
         """Read a chunk of dataflash at the given address.
 
@@ -530,7 +564,21 @@ class INAVDevice:
             return None
 
         if not summary["supported"]:
-            print("  ERROR: Dataflash not supported on this board")
+            # Check if this FC uses SD card or serial instead of dataflash
+            bb_config = self.get_blackbox_config()
+            if bb_config and bb_config["device"] == BB_DEVICE_SDCARD:
+                print("  This FC uses an SD card for blackbox logging.")
+                print("  Direct SD card download is not yet supported.")
+                print("  To get your logs:")
+                print("    - Remove the SD card and copy .bbl files, or")
+                print("    - Type 'msc' in INAV Configurator CLI to mount as USB drive")
+                print("  Then run the analyzer on the file directly.")
+            elif bb_config and bb_config["device"] == BB_DEVICE_SERIAL:
+                print("  This FC logs blackbox over serial (OpenLog/external logger).")
+                print("  Retrieve logs from the external logger's SD card,")
+                print("  then run the analyzer on the file directly.")
+            else:
+                print("  ERROR: Dataflash not supported on this board")
             return None
 
         if not summary["ready"]:
@@ -1007,7 +1055,7 @@ def main():
         print(f"  Board:      {info['board'] or '?'}")
 
         summary = fc.get_dataflash_summary()
-        if summary:
+        if summary and summary['supported']:
             used_kb = summary['used_size'] / 1024
             total_kb = summary['total_size'] / 1024
             pct = summary['used_size'] * 100 // summary['total_size'] if summary['total_size'] > 0 else 0
@@ -1031,8 +1079,25 @@ def main():
                 print(f"\n  Ready to analyze:")
                 print(f"    python3 inav_blackbox_analyzer.py {filepath}")
         else:
-            print("  Dataflash:  not available")
-            print(f"  {'─' * 50}")
+            # No dataflash - check what blackbox device is configured
+            bb_config = fc.get_blackbox_config()
+            if bb_config and bb_config["device"] == BB_DEVICE_SDCARD:
+                print(f"  Blackbox:   SD card")
+                print(f"  {'─' * 50}")
+                print(f"\n  Direct SD card download is not yet supported.")
+                print(f"  To get your logs:")
+                print(f"    - Remove the SD card and copy .bbl files, or")
+                print(f"    - Type 'msc' in INAV Configurator CLI to mount as USB drive")
+                print(f"  Then run the analyzer on the file directly:")
+                print(f"    python3 inav_blackbox_analyzer.py <file.bbl>")
+            elif bb_config and bb_config["device"] == BB_DEVICE_SERIAL:
+                print(f"  Blackbox:   serial (external logger)")
+                print(f"  {'─' * 50}")
+                print(f"\n  Retrieve logs from the external logger's SD card,")
+                print(f"  then run the analyzer on the file directly.")
+            else:
+                print("  Dataflash:  not available")
+                print(f"  {'─' * 50}")
 
     except KeyboardInterrupt:
         print("\n  Interrupted.")
