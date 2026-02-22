@@ -10,7 +10,7 @@ Parses INAV CLI `diff all` output and checks for:
   - Navigation configuration review
 
 Usage:
-    python3 inav_param_analyzer.py diff_all.txt [--frame 10] [--blackbox state.json]
+    inav-params diff_all.txt [--frame 10] [--blackbox state.json]
 """
 
 import argparse
@@ -21,7 +21,7 @@ import sys
 import textwrap
 from datetime import datetime
 
-VERSION = "1.1.0"
+VERSION = "2.14.0"
 
 
 def _enable_ansi_colors():
@@ -1054,7 +1054,7 @@ def check_filters(parsed, frame_inches=None):
             setting="dynamic_gyro_notch_mode",
             current=f"{dyn_notch_mode}"))
 
-        if isinstance(dyn_notch_min, (int, float)):
+        if isinstance(dyn_notch_min, (int, float)) and frame_inches is not None:
             # INAV docs: 150 for 5", 100 for 7", 60-70 for 10"
             expected_max = {5: 180, 7: 120, 10: 80, 12: 60, 15: 45}
             nearest_size = min(expected_max.keys(), key=lambda x: abs(x - frame_inches))
@@ -1774,10 +1774,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Modes:
-              Analysis (default):  python3 inav_param_analyzer.py diff_all.txt --frame 10
-              Setup:               python3 inav_param_analyzer.py --setup 10 --voltage 6S
+              Analysis (default):  inav-params diff_all.txt --frame 10
+              Setup:               inav-params --setup 10 --voltage 6S
             
-            Supported frame sizes: 7, 10, 12, 15 inches
+            Supported frame sizes: 5, 7, 10, 12, 15 inches
             Supported voltages: 4S, 6S, 8S, 12S
         """))
     parser.add_argument("difffile", nargs="?", default=None,

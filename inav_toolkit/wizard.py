@@ -7,8 +7,8 @@ guided tuning workflow. Handles FC connection, blackbox download,
 analysis, result presentation, and CLI command application.
 
 Usage:
-    python3 inav_toolkit.py              # Interactive guided mode
-    python3 inav_toolkit.py --device /dev/ttyACM0   # Specify port
+    inav-toolkit                          # Interactive guided mode
+    inav-toolkit --device /dev/ttyACM0    # Specify port
 """
 
 import glob
@@ -19,7 +19,15 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+try:
+    from inav_toolkit import __version__ as VERSION
+except ImportError:
+    VERSION = "2.14.0"
+
+# Module paths for subprocess invocation (package-aware)
+ANALYZER_MODULE = "inav_toolkit.blackbox_analyzer"
+PARAM_MODULE = "inav_toolkit.param_analyzer"
+# Legacy script names (for git-clone-without-install usage)
 ANALYZER_SCRIPT = "inav_blackbox_analyzer.py"
 PARAM_SCRIPT = "inav_param_analyzer.py"
 
@@ -67,16 +75,40 @@ def _script_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def _find_script(name):
-    """Find a toolkit script in the same directory."""
-    path = os.path.join(_script_dir(), name)
-    if os.path.isfile(path):
-        return path
+def _module_cmd(module_path, fallback_script=None):
+    """Build command prefix to run a toolkit module.
+
+    Works both as installed package (python -m inav_toolkit.X)
+    and from legacy script layout (python inav_blackbox_analyzer.py).
+    """
+    # Try package module first (pip install or running from repo root)
+    cmd = [sys.executable, "-m", module_path]
+    try:
+        # Quick check: can Python find this module?
+        result = subprocess.run(
+            cmd + ["--help"], capture_output=True, timeout=5)
+        if result.returncode in (0, 2):  # 0=ok, 2=argparse error (no args)
+            return cmd
+    except Exception:
+        pass
+
+    # Fallback: look for legacy script alongside this file's parent dir
+    if fallback_script:
+        parent = os.path.dirname(_script_dir())
+        script = os.path.join(parent, fallback_script)
+        if os.path.isfile(script):
+            return [sys.executable, script]
+        # Also check same directory (flat layout)
+        script = os.path.join(_script_dir(), fallback_script)
+        if os.path.isfile(script):
+            return [sys.executable, script]
+
     # PyInstaller bundle
-    if getattr(sys, '_MEIPASS', None):
-        path = os.path.join(sys._MEIPASS, name)
-        if os.path.isfile(path):
-            return path
+    if fallback_script and getattr(sys, '_MEIPASS', None):
+        script = os.path.join(sys._MEIPASS, fallback_script)
+        if os.path.isfile(script):
+            return [sys.executable, script]
+
     return None
 
 
@@ -142,11 +174,14 @@ def _banner():
 def _connect_fc(port=None):
     """Connect to FC and return (device, info) or (None, None)."""
     try:
-        from inav_msp import INAVDevice, auto_detect_fc, find_serial_ports
+        from inav_toolkit.msp import INAVDevice, auto_detect_fc, find_serial_ports
     except ImportError:
-        print(f"  {RED}ERROR: inav_msp.py not found in {_script_dir()}{R}")
-        print(f"  Make sure all toolkit files are in the same directory.")
-        return None, None
+        try:
+            from inav_msp import INAVDevice, auto_detect_fc, find_serial_ports
+        except ImportError:
+            print(f"  {RED}ERROR: MSP module not found{R}")
+            print(f"  Install: pip install inav-toolkit[serial]")
+            return None, None
 
     try:
         import serial
@@ -260,11 +295,11 @@ def _run_analyzer(logfile, mode="tune", diff_file=None, frame=None, extra_args=N
         dict with keys: success, score, verdict, actions, state_json_path,
                         html_path, output (terminal text)
     """
-    script = _find_script(ANALYZER_SCRIPT)
-    if not script:
-        return {"success": False, "output": f"Cannot find {ANALYZER_SCRIPT}"}
+    cmd_prefix = _module_cmd(ANALYZER_MODULE, ANALYZER_SCRIPT)
+    if not cmd_prefix:
+        return {"success": False, "output": f"Cannot find analyzer module"}
 
-    cmd = [sys.executable, script, logfile]
+    cmd = cmd_prefix + [logfile]
     if mode == "nav":
         cmd.append("--nav")
     if diff_file:
@@ -324,11 +359,11 @@ def _run_analyzer(logfile, mode="tune", diff_file=None, frame=None, extra_args=N
 
 def _run_param_check(diff_file, frame=None):
     """Run parameter analyzer safety check. Returns (success, output)."""
-    script = _find_script(PARAM_SCRIPT)
-    if not script:
-        return False, f"Cannot find {PARAM_SCRIPT}"
+    cmd_prefix = _module_cmd(PARAM_MODULE, PARAM_SCRIPT)
+    if not cmd_prefix:
+        return False, f"Cannot find parameter analyzer module"
 
-    cmd = [sys.executable, script, diff_file]
+    cmd = cmd_prefix + [diff_file]
     if frame:
         cmd.extend(["--frame", str(frame)])
 
@@ -486,10 +521,13 @@ def _restore_backup(fc, info, backup_path, port=None):
     time.sleep(5)
 
     try:
-        from inav_msp import INAVDevice, auto_detect_fc
+        from inav_toolkit.msp import INAVDevice, auto_detect_fc
     except ImportError:
-        print(f" {RED}cannot import inav_msp{R}")
-        return None, False
+        try:
+            from inav_msp import INAVDevice, auto_detect_fc
+        except ImportError:
+            print(f" {RED}cannot import MSP module{R}")
+            return None, False
 
     # Try reconnecting several times
     new_fc = None

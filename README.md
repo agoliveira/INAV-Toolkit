@@ -6,74 +6,79 @@ A suite of Python tools for analyzing, validating, and tuning INAV flight contro
 
 | Tool | Purpose |
 |------|---------|
-| **Blackbox Analyzer** | Decode blackbox logs, analyze PID/nav performance, detect oscillation, recommend tuning changes. `--nav` mode for compass/GPS/baro health. `--device` for direct FC communication. |
+| **Blackbox Analyzer** | Decode blackbox logs, analyze PID performance, detect oscillation, recommend tuning changes |
+| **Guided Wizard** | Interactive session manager - connects to FC, backs up config, runs analysis, applies changes |
 | **Parameter Analyzer** | Validate `diff all` configs for safety, filter, PID, and navigation issues |
 | **VTOL Configurator** | Validate VTOL mixer profiles, motor/servo mixing, and transition setup |
+| **Flight Database** | SQLite storage for flight history, progression tracking across tuning sessions |
+| **MSP Communication** | Direct FC communication - download blackbox, pull config, identify hardware |
 
 ## Quick Start
 
-### Requirements
-
-Python 3.8+ required.
+### Install
 
 ```bash
-# Debian / Ubuntu / Raspberry Pi (easiest)
-sudo apt install python3-numpy python3-scipy python3-matplotlib
-sudo apt install python3-serial              # optional: only for --device mode
-
-# Any platform (virtual environment)
-python3 -m venv .venv
-source .venv/bin/activate                    # Linux / macOS
-# .venv\Scripts\activate                     # Windows
-pip install numpy scipy matplotlib
-pip install pyserial                         # optional: only for --device mode
+pip install inav-toolkit
 ```
 
-All tools are standalone scripts. `pyserial` is only needed when downloading blackbox logs directly from the flight controller. The flight database uses Python's built-in sqlite3.
+That's it. All dependencies (numpy, scipy, matplotlib, pyserial) are installed automatically.
+
+**Alternative install methods:**
+
+```bash
+# In a virtual environment
+python3 -m venv inav
+source inav/bin/activate
+pip install inav-toolkit
+
+# With pipx (auto-isolates CLI tools)
+pipx install inav-toolkit
+
+# From source (development)
+git clone https://github.com/iNavFlight/inav-toolkit
+cd inav-toolkit
+pip install -e .
+```
+
+Python 3.8+ required.
 
 ### Blackbox Analyzer
 
 Analyzes binary blackbox logs (`.bbl` / `.bfl`) from INAV. Decodes natively in Python - no `blackbox_decode` needed.
 
 ```bash
-# Preferred: connect to FC, download blackbox + config, analyze
-python3 inav_blackbox_analyzer.py --device auto
+# Full pipeline: connect to FC, download blackbox, analyze (diff pulled automatically)
+inav-analyze --device auto
 
 # Download, analyze, and erase flash for next session
-python3 inav_blackbox_analyzer.py --device auto --erase
+inav-analyze --device auto --erase
 
 # Download only (saves to ./blackbox/, no analysis)
-python3 inav_blackbox_analyzer.py --device auto --download-only
-
-# Nav health check (compass, GPS, baro, estimator)
-python3 inav_blackbox_analyzer.py --device auto --nav
+inav-analyze --device auto --download-only
 
 # Analyze from file (auto-detects frame size, cells, platform)
-python3 inav_blackbox_analyzer.py flight.bbl
-
-# With explicit diff file for config enrichment
-python3 inav_blackbox_analyzer.py flight.bbl --diff diff_all.txt
-
-# Nav health from file
-python3 inav_blackbox_analyzer.py flight.bbl --nav
+inav-analyze flight.bbl
 
 # Multi-log files are automatically split and analyzed individually
-python3 inav_blackbox_analyzer.py dataflash_dump.bbl
+inav-analyze dataflash_dump.bbl
 
 # Show flight history and progression for a craft
-python3 inav_blackbox_analyzer.py flight.bbl --history
+inav-analyze flight.bbl --history
 
 # Override frame size if auto-detection doesn't apply
-python3 inav_blackbox_analyzer.py flight.bbl --frame 10
+inav-analyze flight.bbl --frame 10
 
 # Add motor KV for RPM noise prediction (cells auto-detected from vbatref)
-python3 inav_blackbox_analyzer.py flight.bbl --kv 980
+inav-analyze flight.bbl --kv 980
+
+# Navigation health analysis mode
+inav-analyze flight.bbl --nav
 
 # Skip database storage for one-off analysis
-python3 inav_blackbox_analyzer.py flight.bbl --no-db
+inav-analyze flight.bbl --no-db
 
 # Custom database path
-python3 inav_blackbox_analyzer.py flight.bbl --db-path ~/my_flights.db
+inav-analyze flight.bbl --db-path ~/my_flights.db
 ```
 
 **What it measures:**
@@ -83,11 +88,11 @@ python3 inav_blackbox_analyzer.py flight.bbl --db-path ~/my_flights.db
 - **Motor balance:** Detects thrust asymmetry
 - **Filter phase lag:** Total delay through the filter chain
 - **Tracking error:** RMS deviation between setpoint and gyro
-- **Navigation health** (`--nav`): Compass jitter and EMI, GPS quality and satellite count, baro noise and spikes, estimator convergence, toilet bowl detection, altitude hold stability. Config cross-referencing when diff is available
+- **Navigation health** (`--nav`): Compass interference, GPS quality, barometer noise, position hold drift, altitude hold accuracy
 
 **Multi-log splitting:** Dataflash dumps containing multiple arm/disarm cycles are automatically detected and split. Each flight is analyzed individually with per-flight progression tracking.
 
-**CLI diff merge:** When using `--device`, the analyzer automatically pulls the full `diff all` from the FC and saves it alongside the blackbox log. Settings not present in blackbox headers (motor_poles, nav PIDs, rates, level mode, antigravity, compass, GPS constellation config) are enriched from the diff. For offline analysis, provide `--diff file.txt` or place a `*_diff.txt` file next to the BBL for auto-discovery. Config cross-referencing in `--nav` mode combines sensor readings with FC settings to produce actionable findings.
+**CLI diff merge:** When connected to the FC via `--device`, the analyzer automatically pulls the full `diff all` configuration. Settings not present in blackbox headers (motor_poles, nav PIDs, rates, level mode, antigravity) are enriched from the diff. Mismatches between what was flying and the current FC config are detected and displayed.
 
 **Flight database:** Every analysis is stored in a SQLite database (`inav_flights.db`). Scores, per-axis oscillation data, PID values, filter config, motor balance, and recommended actions are tracked per flight. The `--history` flag shows a progression table.
 
@@ -99,22 +104,36 @@ python3 inav_blackbox_analyzer.py flight.bbl --db-path ~/my_flights.db
 
 **Output:** Terminal report with actionable CLI commands, HTML report with plots, state JSON for cross-referencing, and SQLite database for history.
 
+### Guided Wizard
+
+Interactive session that orchestrates the full workflow: connect to FC, backup config, download blackbox, analyze, review changes, and apply.
+
+```bash
+# Start guided session (auto-detects FC)
+inav-toolkit
+
+# Specify serial port
+inav-toolkit --device /dev/ttyACM0
+```
+
+The wizard creates a timestamped backup before any changes and walks you through each step with safety gates.
+
 ### Parameter Analyzer
 
 Validates an INAV `diff all` export for configuration issues.
 
 ```bash
 # Analyze existing config
-python3 inav_param_analyzer.py my_diff.txt --frame 10
+inav-params my_diff.txt --frame 10
 
 # Generate starting PIDs for a new build
-python3 inav_param_analyzer.py --setup 10 --voltage 6S
+inav-params --setup 10 --voltage 6S
 
 # Compare starting PIDs with current config
-python3 inav_param_analyzer.py --setup 10 --voltage 6S my_diff.txt
+inav-params --setup 10 --voltage 6S my_diff.txt
 
 # Cross-reference with blackbox results
-python3 inav_param_analyzer.py my_diff.txt --blackbox state.json
+inav-params my_diff.txt --blackbox state.json
 ```
 
 **What it checks:**
@@ -127,7 +146,7 @@ python3 inav_param_analyzer.py my_diff.txt --blackbox state.json
 - **Blackbox:** Logging rate, essential fields for analysis
 - **Battery:** Li-ion vs LiPo detection, voltage limits
 
-**Setup mode** generates conservative starting PIDs for 7/10/12/15" frames at 4S/6S/8S/12S.
+**Setup mode** generates conservative starting PIDs for 5/7/10/12/15" frames at 4S/6S/8S/12S.
 
 ### VTOL Configurator
 
@@ -135,10 +154,10 @@ Validates INAV VTOL configurations using mixer_profile switching.
 
 ```bash
 # Validate VTOL config
-python3 inav_vtol_configurator.py vtol_diff.txt
+python3 -m inav_toolkit.vtol_configurator vtol_diff.txt
 
 # JSON output
-python3 inav_vtol_configurator.py vtol_diff.txt --json
+python3 -m inav_toolkit.vtol_configurator vtol_diff.txt --json
 ```
 
 **What it checks:**
@@ -158,19 +177,20 @@ Direct serial communication with INAV flight controllers over USB.
 
 ```bash
 # Identify connected FC
-python3 inav_msp.py --info-only
+inav-msp --info-only
 
 # Download blackbox data
-python3 inav_msp.py --device auto
+inav-msp --device auto
 
 # Specify serial port
-python3 inav_msp.py --device /dev/ttyACM0
+inav-msp --device /dev/ttyACM0
 ```
 
 **Capabilities:**
 - MSP v2 protocol with CRC-8 validation
 - FC identification (craft name, firmware, board, build date)
 - Dataflash summary, read, and erase
+- SD card blackbox detection with guidance
 - CLI mode for `diff all` config retrieval
 - Auto-detection of serial ports (Linux/macOS)
 - Binary blackbox download with progress bar and retry logic
@@ -181,12 +201,12 @@ The tools are designed to work together in a tuning pipeline:
 
 ```
 1. NEW BUILD
-   └─ param_analyzer --setup 10 --voltage 6S
+   └─ inav-params --setup 10 --voltage 6S
       → Conservative starting PIDs, filters, settings
       → Paste CLI commands into INAV Configurator
 
 2. FIRST FLIGHTS
-   └─ param_analyzer my_diff.txt --frame 10
+   └─ inav-params my_diff.txt --frame 10
       → Catches safety issues, missing settings, profile inconsistencies
       → Fix before flying
 
@@ -197,26 +217,24 @@ The tools are designed to work together in a tuning pipeline:
       → Nav segment for position hold / RTH data
 
 4. PID TUNING (one-step with FC connected)
-   └─ blackbox_analyzer --device auto --erase
-      → Downloads blackbox, pulls current config automatically
+   └─ inav-analyze --device auto --erase
+      → Downloads blackbox, pulls current config
       → Splits multi-log files automatically
       → Detects hover oscillation first
       → Recommends filter fixes before PID changes
       → Stores results in flight database
       → Shows progression from previous flights
 
-5. NAV HEALTH CHECK (once PIDs are stable)
-   └─ blackbox_analyzer --device auto --nav
-      → Compass jitter and EMI detection
-      → GPS quality and satellite count
-      → Baro noise and propwash correlation
-      → Cross-references with FC config (auto-pulled)
-      → Flags issues before first poshold/RTH
+5. GUIDED SESSION (interactive)
+   └─ inav-toolkit
+      → Connects, backs up, downloads, analyzes, applies
+      → Safety gates at every step
 
 6. ITERATE
    └─ Apply CLI commands → fly → analyze → repeat
       → Database tracks score progression across sessions
       → --history shows the full tuning journey
+      → Mismatch detection catches config drift
 ```
 
 ## Frame Size Profiles
@@ -225,6 +243,7 @@ The `--setup` mode provides conservative starting configurations:
 
 | Frame | P Roll | P Pitch | D | Gyro LPF | Dyn Notch Min |
 |-------|--------|---------|---|----------|---------------|
+| 5" 4S  | 44 | 46 | 30 | 120Hz | 100Hz |
 | 7" 4S  | 35 | 38 | 23 | 90Hz | 60Hz |
 | 10" 4S | 25 | 28 | 18 | 65Hz | 50Hz |
 | 12" 4S | 20 | 22 | 14 | 50Hz | 35Hz |
@@ -240,43 +259,38 @@ Developed and tested against **INAV 9.0.x**. The blackbox binary decoder handles
 
 ```
 inav-toolkit/
-├── README.md                        # This file
-├── CHANGELOG.md                     # Version history
+├── pyproject.toml                   # Package configuration (pip install)
 ├── requirements.txt                 # Python dependencies
-├── inav_blackbox_analyzer.py        # Blackbox log analyzer (v2.13.0)
-├── inav_msp.py                      # MSP v2 serial communication with FC
-├── inav_flight_db.py                # SQLite flight history database
-├── inav_param_analyzer.py           # Config validator + setup generator
-├── inav_vtol_configurator.py        # VTOL mixer profile validator
+├── README.md
+├── CHANGELOG.md
+├── LICENSE
+├── inav_toolkit/                    # Python package
+│   ├── __init__.py                  # Version: 2.14.0
+│   ├── blackbox_analyzer.py         # Blackbox log analyzer
+│   ├── param_analyzer.py            # Config validator + setup generator
+│   ├── msp.py                       # MSP v2 serial communication
+│   ├── wizard.py                    # Guided session manager
+│   ├── flight_db.py                 # SQLite flight history database
+│   ├── autotune.py                  # Experimental auto-tuning
+│   └── vtol_configurator.py         # VTOL mixer profile validator
 ├── docs/
 │   ├── BLACKBOX_ANALYZER.md         # Detailed blackbox analyzer docs
-│   ├── NAV_ANALYZER.md              # Navigation health analyzer docs
 │   ├── PARAM_ANALYZER.md            # Detailed parameter analyzer docs
 │   ├── VTOL_CONFIGURATOR.md         # Detailed VTOL configurator docs
 │   └── TUNING_WORKFLOW.md           # Step-by-step tuning guide
-└── tests/                           # Test diff files and logs
+└── tests/                           # Test diff files and smoke tests
 ```
-
-## Platform Support
-
-| Platform | Status | Notes |
-|----------|--------|-------|
-| **Linux** | Primary | Developed and tested daily on real hardware. Full support for `--device auto`, serial port discovery, ANSI terminal colors. |
-| **Windows** | Experimental | Serial port discovery via pyserial's `list_ports`, ANSI colors via VT100 mode (Windows 10+), COM port auto-detection. Tested minimally at the bench only - not validated in real flight workflows. |
-| **macOS** | Untested | Should work - serial port patterns cover common USB-serial chips (usbmodem, usbserial, SLAB, CH340). I don't have a Mac so this is completely untested. |
-
-**Important:** Linux is my main platform. Windows has only been bench-tested (no real flights analyzed), and macOS has not been tested at all. If you find a platform-specific bug, please report it, but I may not be able to reproduce or verify fixes on Windows or macOS.
 
 ## Contributing
 
-This is an active project. Roadmap: per-phase nav analysis, RTH tracking, nav PID tuning recommendations.
+This is an active project. Contributions welcome.
 
 ## License
 
-GPL-3.0 License. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
 - The INAV development team and community
-- QuadMeUp (Pawel Spychalski) for filter and RPM analysis research
+- QuadMeUp (Paweł Spychalski) for filter and RPM analysis research
 - The INAV Fixed Wing Group for modes documentation

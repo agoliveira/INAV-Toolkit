@@ -5,7 +5,7 @@
 ### 1.1 Generate Starting PIDs
 
 ```bash
-python3 inav_param_analyzer.py --setup 10 --voltage 6S
+inav-params --setup 10 --voltage 6S
 ```
 
 This outputs conservative PIDs, filters, and settings for your frame. Copy the CLI commands into INAV Configurator's CLI tab.
@@ -24,7 +24,7 @@ Before first flight, ensure these are configured:
 ### 1.3 Validate Configuration
 
 ```bash
-python3 inav_param_analyzer.py my_diff.txt --frame 10
+inav-params my_diff.txt --frame 10
 ```
 
 Fix all CRITICAL findings before flying. Address WARNINGs where practical.
@@ -86,7 +86,7 @@ This data feeds the future navigation analyzer.
 ### 4.1 Blackbox Analysis
 
 ```bash
-python3 inav_blackbox_analyzer.py flight.bbl --frame 10
+inav-analyze flight.bbl --frame 10
 ```
 
 Open the HTML report. Key metrics to evaluate:
@@ -108,7 +108,7 @@ The analyzer generates CLI commands. Review them - don't blindly paste:
 ### 4.3 Cross-Reference
 
 ```bash
-python3 inav_param_analyzer.py my_diff.txt --blackbox state.json
+inav-params my_diff.txt --blackbox state.json
 ```
 
 This catches cases where your config and flight behavior disagree (e.g., EZ Tune overwriting manual PIDs).

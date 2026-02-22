@@ -2,69 +2,55 @@
 
 All notable changes to INAV Toolkit.
 
-## [2026-02-22] - Toolkit v2.14.0
+## [2026-02-22] - v2.14.0
 
 ### Added
-- **Guided session wizard** (`inav_toolkit.py`): Interactive orchestrator for the full tuning workflow. Four connected-FC flows (tune, nav check, new build safety check, download) plus offline analysis. Tracks score progression across sessions, extracts CLI commands from analysis results, applies changes via MSP batch mode.
-- **Backup/restore safety system**: Before first change is applied, wizard pulls a full `diff all` backup with header metadata (craft, firmware, board, timestamp). Restore available mid-session, on quit, or standalone from main menu. Manual restore instructions embedded in backup file. Hard-stops session if backup fails.
-- **MSP CLI batch mode** (`cli_batch()` in `inav_msp.py`): Enters CLI mode once, sends all commands, saves, exits. Eliminates per-command CLI enter/exit overhead for applying tuning changes.
-- **Restore from backup flow**: Main menu option to browse and restore from previous backup files, with auto-discovery and reconnect handling after FC reboot.
+- **pip-installable package**: `pip install inav-toolkit` now installs the full suite with all dependencies and creates system-wide commands: `inav-analyze`, `inav-params`, `inav-toolkit`, `inav-msp`. Works with pip, venv, and pipx.
+- **Guided wizard** (`inav-toolkit`): Interactive session manager that orchestrates the full tuning workflow. Connects to FC, creates timestamped config backup, downloads blackbox, runs analysis, reviews changes with safety gates, and applies CLI commands via MSP batch mode.
+- **MSP batch CLI mode**: `cli_batch()` sends multiple CLI commands to the FC in a single session with per-command echo verification.
+- **SD card blackbox detection**: `MSP_BLACKBOX_CONFIG` (cmd 80) queries the FC's blackbox storage device. When SD card is detected, provides guidance (remove card or use `msc` CLI command) instead of misleading "Dataflash not supported" errors. Serial logger detection included.
+- **Backup/restore safety system**: Wizard creates a full `diff all` backup before any changes. Restore gate prevents applying changes if backup wasn't taken. Handles FC reboot and serial reconnection after `save` command.
 
 ### Changed
-- **Param analyzer frame profiles revised** (research-validated):
-  - Added 5" and 7" profiles (previously only 10"+). 5" matches INAV 9 firmware defaults.
-  - 10" profile: PIDs raised from P=28/D=18 to P=40/D=30 based on community data (GitHub #9765, IntoFPV). I gains raised to 60/55. dterm_lpf_hz=60, dyn_notch_min=65Hz (INAV docs midpoint). Added iterm_relax_cutoff=8, rate_accel_limit=1000/500, CD terms, rates.
-  - 12" profile: dterm_lpf_hz=45 (PT3), dyn_notch_min=45Hz, accel limits 500/250, CD terms added.
-  - 15" profile: PIDs raised from P=25/D=20 to P=28/D=22. Yaw P raised to 30. Community note about tuned 16" flying P=44. Accel limits 360/180 per INAV dev guidance.
-  - All profiles: Added source annotations citing INAV Settings.md, GitHub discussions, community blackbox data. Added EZ Tune alternative notes. Added dterm_lpf_type=PT3.
-- **Dynamic notch min_hz analysis**: Now size-specific thresholds (80Hz for 10", 60Hz for 12", 45Hz for 15") instead of blanket 8"+ check.
-- **D-term LPF analysis**: Added expected range table per frame size from INAV docs and community data. Flags both too-high and too-low values.
+- **Package layout**: All modules moved into `inav_toolkit/` package directory. Old `inav_*.py` root scripts replaced by proper Python package with entry points.
+- **Unified version**: All modules now report v2.14.0 from a single source (`inav_toolkit.__version__`).
+- **pyserial now a default dependency**: Was optional; now included by default since the wizard and MSP tools need it. Adds only ~200KB.
+- **requirements.txt**: Added missing `matplotlib>=3.5.0` dependency (was imported but not listed).
 
-## [2026-02-22] - Blackbox Analyzer v2.13.0
+### Fixed
+- **Parameter analyzer crash on `--frame` omission**: `check_filters()` crashed with `TypeError` when `frame_inches` was `None` (no `--frame` flag and no auto-detection). Now guards frame-specific threshold checks.
+- **Windows ANSI color support**: All modules now enable Windows console virtual terminal processing. Respects `NO_COLOR` environment variable.
+
+### Docs
+- README rewritten with `pip install` instructions, new command names, updated project structure.
+- All docs (`docs/*.md`) updated from `python3 inav_*.py` to new command names.
+- Smoke tests updated for package module invocation (`python -m inav_toolkit.*`).
+
+## [2026-02-22] - v2.13.0
 
 ### Added
-- **Navigation health analyzer** (`--nav`): Standalone analysis mode checking compass, GPS, barometer, and estimator health from any flight. No poshold or RTH required - works on manual/acro hover data. Produces its own terminal output and HTML report with sensor scores and weighted nav score.
-- **Compass analysis**: Heading jitter (RMS rate), throttle-correlated EMI detection, heading drift rate. Penalties for jitter >2 deg/s, EMI correlation >0.3, drift >0.5 deg/s.
-- **GPS analysis**: Average/minimum satellite count, EPH accuracy, position jump detection. Penalties for <12 sats, EPH >300cm, jumps >5m.
-- **Barometer analysis**: Noise RMS after detrending, throttle-correlated propwash, spike detection. Penalties for noise >30cm, propwash correlation >0.3.
-- **Estimator analysis**: Baro-to-nav altitude correlation, max divergence tracking. Penalties for correlation <0.95 or divergence >200cm.
-- **Position hold analysis**: CEP (circular error probable), max drift, toilet bowl detection via spectral analysis of position error.
-- **Altitude hold analysis**: Oscillation amplitude and frequency detection.
-- **Phase gating**: Nav mode segments (poshold, althold, RTH, manual) are detected from nav_state field. Sensor scores use all data, hold scores use only relevant phases.
-- **Tuning prerequisite warning**: If PID tuning analysis detects oscillation, nav report warns that sensor readings (especially baro and compass) are affected by vibration.
-- **Config cross-referencing**: When FC config is available (via `--device` or `--diff`), combines flight sensor data with FC settings to produce findings neither source alone can provide:
-  - Baro noise + altitude PID gains = oscillation risk warning
-  - Compass jitter + mag calibration spread = recalibrate recommendation
-  - Compass jitter + heading P gain = amplification warning
-  - Low GPS satellites + disabled GNSS constellations = enable recommendation
-  - No compass configured = GPS-course-only warning for nav modes
-  - Estimator divergence + low baro weight = trust adjustment recommendation
-- **Nav HTML report with charts**: 5 embedded matplotlib charts (heading+jitter, baro+estimator altitude, GPS satellite count, EPH timeline, poshold scatter). Score cards with bar fills. FC config section. Matches tuning report visual style.
-- **Auto-diff pull**: `--device` now always pulls `diff all` from the FC automatically. No `--diff` flag needed when connected.
-- **Auto-diff discovery**: When analyzing from file, automatically finds `*_diff.txt`, `diff.txt`, or `diff_all.txt` in the same directory as the BBL.
-- **`--diff FILE`**: Provide a CLI diff file explicitly for offline analysis with config enrichment.
-- **Cross-platform serial port discovery**: Uses pyserial's `list_ports` for Windows COM port and macOS detection. STM32 VID 0x0483 prioritized. Falls back to glob patterns on Linux.
-- **Windows ANSI color support**: Enables VT100 processing via ctypes kernel32 on Windows 10+. Auto-disables colors when stdout is piped or redirected.
-- **Centralized color handling**: All ANSI escape codes go through `_colors()` function. No more scattered inline escape sequences.
-- **Navigation analyzer documentation** (`docs/NAV_ANALYZER.md`): Comprehensive guide covering blackbox config, analysis modules, scoring, cross-referencing, flight patterns, and troubleshooting.
+- **Navigation health analysis** (`--nav` flag): Completely separate analysis mode that bypasses PID tuning and produces navigation-focused diagnostics. Six analysis modules:
+  - **Compass health**: Heading jitter, magnetic interference correlation with throttle, heading drift rate during GPS-controlled flight.
+  - **GPS quality**: Fix type distribution, satellite count statistics, HDOP analysis, position jump detection, 3D speed consistency.
+  - **Barometer performance**: Altitude noise (RMS), propwash interference correlation, short-term stability assessment.
+  - **Position estimator**: Estimated vs GPS position divergence, velocity estimation accuracy, estimator reset detection.
+  - **Altitude hold**: Altitude tracking error during ALTHOLD/POSHOLD, climb/descent response analysis.
+  - **Position hold drift**: Circular error probable (CEP), toilet-bowl pattern detection, drift rate measurement during POSHOLD.
+- **Extended blackbox decoder**: Extracts 30+ navigation fields from blackbox logs. Decodes S-frames (flight mode changes) and G-frames (GPS data) that were previously skipped.
+- **Flight phase segmentation**: Analysis isolates nav-controlled flight periods (POSHOLD, ALTHOLD, RTH, WP) to avoid false positives from manual flight maneuvers.
+- **Navigation HTML report**: Standalone dark-themed HTML report with compass, baro, GPS, and position hold charts. Separate from the PID tuning report.
+- **Tuning prerequisite warnings**: Navigation analysis detects PID oscillation issues and warns users to fix tuning problems before trusting navigation health metrics.
+- **Frame size profiles expanded**: Added 5-inch profile with research-validated defaults. All profiles (5/7/10/12/15") now include size-specific analysis thresholds for noise frequencies, filter recommendations, and PID starting points.
+- **Color-coded navigation scores**: Terminal output shows per-module scores (compass, GPS, baro, position hold) with color-coded pass/warn/fail indicators.
+
+## [2026-02-22] - Blackbox Analyzer v2.12.1
 
 ### Fixed
-- **Baro detrending bug**: `sosfilt` (one-pass, startup transient) replaced with `sosfiltfilt` (zero-phase). The one-pass filter ramped from 0 to baro altitude over the first few seconds, creating a large fake residual that inflated baro noise readings.
+- **MSP download speed regression**: Fixed 100x speed drop (2 KB/s vs 200 KB/s) when downloading blackbox through the analyzer. Root cause: `_recv()` hot-spun at 100% CPU when the serial buffer held a partial MSP frame with no new data arriving. In the lightweight standalone `inav_msp.py` process this was harmless, but in the analyzer process (89,000+ GC-tracked objects from numpy/scipy/matplotlib) the spin competed with Python's garbage collector and OS USB interrupt servicing, causing FC USB flow control back-pressure. Fix: 200us sleep when waiting for partial frame completion.
+- **Em dash cleanup**: Replaced all Unicode em dashes with ASCII hyphens across all source files and documentation.
 
 ### Changed
-- **`--diff` is now file-path only**: No longer a boolean flag. `--device` auto-pulls config, `--diff path.txt` is for offline use.
-- **Install instructions**: apt-first for Debian/Ubuntu/RPi, venv as universal fallback. Removed `--break-system-packages`.
-- **`--device` help text**: Shows cross-platform port examples (COM3, /dev/cu.usbmodem).
-- **Windows COM port handling**: Skips filesystem existence check for COM ports.
-- **requirements.txt**: Added matplotlib (was a hard dependency but missing from requirements).
-- **README**: Platform Support table, nav in workflow, updated project structure.
-
-## [2026-02-21] - Blackbox Analyzer v2.12.1
-
-### Fixed
-- **MSP hot-spin on disconnect**: Serial read loop could spin at 100% CPU if FC disconnected mid-transfer. Added timeout handling.
-- **Em dash cleanup**: Replaced Unicode em dashes with ASCII hyphens throughout all source files and docs for terminal compatibility.
-- **UI symbol consistency**: Standardized checkmarks and status symbols across terminal output.
+- **Automatic diff pull on --device**: `diff all` is now pulled automatically when the FC is connected (previously required explicit `--diff` flag). Enables session detection, CONFIG REVIEW, and mismatch detection without extra flags.
 
 ## [2026-02-21] - Blackbox Analyzer v2.12.0
 

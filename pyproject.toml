@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inav-toolkit"
+version = "2.14.0"
+description = "Blackbox analyzer, parameter checker, and tuning wizard for INAV flight controllers"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+keywords = ["inav", "drone", "blackbox", "pid", "tuning", "flight-controller", "multirotor"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.21.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.5.0",
+    "pyserial>=3.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/iNavFlight/inav-toolkit"
+Issues = "https://github.com/iNavFlight/inav-toolkit/issues"
+
+[project.scripts]
+inav-analyze = "inav_toolkit.blackbox_analyzer:main"
+inav-params = "inav_toolkit.param_analyzer:main"
+inav-toolkit = "inav_toolkit.wizard:main"
+inav-msp = "inav_toolkit.msp:main"
+
+[tool.setuptools.packages.find]
+include = ["inav_toolkit*"]

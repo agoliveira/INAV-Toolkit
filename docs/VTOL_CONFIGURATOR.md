@@ -21,10 +21,10 @@ Each mixer profile contains its own `platform_type`, motor mix (`mmix`), and ser
 
 ```bash
 # Validate VTOL config
-python3 inav_vtol_configurator.py vtol_diff.txt
+python3 -m inav_toolkit.vtol_configurator vtol_diff.txt
 
 # JSON output for automation
-python3 inav_vtol_configurator.py vtol_diff.txt --json
+python3 -m inav_toolkit.vtol_configurator vtol_diff.txt --json
 ```
 
 ## VTOL Types Supported

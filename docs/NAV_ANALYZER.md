@@ -12,7 +12,7 @@ This works on any flight type including manual/acro. You don't need to fly posho
 
 ```bash
 # Download blackbox + pull config + nav analysis (preferred)
-python3 inav_blackbox_analyzer.py --device auto --nav
+inav-analyze --device auto --nav
 ```
 
 This is the best workflow. The analyzer connects to the FC, downloads the blackbox log, pulls the full configuration, and runs nav analysis with config cross-referencing. Cross-referenced findings combine flight data with FC settings to produce actionable results - for example, warning that high baro noise combined with aggressive altitude PID gains will cause oscillation.
@@ -21,13 +21,13 @@ This is the best workflow. The analyzer connects to the FC, downloads the blackb
 
 ```bash
 # Nav health analysis
-python3 inav_blackbox_analyzer.py flight.bbl --nav
+inav-analyze flight.bbl --nav
 
 # With explicit diff file for config enrichment
-python3 inav_blackbox_analyzer.py flight.bbl --nav --diff diff_all.txt
+inav-analyze flight.bbl --nav --diff diff_all.txt
 
 # Analyze specific flight from multi-log flash dump
-python3 inav_blackbox_analyzer.py dataflash.bbl --nav
+inav-analyze dataflash.bbl --nav
 ```
 
 **Auto-discovery:** If a `*_diff.txt` file exists in the same directory as the BBL (saved automatically by `--device` mode), it is loaded without needing `--diff`. To save a diff manually: open the CLI tab in INAV Configurator, type `diff all`, copy the output, save to a text file next to your BBL.

@@ -6,7 +6,7 @@ Each analyzed flight is recorded with scores, per-axis measurements,
 motor data, configuration snapshot, and recommended actions.
 
 Usage:
-    from inav_flight_db import FlightDB
+    from inav_toolkit.flight_db import FlightDB
 
     db = FlightDB("./inav_flights.db")
     flight_id = db.store_flight(plan, config, data, hover_osc, motor_analysis,
@@ -21,7 +21,7 @@ import json
 import os
 from datetime import datetime
 
-VERSION = "1.0.0"
+VERSION = "2.14.0"
 
 SCHEMA_VERSION = 1
 

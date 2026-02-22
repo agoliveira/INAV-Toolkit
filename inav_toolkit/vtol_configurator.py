@@ -13,9 +13,9 @@ INAV VTOL works by switching between two mixer_profiles:
   Transition mixing (smix source 38) handles tilt servos.
 
 Usage:
-    python3 inav_vtol_configurator.py diff_all.txt              # Validate
-    python3 inav_vtol_configurator.py diff_all.txt --wizard     # Interactive setup
-    python3 inav_vtol_configurator.py diff_all.txt --json       # Machine output
+    python3 -m inav_toolkit.vtol_configurator diff_all.txt              # Validate
+    python3 -m inav_toolkit.vtol_configurator diff_all.txt --wizard     # Interactive setup
+    python3 -m inav_toolkit.vtol_configurator diff_all.txt --json       # Machine output
 """
 
 import argparse
@@ -25,7 +25,7 @@ import re
 import sys
 import textwrap
 
-VERSION = "1.0.1"
+VERSION = "2.14.0"
 
 
 def _enable_ansi_colors():

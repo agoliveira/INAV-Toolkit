@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.13.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.14.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -8,8 +8,8 @@ Output: specific "change X from A to B" instructions, not vague advice.
 Supports iterative tuning: run → adjust → fly → run again → repeat.
 
 Usage:
-    python inav_blackbox_analyzer.py <logfile.bbl|logfile.csv> [options]
-    python inav_blackbox_analyzer.py new_log.csv --previous old_log.csv  # compare iterations
+    inav-analyze <logfile.bbl> [options]
+    inav-analyze flight.bbl --previous old_state.json  # compare iterations
 """
 
 import sys
@@ -87,7 +87,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.13.0"
+REPORT_VERSION = "2.14.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -886,7 +886,10 @@ def merge_diff_into_config(config, diff_raw):
     if not diff_raw:
         return 0
 
-    from inav_flight_db import parse_diff_output
+    try:
+        from inav_toolkit.flight_db import parse_diff_output
+    except ImportError:
+        from inav_flight_db import parse_diff_output
     diff_settings = parse_diff_output(diff_raw)
 
     merged = 0
@@ -4875,7 +4878,7 @@ def count_blackbox_logs(filepath):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.13.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.14.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("logfile", nargs="?", default=None,
                         help="Blackbox log (.bbl/.bfl/.bbs/.txt or decoded .csv). "
@@ -4938,11 +4941,14 @@ def main():
     diff_raw = None
     if args.device:
         try:
-            from inav_msp import INAVDevice, auto_detect_fc, find_serial_ports
+            try:
+                from inav_toolkit.msp import INAVDevice, auto_detect_fc, find_serial_ports
+            except ImportError:
+                from inav_msp import INAVDevice, auto_detect_fc, find_serial_ports
             import time as _time
         except ImportError:
-            print("  ERROR: inav_msp.py module not found.")
-            print("    Make sure inav_msp.py is in the same directory as the analyzer.")
+            print("  ERROR: MSP module not found.")
+            print("    Install: pip install inav-toolkit")
             sys.exit(1)
 
         print(f"\n  ▲ INAV Blackbox Analyzer v{REPORT_VERSION}")
@@ -5092,7 +5098,10 @@ def main():
 
     # ── History mode: show progression and exit ──
     if args.history:
-        from inav_flight_db import FlightDB
+        try:
+            from inav_toolkit.flight_db import FlightDB
+        except ImportError:
+            from inav_flight_db import FlightDB
         db = FlightDB(args.db_path)
         # Need to peek at craft name from headers
         rp = parse_headers_from_bbl(logfile) if os.path.isfile(logfile) else {}
@@ -5273,7 +5282,10 @@ def _process_multi_log(log_files, args, diff_raw):
     # ── Phase 6: Show cross-session progression ──
     if not args.no_db:
         try:
-            from inav_flight_db import FlightDB
+            try:
+                from inav_toolkit.flight_db import FlightDB
+            except ImportError:
+                from inav_flight_db import FlightDB
             db = FlightDB(args.db_path)
             rp = parse_headers_from_bbl(log_files[0])
             cfg = extract_fc_config(rp)
@@ -5330,7 +5342,10 @@ def _fingerprint_from_diff(diff_raw):
     if not diff_raw:
         return ""
 
-    from inav_flight_db import parse_diff_output
+    try:
+        from inav_toolkit.flight_db import parse_diff_output
+    except ImportError:
+        from inav_flight_db import parse_diff_output
     diff_settings = parse_diff_output(diff_raw)
 
     # Map CLI names → config keys (same mapping as merge_diff_into_config)
@@ -5358,7 +5373,10 @@ def _print_config_review(diff_raw, config, frame_inches, plan):
     R, B, C, G, Y, RED, DIM = _colors()
 
     try:
-        from inav_param_analyzer import parse_diff_all, run_all_checks, CRITICAL, WARNING
+        try:
+            from inav_toolkit.param_analyzer import parse_diff_all, run_all_checks, CRITICAL, WARNING
+        except ImportError:
+            from inav_param_analyzer import parse_diff_all, run_all_checks, CRITICAL, WARNING
     except ImportError:
         return  # param analyzer not available
 
@@ -5414,7 +5432,7 @@ def _print_config_review(diff_raw, config, frame_inches, plan):
                 fix_line += " ..."
             print(f"    {G}Fix: {fix_line}{R}")
 
-    print(f"\n  {DIM}Run 'python3 inav_param_analyzer.py diff.txt' for the full config review.{R}")
+    print(f"\n  {DIM}Run 'inav-params diff.txt' for the full config review.{R}")
     print(f"{B}{Y}{'─' * 70}{R}")
 
 
@@ -5814,7 +5832,10 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
         # Still store in DB
         if not args.no_db:
             try:
-                from inav_flight_db import FlightDB
+                try:
+                    from inav_toolkit.flight_db import FlightDB
+                except ImportError:
+                    from inav_flight_db import FlightDB
                 db = FlightDB(args.db_path)
                 flight_id, is_new = db.store_flight(
                     plan, config, data, hover_osc, motor_analysis,
@@ -5869,7 +5890,10 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     # ── Store in flight database ──
     if not args.no_db:
         try:
-            from inav_flight_db import FlightDB
+            try:
+                from inav_toolkit.flight_db import FlightDB
+            except ImportError:
+                from inav_flight_db import FlightDB
             db = FlightDB(args.db_path)
             flight_id, is_new = db.store_flight(
                 plan, config, data, hover_osc, motor_analysis,

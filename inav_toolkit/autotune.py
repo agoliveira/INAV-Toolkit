@@ -13,15 +13,15 @@ Same code runs on:
 
 Usage:
     # Advisory mode - show recommendations, don't apply
-    python inav_autotune.py /dev/ttyACM0 --frame 5 --blades 3
+    python3 -m inav_toolkit.autotune /dev/ttyACM0 --frame 5 --blades 3
 
     # Auto mode - apply changes automatically between captures
-    python inav_autotune.py /dev/ttyACM0 --frame 10 --blades 2 --auto
+    python3 -m inav_toolkit.autotune /dev/ttyACM0 --frame 10 --blades 2 --auto
 
     # Single analysis of an existing blackbox file (no FC connection)
-    python inav_autotune.py --file flight.bbl --frame 7
+    python3 -m inav_toolkit.autotune --file flight.bbl --frame 7
 
-Requires: inav_msp.py, inav_blackbox_analyzer.py
+Requires: inav_toolkit package (pip install inav-toolkit)
 """
 
 import argparse
@@ -37,17 +37,29 @@ log = logging.getLogger("autotune")
 # ─── Import our modules ──────────────────────────────────────────────────────
 
 try:
-    from inav_msp import INAVLink
+    from inav_toolkit.msp import INAVLink
 except ImportError:
-    INAVLink = None
+    try:
+        from inav_msp import INAVLink
+    except ImportError:
+        INAVLink = None
 
-from inav_blackbox_analyzer import (
-    get_frame_profile, parse_csv_log, analyze_noise, analyze_pid_response,
-    analyze_motors, analyze_dterm_noise, generate_action_plan,
-    analyze_motor_response, estimate_rpm_range, estimate_prop_harmonics,
-    estimate_total_phase_lag, config_has_pid, config_has_filters,
-    AXIS_NAMES, REPORT_VERSION,
-)
+try:
+    from inav_toolkit.blackbox_analyzer import (
+        get_frame_profile, parse_csv_log, analyze_noise, analyze_pid_response,
+        analyze_motors, analyze_dterm_noise, generate_action_plan,
+        analyze_motor_response, estimate_rpm_range, estimate_prop_harmonics,
+        estimate_total_phase_lag, config_has_pid, config_has_filters,
+        AXIS_NAMES, REPORT_VERSION,
+    )
+except ImportError:
+    from inav_blackbox_analyzer import (
+        get_frame_profile, parse_csv_log, analyze_noise, analyze_pid_response,
+        analyze_motors, analyze_dterm_noise, generate_action_plan,
+        analyze_motor_response, estimate_rpm_range, estimate_prop_harmonics,
+        estimate_total_phase_lag, config_has_pid, config_has_filters,
+        AXIS_NAMES, REPORT_VERSION,
+    )
 
 
 # ─── Safety Clamps ───────────────────────────────────────────────────────────
@@ -257,19 +269,19 @@ def main():
         epilog="""
 Examples:
   # Bench mode: FC connected via USB, analyze a blackbox file
-  python inav_autotune.py /dev/ttyACM0 --file flight.bbl --frame 5
+  python3 -m inav_toolkit.autotune /dev/ttyACM0 --file flight.bbl --frame 5
 
   # Read current PIDs from FC and show status
-  python inav_autotune.py /dev/ttyACM0 --frame 5 --status
+  python3 -m inav_toolkit.autotune /dev/ttyACM0 --frame 5 --status
 
   # Analyze a blackbox file with FC params, show recommendations
-  python inav_autotune.py /dev/ttyACM0 --file flight.bbl --frame 10 --blades 2
+  python3 -m inav_toolkit.autotune /dev/ttyACM0 --file flight.bbl --frame 10 --blades 2
 
   # Auto-apply recommendations to FC (bench tuning with USB)
-  python inav_autotune.py /dev/ttyACM0 --file flight.bbl --frame 5 --apply
+  python3 -m inav_toolkit.autotune /dev/ttyACM0 --file flight.bbl --frame 5 --apply
 
   # Offline mode (no FC): analyze a file only
-  python inav_autotune.py --file flight.bbl --frame 7 --blades 2
+  python3 -m inav_toolkit.autotune --file flight.bbl --frame 7 --blades 2
         """)
 
     parser.add_argument("port", nargs="?", help="Serial port to FC (e.g., /dev/ttyACM0)")
@@ -323,8 +335,8 @@ Examples:
 
     if args.port:
         if INAVLink is None:
-            print("  ERROR: inav_msp.py not found or pyserial not installed")
-            print("         pip install pyserial")
+            print("  ERROR: MSP module not found or pyserial not installed")
+            print("         pip install inav-toolkit")
             sys.exit(1)
 
         fc = INAVLink(args.port)
@@ -377,7 +389,10 @@ Examples:
 
     # ── Analyze blackbox file ──
     if args.file:
-        from inav_blackbox_analyzer import parse_headers_from_bbl, decode_blackbox, extract_fc_config
+        try:
+            from inav_toolkit.blackbox_analyzer import parse_headers_from_bbl, decode_blackbox, extract_fc_config
+        except ImportError:
+            from inav_blackbox_analyzer import parse_headers_from_bbl, decode_blackbox, extract_fc_config
         import shutil
 
         logfile = args.file

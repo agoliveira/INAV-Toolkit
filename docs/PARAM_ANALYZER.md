@@ -10,29 +10,29 @@ The INAV Parameter Analyzer validates `diff all` configuration exports for safet
 
 ```bash
 # Basic analysis
-python3 inav_param_analyzer.py my_diff.txt
+inav-params my_diff.txt
 
 # With frame size for tailored filter/PID recommendations
-python3 inav_param_analyzer.py my_diff.txt --frame 10
+inav-params my_diff.txt --frame 10
 
 # Cross-reference with blackbox analyzer results
-python3 inav_param_analyzer.py my_diff.txt --blackbox state.json
+inav-params my_diff.txt --blackbox state.json
 
 # JSON output for automation
-python3 inav_param_analyzer.py my_diff.txt --json
+inav-params my_diff.txt --json
 ```
 
 ### Setup Mode
 
 ```bash
 # Generate starting config for a new build
-python3 inav_param_analyzer.py --setup 10 --voltage 6S
+inav-params --setup 10 --voltage 6S
 
 # Compare with existing config
-python3 inav_param_analyzer.py --setup 10 --voltage 6S my_diff.txt
+inav-params --setup 10 --voltage 6S my_diff.txt
 
 # JSON output
-python3 inav_param_analyzer.py --setup 10 --voltage 6S --json
+inav-params --setup 10 --voltage 6S --json
 ```
 
 ## Getting a `diff all` File
@@ -45,7 +45,7 @@ In INAV Configurator:
 Or via command line if you have serial access:
 ```bash
 # The analyzer can also read from stdin
-echo "diff all" | picocom /dev/ttyACM0 -b 115200 | python3 inav_param_analyzer.py -
+echo "diff all" | picocom /dev/ttyACM0 -b 115200 | inav-params -
 ```
 
 ## Severity Levels

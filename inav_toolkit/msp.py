@@ -13,7 +13,7 @@ MSP v2 frame format:
   $X>  flag(u8)  cmd(u16 LE)  size(u16 LE)  payload  crc8
 
 Usage:
-    from inav_msp import INAVDevice, auto_detect_fc
+    from inav_toolkit.msp import INAVDevice, auto_detect_fc
 
     fc, info = auto_detect_fc()  # works on Linux, macOS, Windows
     if fc:
@@ -33,7 +33,7 @@ try:
 except ImportError:
     serial = None  # Checked in open()
 
-VERSION = "1.0.0"
+VERSION = "2.14.0"
 
 # ─── MSP Command IDs ─────────────────────────────────────────────────────────
 
@@ -1077,7 +1077,7 @@ def main():
 
             if filepath:
                 print(f"\n  Ready to analyze:")
-                print(f"    python3 inav_blackbox_analyzer.py {filepath}")
+                print(f"    inav-analyze {filepath}")
         else:
             # No dataflash - check what blackbox device is configured
             bb_config = fc.get_blackbox_config()
@@ -1089,7 +1089,7 @@ def main():
                 print(f"    - Remove the SD card and copy .bbl files, or")
                 print(f"    - Type 'msc' in INAV Configurator CLI to mount as USB drive")
                 print(f"  Then run the analyzer on the file directly:")
-                print(f"    python3 inav_blackbox_analyzer.py <file.bbl>")
+                print(f"    inav-analyze <file.bbl>")
             elif bb_config and bb_config["device"] == BB_DEVICE_SERIAL:
                 print(f"  Blackbox:   serial (external logger)")
                 print(f"  {'─' * 50}")
