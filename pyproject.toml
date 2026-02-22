@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inav-toolkit"
-version = "2.14.0"
+version = "2.14.1"
 description = "Blackbox analyzer, parameter checker, and tuning wizard for INAV flight controllers"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "GPL3"}
 requires-python = ">=3.8"
 keywords = ["inav", "drone", "blackbox", "pid", "tuning", "flight-controller", "multirotor"]
 classifiers = [
