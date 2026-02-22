@@ -166,8 +166,4 @@ For PID analysis:
 4. Yaw snaps left/right (3-4 each)
 5. Throttle punch-outs and chops (2-3 each)
 
-For navigation analysis (future):
-1. Altitude hold hover, 30 seconds
-2. Position hold, 30 seconds
-3. Fly out 100-200m, trigger RTH
-4. Let it complete the full return and landing
+For navigation analysis, see [NAV_ANALYZER.md](NAV_ANALYZER.md).
