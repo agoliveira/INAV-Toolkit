@@ -20,7 +20,38 @@ import locale as _locale_mod
 
 _catalogs = {}       # lang -> {key: translated_string}
 _active_locale = "en"
-_locales_dir = os.path.join(os.path.dirname(__file__), "locales")
+
+
+def _find_locales_dir():
+    """Find the locales directory, trying multiple strategies."""
+    # Strategy 1: relative to this file (works for editable installs and source runs)
+    candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), "locales")
+    if os.path.isdir(candidate) and any(f.endswith(".json") for f in os.listdir(candidate)):
+        return candidate
+
+    # Strategy 2: importlib.resources (works for installed wheels, Python 3.9+)
+    try:
+        from importlib.resources import files
+        pkg_dir = str(files("inav_toolkit"))
+        candidate = os.path.join(pkg_dir, "locales")
+        if os.path.isdir(candidate):
+            return candidate
+    except (ImportError, TypeError, ModuleNotFoundError):
+        pass
+
+    # Strategy 3: walk up from __file__ looking for locales/en.json
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(3):
+        candidate = os.path.join(here, "locales")
+        if os.path.isdir(candidate):
+            return candidate
+        here = os.path.dirname(here)
+
+    # Fallback: return the expected path even if missing (will just produce empty catalogs)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "locales")
+
+
+_locales_dir = _find_locales_dir()
 
 
 def _load_catalog(lang):
