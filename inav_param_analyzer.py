@@ -103,129 +103,259 @@ COMMON_MOTOR_POLES = {14: "most standard motors", 12: "some smaller motors"}
 # of a 7". PID gains must scale down accordingly.
 
 FRAME_PROFILES = {
+    # ── 5-inch baseline ─────────────────────────────────────────────────
+    # Sources:
+    #   - INAV 9 firmware defaults (settings.yaml / pid.c)
+    #   - INAV configurator 5" preset (GitHub issue #167)
+    #   - INAV Settings.md: dterm_lpf "100 should work best with 5-inch"
+    #   - INAV Settings.md: dyn_notch_min "default 150 works best with 5\""
+    5: {
+        "name": "5-inch racer / freestyle",
+        "description": "Standard FPV size. 2306-2207 motors, 4S-6S.",
+        "typical_auw": "350-700g",
+        "typical_motors": "2207, 2306, 2405",
+        "pids": {
+            "mc_p_pitch": 44, "mc_i_pitch": 75, "mc_d_pitch": 28,
+            "mc_cd_pitch": 60,
+            "mc_p_roll": 40, "mc_i_roll": 60, "mc_d_roll": 26,
+            "mc_cd_roll": 60,
+            "mc_p_yaw": 45, "mc_i_yaw": 80, "mc_d_yaw": 0,
+        },
+        "filters": {
+            "gyro_main_lpf_hz": 110,
+            "dterm_lpf_hz": 110,
+            "dterm_lpf_type": "PT3",
+            "dynamic_gyro_notch_min_hz": 150,
+            "dynamic_gyro_notch_q": 250,
+            "dynamic_gyro_notch_mode": "3D",
+        },
+        "rates": {
+            "roll_rate": 70,
+            "pitch_rate": 70,
+            "yaw_rate": 60,
+        },
+        "other": {
+            "mc_iterm_relax": "RPY",
+            "mc_iterm_relax_cutoff": 15,
+            "d_boost_min": 0.8,
+            "d_boost_max": 1.2,
+            "antigravity_gain": 2.0,
+            "antigravity_accelerator": 5.0,
+            "tpa_rate": 20,
+            "tpa_breakpoint": 1350,
+            "rate_accel_limit_roll_pitch": 0,
+            "rate_accel_limit_yaw": 0,
+        },
+        "notes": [
+            "Close to INAV 9 defaults. Fine starting point for 5-inch builds.",
+            "Tune from here using blackbox - most 5-inch quads converge quickly.",
+        ],
+    },
+    # ── 7-inch ──────────────────────────────────────────────────────────
+    # Sources:
+    #   - INAV Settings.md: dterm_lpf "80 seems like a gold spot for 7-inch"
+    #   - INAV Settings.md: dyn_notch_min "values around 100 work fine on 7\""
+    #   - Pawel Spychalski's 7" builds (INAV core dev, community baseline)
+    #   - INAV defaults designed for 5-7", minimal changes needed at 7"
     7: {
         "name": "7-inch long-range",
         "description": "Common for long-range builds. 2807-3007 motors, 4S-6S.",
         "typical_auw": "800-1400g",
         "typical_motors": "2807, 2907, 3007",
         "pids": {
-            "mc_p_pitch": 38, "mc_i_pitch": 70, "mc_d_pitch": 23,
-            "mc_p_roll": 35, "mc_i_roll": 70, "mc_d_roll": 23,
-            "mc_p_yaw": 70, "mc_i_yaw": 50, "mc_d_yaw": 0,
+            "mc_p_pitch": 44, "mc_i_pitch": 75, "mc_d_pitch": 25,
+            "mc_cd_pitch": 60,
+            "mc_p_roll": 40, "mc_i_roll": 60, "mc_d_roll": 23,
+            "mc_cd_roll": 60,
+            "mc_p_yaw": 45, "mc_i_yaw": 80, "mc_d_yaw": 0,
         },
         "filters": {
             "gyro_main_lpf_hz": 90,
-            "dynamic_gyro_notch_min_hz": 60,
+            "dterm_lpf_hz": 80,
+            "dterm_lpf_type": "PT3",
+            "dynamic_gyro_notch_min_hz": 100,
             "dynamic_gyro_notch_q": 250,
             "dynamic_gyro_notch_mode": "3D",
         },
+        "rates": {
+            "roll_rate": 50,
+            "pitch_rate": 50,
+            "yaw_rate": 40,
+        },
         "other": {
             "mc_iterm_relax": "RPY",
+            "mc_iterm_relax_cutoff": 12,
             "d_boost_min": 0.85,
             "d_boost_max": 1.15,
             "antigravity_gain": 2.0,
             "antigravity_accelerator": 5.0,
             "tpa_rate": 20,
             "tpa_breakpoint": 1350,
+            "rate_accel_limit_roll_pitch": 0,
+            "rate_accel_limit_yaw": 0,
         },
         "notes": [
-            "7-inch is close to INAV defaults (designed for 5-7\"). PIDs are only slightly reduced.",
-            "If using triblades, reduce P by another 10-15% - they have more grip and respond faster.",
+            "INAV defaults are designed for 5-7\". Only minor changes needed.",
+            "Dterm LPF at 80Hz per INAV dev guidance. Dynamic notch min at 100Hz.",
+            "If using triblades, reduce P by 10-15% - they grip harder and respond faster.",
         ],
     },
+    # ── 10-inch ─────────────────────────────────────────────────────────
+    # Sources:
+    #   - INAV Settings.md: dyn_notch_min "60-70" for 10", dterm_lpf ~60-70Hz
+    #   - GitHub #9765 (Ivan): starting PIDs 55/75/35 for 7"+, filters -10Hz from 7"
+    #   - IntoFPV forum: P:D ratio ~1:1, iterm_relax_cutoff <10 (5 recommended)
+    #   - Community consensus: frame stiffness 7.5mm arm min, RPM filters critical
+    # Conservative starting point biased toward safe first flight.
     10: {
         "name": "10-inch long-range / cruiser",
         "description": "Long-range with large Li-ion packs. 3507-4010 motors, 4S-6S.",
         "typical_auw": "1500-2800g",
         "typical_motors": "3507, 3508, 4008, 4010",
         "pids": {
-            "mc_p_pitch": 28, "mc_i_pitch": 65, "mc_d_pitch": 18,
-            "mc_p_roll": 25, "mc_i_roll": 65, "mc_d_roll": 18,
-            "mc_p_yaw": 55, "mc_i_yaw": 45, "mc_d_yaw": 0,
+            "mc_p_pitch": 40, "mc_i_pitch": 60, "mc_d_pitch": 30,
+            "mc_cd_pitch": 40,
+            "mc_p_roll": 38, "mc_i_roll": 55, "mc_d_roll": 28,
+            "mc_cd_roll": 40,
+            "mc_p_yaw": 40, "mc_i_yaw": 60, "mc_d_yaw": 0,
         },
         "filters": {
-            "gyro_main_lpf_hz": 65,
-            "dynamic_gyro_notch_min_hz": 50,
+            "gyro_main_lpf_hz": 70,
+            "dterm_lpf_hz": 60,
+            "dterm_lpf_type": "PT3",
+            "dynamic_gyro_notch_min_hz": 65,
             "dynamic_gyro_notch_q": 250,
             "dynamic_gyro_notch_mode": "3D",
         },
+        "rates": {
+            "roll_rate": 36,
+            "pitch_rate": 36,
+            "yaw_rate": 30,
+        },
         "other": {
             "mc_iterm_relax": "RPY",
+            "mc_iterm_relax_cutoff": 8,
             "d_boost_min": 0.80,
             "d_boost_max": 1.20,
             "antigravity_gain": 2.0,
             "antigravity_accelerator": 5.0,
             "tpa_rate": 20,
             "tpa_breakpoint": 1250,
+            "rate_accel_limit_roll_pitch": 1000,
+            "rate_accel_limit_yaw": 500,
         },
         "notes": [
-            "10-inch props have roughly 4x the inertia of 7\". PIDs must be significantly lower.",
-            "Motor response is typically 40-60ms. Don't expect racing-quad responsiveness.",
-            "If heavy (>2.5kg), reduce P by another 10% and increase I by 10% for better position holding.",
+            "P:D ratio close to 1:1 on 10\" (unlike 5\" where P >> D).",
+            "Lower iterm_relax_cutoff (8) prevents bounce-back on this heavier airframe.",
+            "Rate acceleration limits prevent sudden moves that stress the frame.",
+            "Frame stiffness is critical - 7.5mm carbon arms minimum.",
+            "If heavy (>2.5kg), reduce P by 10% and raise I by 10% for better position hold.",
+            "EZ Tune is an alternative: set ez_filter_hz ~70, lower response/stability.",
         ],
     },
+    # ── 12-inch ─────────────────────────────────────────────────────────
+    # Sources:
+    #   - Extrapolated from 10" community data + physics-based scaling
+    #   - GitHub #9765: 16" Tarot flew P=44/I=45/D=36, gyro=50, dterm=40
+    #   - Noise frequencies shift down proportionally with prop diameter
+    #   - INAV Settings.md: accel limits ~360-500 dps^2 for heavy multirotors
     12: {
         "name": "12-inch heavy lifter",
         "description": "Heavy lift, cine, long endurance. 4510-5010 motors, 6S-12S.",
         "typical_auw": "2500-5000g",
         "typical_motors": "4510, 4515, 5010, 5015",
         "pids": {
-            "mc_p_pitch": 22, "mc_i_pitch": 60, "mc_d_pitch": 14,
-            "mc_p_roll": 20, "mc_i_roll": 60, "mc_d_roll": 14,
-            "mc_p_yaw": 45, "mc_i_yaw": 40, "mc_d_yaw": 0,
+            "mc_p_pitch": 32, "mc_i_pitch": 50, "mc_d_pitch": 25,
+            "mc_cd_pitch": 30,
+            "mc_p_roll": 30, "mc_i_roll": 45, "mc_d_roll": 23,
+            "mc_cd_roll": 30,
+            "mc_p_yaw": 35, "mc_i_yaw": 50, "mc_d_yaw": 0,
         },
         "filters": {
-            "gyro_main_lpf_hz": 50,
-            "dynamic_gyro_notch_min_hz": 35,
+            "gyro_main_lpf_hz": 55,
+            "dterm_lpf_hz": 45,
+            "dterm_lpf_type": "PT3",
+            "dynamic_gyro_notch_min_hz": 45,
             "dynamic_gyro_notch_q": 250,
             "dynamic_gyro_notch_mode": "3D",
         },
+        "rates": {
+            "roll_rate": 28,
+            "pitch_rate": 28,
+            "yaw_rate": 22,
+        },
         "other": {
             "mc_iterm_relax": "RPY",
+            "mc_iterm_relax_cutoff": 5,
             "d_boost_min": 0.75,
             "d_boost_max": 1.25,
             "antigravity_gain": 2.5,
             "antigravity_accelerator": 5.0,
             "tpa_rate": 15,
             "tpa_breakpoint": 1300,
+            "rate_accel_limit_roll_pitch": 500,
+            "rate_accel_limit_yaw": 250,
         },
         "notes": [
-            "12-inch props have very high inertia. Low P is essential to avoid oscillation.",
+            "Large prop inertia makes overcorrection the main risk, not sluggishness.",
             "Aerodynamic damping from large props reduces the need for D-term.",
-            "Focus on smooth flying - these quads are not designed for fast maneuvers.",
             "Higher antigravity helps maintain altitude during throttle changes with heavy payloads.",
+            "Acceleration limits are essential - sudden rate demands can flex the frame.",
+            "FC vibration isolation is critical. Use soft-mount or TPU dampers.",
+            "EZ Tune alternative: set ez_filter_hz ~55, lower response/stability.",
         ],
     },
+    # ── 15-inch ─────────────────────────────────────────────────────────
+    # Sources:
+    #   - GitHub #9765 (Ivan): gyro filters ~50Hz on 16", PIDs 44/45/36 (tuned)
+    #   - INAV Settings.md: accel limits 360/180 dps^2 for big heavy multirotors
+    #   - Physics: prop inertia ~10x that of 7", motor noise 60-120Hz range
+    #   - Conservative starting point - 16" Tarot flew P=44 but was well-tuned
     15: {
         "name": "15-inch heavy lift / cine lifter",
         "description": "Maximum endurance and payload. 5515-7015 motors, 6S-12S.",
         "typical_auw": "4000-10000g",
         "typical_motors": "5515, 6010, 6015, 7015",
         "pids": {
-            "mc_p_pitch": 16, "mc_i_pitch": 55, "mc_d_pitch": 10,
-            "mc_p_roll": 15, "mc_i_roll": 55, "mc_d_roll": 10,
-            "mc_p_yaw": 35, "mc_i_yaw": 35, "mc_d_yaw": 0,
+            "mc_p_pitch": 28, "mc_i_pitch": 45, "mc_d_pitch": 22,
+            "mc_cd_pitch": 20,
+            "mc_p_roll": 26, "mc_i_roll": 40, "mc_d_roll": 20,
+            "mc_cd_roll": 20,
+            "mc_p_yaw": 30, "mc_i_yaw": 40, "mc_d_yaw": 0,
         },
         "filters": {
-            "gyro_main_lpf_hz": 40,
-            "dynamic_gyro_notch_min_hz": 25,
+            "gyro_main_lpf_hz": 45,
+            "dterm_lpf_hz": 35,
+            "dterm_lpf_type": "PT3",
+            "dynamic_gyro_notch_min_hz": 30,
             "dynamic_gyro_notch_q": 250,
             "dynamic_gyro_notch_mode": "3D",
         },
+        "rates": {
+            "roll_rate": 20,
+            "pitch_rate": 20,
+            "yaw_rate": 18,
+        },
         "other": {
             "mc_iterm_relax": "RPY",
+            "mc_iterm_relax_cutoff": 5,
             "d_boost_min": 0.70,
             "d_boost_max": 1.30,
             "antigravity_gain": 3.0,
             "antigravity_accelerator": 5.0,
             "tpa_rate": 10,
             "tpa_breakpoint": 1300,
+            "rate_accel_limit_roll_pitch": 360,
+            "rate_accel_limit_yaw": 180,
         },
         "notes": [
-            "15-inch builds are at the edge of what INAV handles well. Very conservative PIDs.",
-            "Prop inertia is enormous - overcorrection is the main risk, not sluggishness.",
+            "Prop inertia is enormous. Overcorrection is the main risk, not sluggishness.",
             "Test in calm conditions first. Wind amplifies any PID issues on large frames.",
-            "Consider reducing looptime to 250 (4kHz) if FC supports it - more filter headroom.",
+            "Accel limits (360/180 dps^2) per INAV dev guidance for big heavy multirotors.",
+            "FC vibration isolation is critical. Use soft-mount or TPU dampers.",
+            "If oscillation persists, lower P before lowering D - unlike smaller quads.",
+            "Community data: tuned 16\" flew P=44 - room to increase once vibrations are controlled.",
+            "EZ Tune alternative: set ez_filter_hz ~45, lower response/stability significantly.",
         ],
     },
 }
@@ -263,7 +393,7 @@ def generate_setup_config(frame_inches, voltage="4S", use_case="longrange"):
         # Find nearest
         available = sorted(FRAME_PROFILES.keys())
         nearest = min(available, key=lambda x: abs(x - frame_inches))
-        print(f"  ⚠ No profile for {frame_inches}\". Using nearest: {nearest}\"")
+        print(f"  Warning: No profile for {frame_inches}\". Using nearest: {nearest}\"")
         frame_inches = nearest
 
     profile = FRAME_PROFILES[frame_inches]
@@ -276,7 +406,7 @@ def generate_setup_config(frame_inches, voltage="4S", use_case="longrange"):
         if v == 0:
             # Respect explicit zeros (e.g. yaw D = 0 on multirotors)
             pids[k] = 0
-        elif k.startswith("mc_p_") or k.startswith("mc_d_"):
+        elif k.startswith("mc_p_") or k.startswith("mc_d_") or k.startswith("mc_cd_"):
             pids[k] = max(5, round(v * scale))
         elif k.startswith("mc_i_"):
             # I-term scales less with voltage - it's about steady-state
@@ -291,6 +421,7 @@ def generate_setup_config(frame_inches, voltage="4S", use_case="longrange"):
         "v_adj": v_adj,
         "pids": pids,
         "filters": dict(profile["filters"]),
+        "rates": dict(profile.get("rates", {})),
         "other": dict(profile["other"]),
     }
 
@@ -305,65 +436,101 @@ def print_setup_report(config):
     frame = config["frame"]
     voltage = config["voltage"]
 
-    print(f"\n{B}{C}{'═'*70}{R}")
+    print(f"\n{B}{C}{'='*70}{R}")
     print(f"{B}{C}  INAV Starting Configuration - {frame}-inch ({voltage}){R}")
-    print(f"{B}{C}{'═'*70}{R}")
+    print(f"{B}{C}{'='*70}{R}")
     print(f"  {DIM}{profile['description']}{R}")
     print(f"  {DIM}Typical AUW: {profile['typical_auw']} | Motors: {profile['typical_motors']}{R}")
 
     if config["v_adj"]["pid_scale"] != 1.0:
         pct = (1.0 - config["v_adj"]["pid_scale"]) * 100
-        print(f"  {Y}Voltage adjustment: {voltage} → PIDs reduced ~{pct:.0f}%{R}")
+        print(f"  {Y}Voltage adjustment: {voltage} -> PIDs reduced ~{pct:.0f}%{R}")
 
-    print(f"\n{B}{C}{'─'*70}{R}")
-    print(f"  {B}⚠ IMPORTANT:{R}")
+    print(f"\n{B}{C}{'-'*70}{R}")
+    print(f"  {B}IMPORTANT:{R}")
     print(f"  {DIM}These are CONSERVATIVE starting values - safe for first hover.{R}")
     print(f"  {DIM}The quad may feel sluggish. That's intentional.{R}")
     print(f"  {DIM}Fly, log blackbox data, then use the blackbox analyzer to refine.{R}")
-    print(f"{B}{C}{'─'*70}{R}")
+    print(f"{B}{C}{'-'*70}{R}")
 
     # PID table
     pids = config["pids"]
-    print(f"\n  {B}STARTING PIDs:{R}")
-    print(f"             {'P':>5}  {'I':>5}  {'D':>5}")
-    for axis in ("roll", "pitch", "yaw"):
-        p = pids.get(f"mc_p_{axis}", "-")
-        i = pids.get(f"mc_i_{axis}", "-")
-        d = pids.get(f"mc_d_{axis}", "-")
-        print(f"    {axis.capitalize():6}   {p:>5}  {i:>5}  {d:>5}")
+    has_cd = any(k.startswith("mc_cd_") for k in pids)
+    if has_cd:
+        print(f"\n  {B}STARTING PIDs:{R}")
+        print(f"             {'P':>5}  {'I':>5}  {'D':>5}  {'CD':>5}")
+        for axis in ("roll", "pitch", "yaw"):
+            p = pids.get(f"mc_p_{axis}", "-")
+            i = pids.get(f"mc_i_{axis}", "-")
+            d = pids.get(f"mc_d_{axis}", "-")
+            cd = pids.get(f"mc_cd_{axis}", "-")
+            print(f"    {axis.capitalize():6}   {p:>5}  {i:>5}  {d:>5}  {cd:>5}")
+    else:
+        print(f"\n  {B}STARTING PIDs:{R}")
+        print(f"             {'P':>5}  {'I':>5}  {'D':>5}")
+        for axis in ("roll", "pitch", "yaw"):
+            p = pids.get(f"mc_p_{axis}", "-")
+            i = pids.get(f"mc_i_{axis}", "-")
+            d = pids.get(f"mc_d_{axis}", "-")
+            print(f"    {axis.capitalize():6}   {p:>5}  {i:>5}  {d:>5}")
 
     # Filters
-    print(f"\n  {B}FILTERS:{R}")
     f = config["filters"]
+    print(f"\n  {B}FILTERS:{R}")
     print(f"    Gyro LPF:           {f['gyro_main_lpf_hz']}Hz")
+    dterm_lpf = f.get("dterm_lpf_hz")
+    dterm_type = f.get("dterm_lpf_type", "")
+    if dterm_lpf:
+        type_str = f" ({dterm_type})" if dterm_type else ""
+        print(f"    D-term LPF:         {dterm_lpf}Hz{type_str}")
     print(f"    Dynamic notch:      {f['dynamic_gyro_notch_mode']} (Q={f['dynamic_gyro_notch_q']}, min={f['dynamic_gyro_notch_min_hz']}Hz)")
+
+    # Rates
+    rates = config.get("rates", {})
+    if rates:
+        rr = rates.get("roll_rate", "?")
+        pr = rates.get("pitch_rate", "?")
+        yr = rates.get("yaw_rate", "?")
+        # INAV rates are in deca-degrees/sec, so rate 36 = 360 deg/s
+        print(f"\n  {B}RATES:{R}")
+        print(f"    Roll:  {rr} ({rr*10} deg/s)  |  Pitch:  {pr} ({pr*10} deg/s)  |  Yaw:  {yr} ({yr*10} deg/s)")
 
     # Other settings
     print(f"\n  {B}RECOMMENDED SETTINGS:{R}")
     o = config["other"]
-    print(f"    I-term relax:       {o['mc_iterm_relax']}")
-    print(f"    D-boost:            {o['d_boost_min']:.2f} – {o['d_boost_max']:.2f}")
+    relax_cutoff = o.get("mc_iterm_relax_cutoff")
+    cutoff_str = f" (cutoff: {relax_cutoff})" if relax_cutoff else ""
+    print(f"    I-term relax:       {o['mc_iterm_relax']}{cutoff_str}")
+    print(f"    D-boost:            {o['d_boost_min']:.2f} - {o['d_boost_max']:.2f}")
     print(f"    Antigravity:        {o['antigravity_gain']:.1f} (accel: {o['antigravity_accelerator']:.1f})")
     print(f"    TPA:                {o['tpa_rate']}% above {o['tpa_breakpoint']}")
+
+    accel_rp = o.get("rate_accel_limit_roll_pitch", 0)
+    accel_y = o.get("rate_accel_limit_yaw", 0)
+    if accel_rp > 0 or accel_y > 0:
+        rp_str = f"{accel_rp} dps^2" if accel_rp > 0 else "OFF"
+        y_str = f"{accel_y} dps^2" if accel_y > 0 else "OFF"
+        print(f"    Accel limits:       Roll/Pitch: {rp_str}  |  Yaw: {y_str}")
 
     # Notes
     if profile["notes"]:
         print(f"\n  {B}NOTES:{R}")
         for note in profile["notes"]:
-            print(f"    {DIM}• {note}{R}")
+            print(f"    {DIM}* {note}{R}")
 
     if config["v_adj"]["notes"]:
-        print(f"    {DIM}• {config['v_adj']['notes']}{R}")
+        print(f"    {DIM}* {config['v_adj']['notes']}{R}")
 
     # CLI commands
-    print(f"\n{B}{C}{'─'*70}{R}")
+    print(f"\n{B}{C}{'-'*70}{R}")
     print(f"  {B}INAV CLI - paste into Configurator CLI tab:{R}")
-    print(f"{B}{C}{'─'*70}{R}")
+    print(f"{B}{C}{'-'*70}{R}")
     print()
 
     all_settings = {}
     all_settings.update(config["pids"])
     all_settings.update(config["filters"])
+    all_settings.update(config.get("rates", {}))
     all_settings.update(config["other"])
 
     for k, v in all_settings.items():
@@ -373,7 +540,7 @@ def print_setup_report(config):
             print(f"    {G}set {k} = {v}{R}")
     print(f"    {G}save{R}")
 
-    print(f"\n{B}{C}{'═'*70}{R}\n")
+    print(f"\n{B}{C}{'='*70}{R}\n")
 
 
 def print_setup_json(config):
@@ -385,6 +552,7 @@ def print_setup_json(config):
         "description": config["profile"]["description"],
         "pids": config["pids"],
         "filters": config["filters"],
+        "rates": config.get("rates", {}),
         "other": config["other"],
         "notes": config["profile"]["notes"],
         "voltage_notes": config["v_adj"]["notes"],
@@ -887,15 +1055,21 @@ def check_filters(parsed, frame_inches=None):
             current=f"{dyn_notch_mode}"))
 
         if isinstance(dyn_notch_min, (int, float)):
-            if frame_inches and frame_inches >= 8 and dyn_notch_min > 60:
+            # INAV docs: 150 for 5", 100 for 7", 60-70 for 10"
+            expected_max = {5: 180, 7: 120, 10: 80, 12: 60, 15: 45}
+            nearest_size = min(expected_max.keys(), key=lambda x: abs(x - frame_inches))
+            max_thresh = expected_max[nearest_size]
+            if frame_inches >= 8 and dyn_notch_min > max_thresh:
+                rec = max_thresh - 10
                 findings.append(Finding(
                     INFO, "Filters", f"Dynamic notch min_hz = {dyn_notch_min}Hz - may miss low-freq noise",
                     f"Large props can produce harmonics below {dyn_notch_min}Hz. "
-                    f"Consider lowering to 40-50Hz for {frame_inches}-inch.",
+                    f"INAV docs recommend lower values for {frame_inches}-inch. "
+                    f"Consider lowering to {rec}-{max_thresh}Hz.",
                     setting="dynamic_gyro_notch_min_hz",
                     current=str(dyn_notch_min),
-                    recommended="40-50",
-                    cli_fix=f"set dynamic_gyro_notch_min_hz = 50"))
+                    recommended=f"{rec}-{max_thresh}",
+                    cli_fix=f"set dynamic_gyro_notch_min_hz = {rec}"))
     else:
         findings.append(Finding(
             WARNING, "Filters", "Dynamic notch filter is OFF",
@@ -906,6 +1080,31 @@ def check_filters(parsed, frame_inches=None):
             current="OFF",
             recommended="3D",
             cli_fix="set dynamic_gyro_notch_mode = 3D"))
+
+    # D-term LPF
+    dterm_lpf = get_setting(parsed, "dterm_lpf_hz", 110)
+    if isinstance(dterm_lpf, (int, float)) and frame_inches:
+        # Expected ranges per frame size from INAV dev guidance and community data
+        expected = {5: (90, 150), 7: (70, 100), 10: (45, 75), 12: (35, 60), 15: (25, 45)}
+        nearest = min(expected.keys(), key=lambda x: abs(x - frame_inches))
+        low, high = expected[nearest]
+        if dterm_lpf > high + 20:
+            findings.append(Finding(
+                WARNING, "Filters", f"D-term LPF at {dterm_lpf}Hz - high for {frame_inches}-inch",
+                f"Large props generate lower-frequency noise that feeds through D-term. "
+                f"For {frame_inches}-inch, {low}-{high}Hz is typical. "
+                f"High D-term filtering lets motor noise through and causes hot motors.",
+                setting="dterm_lpf_hz",
+                current=str(dterm_lpf),
+                recommended=f"{low}-{high}",
+                cli_fix=f"set dterm_lpf_hz = {(low + high) // 2}"))
+        elif dterm_lpf < low - 15:
+            findings.append(Finding(
+                INFO, "Filters", f"D-term LPF at {dterm_lpf}Hz - conservative for {frame_inches}-inch",
+                f"This adds more phase lag than needed. For {frame_inches}-inch, {low}-{high}Hz "
+                f"is typical. Higher values reduce delay and improve prop wash handling.",
+                setting="dterm_lpf_hz",
+                current=str(dterm_lpf)))
 
     # Setpoint Kalman
     if isinstance(kalman_q, (int, float)):
@@ -956,6 +1155,24 @@ def check_pid_config(parsed, frame_inches=None):
             setting="mc_iterm_relax",
             current="RP",
             recommended="RPY"))
+
+    # I-term relax cutoff - critical for large quads
+    relax_cutoff = profile.get("mc_iterm_relax_cutoff",
+                               get_setting(parsed, "mc_iterm_relax_cutoff", 15))
+    if isinstance(relax_cutoff, (int, float)) and frame_inches and frame_inches >= 9:
+        if relax_cutoff > 10:
+            recommended_cutoff = 8 if frame_inches <= 10 else 5
+            findings.append(Finding(
+                WARNING, "PID",
+                f"I-term relax cutoff = {relax_cutoff} - high for {frame_inches}-inch",
+                f"Large quads need lower iterm_relax_cutoff to prevent bounce-back. "
+                f"The default of 15 works for 5\", but {frame_inches}\" builds "
+                f"need {recommended_cutoff} or lower. High cutoff lets I-term build "
+                f"during maneuvers, causing overshoot on heavy airframes.{ez_note}",
+                setting="mc_iterm_relax_cutoff",
+                current=str(relax_cutoff),
+                recommended=str(recommended_cutoff),
+                cli_fix=f"set mc_iterm_relax_cutoff = {recommended_cutoff}"))
 
     # D-boost
     d_boost_min = profile.get("d_boost_min", get_setting(parsed, "d_boost_min", 1.0))
@@ -1008,6 +1225,24 @@ def check_pid_config(parsed, frame_inches=None):
                 setting="tpa_breakpoint",
                 current=str(tpa_bp),
                 recommended="1350-1500"))
+
+    # Rate acceleration limits - important for large quads
+    if frame_inches and frame_inches >= 9:
+        accel_rp = get_setting(parsed, "rate_accel_limit_roll_pitch", 0)
+        accel_yaw = get_setting(parsed, "rate_accel_limit_yaw", 0)
+        if isinstance(accel_rp, (int, float)) and accel_rp == 0:
+            rec = 500 if frame_inches <= 10 else 360
+            findings.append(Finding(
+                INFO, "PID",
+                f"No roll/pitch acceleration limit set for {frame_inches}-inch quad",
+                f"Large quads benefit from rate acceleration limits to prevent sudden "
+                f"rate demands that stress the frame and overwhelm the motors. "
+                f"INAV devs recommend ~360 dps^2 for big heavy multirotors. "
+                f"A value around {rec} is a good starting point for {frame_inches}\".{ez_note}",
+                setting="rate_accel_limit_roll_pitch",
+                current="0 (unlimited)",
+                recommended=str(rec),
+                cli_fix=f"set rate_accel_limit_roll_pitch = {rec}"))
 
     # EZ Tune cross-check (only relevant if EZ Tune is actually active)
     if ez_active:

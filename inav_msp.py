@@ -878,6 +878,74 @@ class INAVDevice:
         """
         return self.cli_command("diff all", timeout=timeout)
 
+    def cli_batch(self, commands, timeout=5.0, save=True):
+        """Send multiple CLI commands in a single CLI session.
+
+        Enters CLI mode once, sends all commands, optionally saves,
+        then exits. Much faster than calling cli_command() per line.
+
+        Args:
+            commands: List of CLI command strings (e.g., ['set mc_p_roll = 28'])
+            timeout: Max seconds to wait per command response
+            save: If True, sends 'save' after all commands
+
+        Returns:
+            List of (command, response) tuples
+        """
+        ser = self._ser
+
+        # Flush any pending data
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+
+        # Enter CLI mode
+        ser.write(b"#")
+        time.sleep(0.3)
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+
+        results = []
+        all_cmds = list(commands)
+        if save:
+            all_cmds.append("save")
+
+        for cmd in all_cmds:
+            ser.write((cmd + "\n").encode("ascii"))
+            time.sleep(0.05)
+
+            # Read until prompt
+            buf = b""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if ser.in_waiting:
+                    buf += ser.read(ser.in_waiting)
+                    if buf.rstrip().endswith(b"#") or buf.endswith(b"# "):
+                        break
+                else:
+                    time.sleep(0.01)
+
+            try:
+                text = buf.decode("ascii", errors="replace")
+            except Exception:
+                text = ""
+
+            # Clean response
+            lines = []
+            for line in text.splitlines():
+                line = line.rstrip()
+                if line == cmd or line == "#" or line == "# ":
+                    continue
+                lines.append(line)
+            results.append((cmd, "\n".join(lines).strip()))
+
+        # Exit CLI mode
+        ser.write(b"exit\n")
+        time.sleep(0.5)
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+
+        return results
+
 
 # ─── CLI Entrypoint ──────────────────────────────────────────────────────────
 

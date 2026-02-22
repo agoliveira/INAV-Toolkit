@@ -2,6 +2,24 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-02-22] - Toolkit v2.14.0
+
+### Added
+- **Guided session wizard** (`inav_toolkit.py`): Interactive orchestrator for the full tuning workflow. Four connected-FC flows (tune, nav check, new build safety check, download) plus offline analysis. Tracks score progression across sessions, extracts CLI commands from analysis results, applies changes via MSP batch mode.
+- **Backup/restore safety system**: Before first change is applied, wizard pulls a full `diff all` backup with header metadata (craft, firmware, board, timestamp). Restore available mid-session, on quit, or standalone from main menu. Manual restore instructions embedded in backup file. Hard-stops session if backup fails.
+- **MSP CLI batch mode** (`cli_batch()` in `inav_msp.py`): Enters CLI mode once, sends all commands, saves, exits. Eliminates per-command CLI enter/exit overhead for applying tuning changes.
+- **Restore from backup flow**: Main menu option to browse and restore from previous backup files, with auto-discovery and reconnect handling after FC reboot.
+
+### Changed
+- **Param analyzer frame profiles revised** (research-validated):
+  - Added 5" and 7" profiles (previously only 10"+). 5" matches INAV 9 firmware defaults.
+  - 10" profile: PIDs raised from P=28/D=18 to P=40/D=30 based on community data (GitHub #9765, IntoFPV). I gains raised to 60/55. dterm_lpf_hz=60, dyn_notch_min=65Hz (INAV docs midpoint). Added iterm_relax_cutoff=8, rate_accel_limit=1000/500, CD terms, rates.
+  - 12" profile: dterm_lpf_hz=45 (PT3), dyn_notch_min=45Hz, accel limits 500/250, CD terms added.
+  - 15" profile: PIDs raised from P=25/D=20 to P=28/D=22. Yaw P raised to 30. Community note about tuned 16" flying P=44. Accel limits 360/180 per INAV dev guidance.
+  - All profiles: Added source annotations citing INAV Settings.md, GitHub discussions, community blackbox data. Added EZ Tune alternative notes. Added dterm_lpf_type=PT3.
+- **Dynamic notch min_hz analysis**: Now size-specific thresholds (80Hz for 10", 60Hz for 12", 45Hz for 15") instead of blanket 8"+ check.
+- **D-term LPF analysis**: Added expected range table per frame size from INAV docs and community data. Flags both too-high and too-low values.
+
 ## [2026-02-22] - Blackbox Analyzer v2.13.0
 
 ### Added
