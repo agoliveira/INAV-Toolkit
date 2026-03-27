@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.15.1
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.16.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.15.1"
+REPORT_VERSION = "2.16.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -2388,14 +2388,15 @@ def fingerprint_noise(noise_results, config, prop_harmonics=None):
     }
 
 
-def format_noise_fingerprint_terminal(fp, colors=None):
-    """Format noise fingerprint results for terminal display."""
+def format_noise_fingerprint_terminal(fp, colors=None, max_show=3):
+    """Format noise fingerprint results for terminal display.
+
+    Groups peaks by source type, shows the top `max_show` most significant,
+    and collapses the rest into a summary line. Deduplicates remedies.
+    """
     if not fp["peaks"]:
         return ""
     R, B, C, G, Y, RED, DIM = colors or _colors()
-
-    lines = []
-    lines.append(f"\n  {B}NOISE SOURCES:{R}")
 
     source_icons = {
         "prop_harmonics": "⚙", "motor_imbalance": "⚖", "structural": "🔧",
@@ -2404,18 +2405,64 @@ def format_noise_fingerprint_terminal(fp, colors=None):
         "high_freq_noise": "⚡", "unknown": "?",
     }
 
-    for p in sorted(fp["peaks"], key=lambda x: x["power_db"], reverse=True):
-        icon = source_icons.get(p["source"], "?")
-        power_color = RED if p["power_db"] > -10 else Y if p["power_db"] > -20 else DIM
-        conf = f" [{p['confidence']}]" if p["confidence"] != "high" else ""
-        axes_str = "/".join(p["axes"])
+    # Group peaks by source type
+    by_source = {}
+    for p in fp["peaks"]:
+        src = p["source"]
+        by_source.setdefault(src, []).append(p)
+
+    # Build display items: one line per source group, sorted by worst peak power
+    groups = []
+    for src, peaks in by_source.items():
+        peaks_sorted = sorted(peaks, key=lambda x: x["power_db"], reverse=True)
+        worst = peaks_sorted[0]
+        freqs = sorted(set(int(p["freq_hz"]) for p in peaks_sorted))
+        all_axes = sorted(set(ax for p in peaks_sorted for ax in p["axes"]))
+        groups.append({
+            "source": src,
+            "icon": source_icons.get(src, "?"),
+            "power_db": worst["power_db"],
+            "freqs": freqs,
+            "axes": all_axes,
+            "confidence": worst["confidence"],
+            "remedy": worst.get("remedy", ""),
+            "count": len(peaks_sorted),
+        })
+
+    groups.sort(key=lambda x: x["power_db"], reverse=True)
+
+    lines = []
+    lines.append(f"\n  {B}NOISE SOURCES:{R}")
+
+    shown = groups[:max_show]
+    hidden = groups[max_show:]
+
+    for g in shown:
+        power_color = RED if g["power_db"] > -10 else Y if g["power_db"] > -20 else DIM
+        conf = f" [{g['confidence']}]" if g["confidence"] != "high" else ""
+        axes_str = "/".join(g["axes"])
+        label = g["source"].replace("_", " ")
+
+        # Show frequency list compactly
+        if len(g["freqs"]) <= 3:
+            freq_str = ", ".join(f"{f}Hz" for f in g["freqs"])
+        else:
+            freq_str = f"{g['freqs'][0]}-{g['freqs'][-1]}Hz ({g['count']} peaks)"
+
         lines.append(
-            f"    {icon} {power_color}{p['freq_hz']:.0f}Hz{R} ({p['power_db']:.0f}dB, {axes_str}) "
-            f"{DIM}{p['source'].replace('_', ' ')}{conf}{R}")
-        if p["detail"]:
-            lines.append(f"      {DIM}{p['detail']}{R}")
-        if p.get("remedy"):
-            lines.append(f"      {G}→ {p['remedy']}{R}")
+            f"    {g['icon']} {power_color}{freq_str}{R} {DIM}{label} on {axes_str}{conf}{R}")
+        if g["remedy"]:
+            # Truncate long remedies to one line
+            remedy = g["remedy"]
+            if len(remedy) > 90:
+                remedy = remedy[:87] + "..."
+            lines.append(f"      {G}→ {remedy}{R}")
+
+    if hidden:
+        n_hidden = sum(g["count"] for g in hidden)
+        hidden_sources = set(g["source"].replace("_", " ") for g in hidden)
+        lines.append(f"    {DIM}  + {n_hidden} more peak{'s' if n_hidden > 1 else ''} "
+                     f"({', '.join(hidden_sources)}){R}")
 
     return "\n".join(lines)
 
@@ -4799,28 +4846,66 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
     vc = {"DIALED_IN": G, "NEARLY_THERE": G, "GETTING_BETTER": Y, "NEEDS_WORK": Y, "ROUGH": RED, "NEED_DATA": Y, "GROUND_ONLY": DIM}
     print(f"\n  {B}{vc.get(plan['verdict'],C)}▸ {plan['verdict_text']}{R}")
 
-    # Narrative (on by default)
-    if show_narrative and profile:
-        narrative = generate_narrative(plan, pid_results, motor_analysis, noise_results, config, data, profile)
-        print(f"\n  {DIM}{'─'*68}{R}")
-        import textwrap
-        for line in textwrap.wrap(narrative, width=66):
-            print(f"  {DIM}{line}{R}")
-
-    if config_has_pid(config):
-        print(f"\n  {B}CURRENT CONFIG:{R}")
-        for ax in ["roll","pitch","yaw"]:
-            print(f"    {ax.capitalize():6s} P={config.get(f'{ax}_p','?'):>3}  I={config.get(f'{ax}_i','?'):>3}  D={config.get(f'{ax}_d','?'):>3}")
-        if config_has_filters(config):
-            print(f"    Gyro LPF: {config.get('gyro_lowpass_hz','?')}Hz  D-term LPF: {config.get('dterm_lpf_hz','?')}Hz")
-
-    # Show diff mismatches (FC config differs from what was flying)
+    # ── Config mismatch warning (show early if significant) ──
     mismatches = config.get("_diff_mismatches", [])
+    if len(mismatches) >= 3:
+        print(f"\n  {RED}{B}⚠ STALE DATA:{R} {Y}FC config has changed since this flight "
+              f"({len(mismatches)} parameters differ).{R}")
+        print(f"  {DIM}  Analysis reflects what was flying, not the current FC config.{R}")
+        print(f"  {DIM}  Fly again to get analysis of your current tune.{R}")
+
+    # ── Current config + mismatches (compact) ──
+    if config_has_pid(config):
+        print(f"\n  {B}CONFIG:{R}", end="")
+        if mismatches:
+            print(f"  {DIM}(from blackbox headers — what was actually flying){R}")
+        else:
+            print()
+        for ax in ["roll","pitch","yaw"]:
+            pid_line = f"    {ax.capitalize():6s} P={config.get(f'{ax}_p','?'):>3}  I={config.get(f'{ax}_i','?'):>3}  D={config.get(f'{ax}_d','?'):>3}"
+            # Show FC-current values inline if different
+            changed = []
+            for param in ['p', 'i', 'd']:
+                key = f"{ax}_{param}"
+                for mk, bb_val, diff_val in mismatches:
+                    if mk == key:
+                        changed.append(f"{param.upper()}→{diff_val}")
+            if changed:
+                pid_line += f"  {Y}(FC now: {', '.join(changed)}){R}"
+            print(pid_line)
+        if config_has_filters(config):
+            filt_line = f"    Gyro LPF: {config.get('gyro_lowpass_hz','?')}Hz  D-term LPF: {config.get('dterm_lpf_hz','?')}Hz"
+            filt_changes = []
+            for mk, bb_val, diff_val in mismatches:
+                if mk in ('gyro_lowpass_hz', 'dterm_lpf_hz'):
+                    label = 'Gyro' if 'gyro' in mk else 'D-term'
+                    filt_changes.append(f"{label}→{diff_val}Hz")
+            if filt_changes:
+                filt_line += f"  {Y}(FC now: {', '.join(filt_changes)}){R}"
+            print(filt_line)
+
+    # Show remaining mismatches not already shown inline (motor protocol, etc.)
     if mismatches:
-        print(f"\n  {Y}⚠ FC config differs from blackbox (changed after flight?):{R}")
-        for key, bb_val, diff_val in mismatches:
-            label = key.replace("_", " ").title()
-            print(f"    {DIM}{label}: {bb_val} (in flight) → {diff_val} (on FC now){R}")
+        shown_inline = set()
+        for ax in ["roll","pitch","yaw"]:
+            for param in ['p', 'i', 'd']:
+                shown_inline.add(f"{ax}_{param}")
+        shown_inline.update(['gyro_lowpass_hz', 'dterm_lpf_hz'])
+        remaining = [(k, bb, fc) for k, bb, fc in mismatches if k not in shown_inline]
+        if remaining:
+            for key, bb_val, diff_val in remaining:
+                label = key.replace("_", " ").title()
+                print(f"    {DIM}{label}: {bb_val} → {diff_val} (on FC){R}")
+
+    # Narrative (skip if config is stale — it would just confuse)
+    if show_narrative and profile and len(mismatches) < 3:
+        narrative = generate_narrative(plan, pid_results, motor_analysis, noise_results, config, data, profile)
+        # Only show if it adds something beyond the verdict line
+        if len(narrative) > len(plan.get('verdict_text', '')) + 20:
+            print(f"\n  {DIM}{'─'*68}{R}")
+            import textwrap
+            for line in textwrap.wrap(narrative, width=66):
+                print(f"  {DIM}{line}{R}")
 
     # Informational items (not actions)
     info_items = plan.get("info", [])
@@ -5848,7 +5933,7 @@ def count_blackbox_logs(filepath):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.15.1 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.16.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -6268,15 +6353,24 @@ def _process_multi_log(log_files, args, diff_raw):
         score = s.get("score")
         dur = s.get("duration", 0)
         idle = s.get("idle", False)
+        verdict = s.get("verdict", "")
 
-        sc_str = f"{score:.0f}/100" if score is not None else "     -"
-        sc_c = G if (score or 0) >= 85 else Y if (score or 0) >= 60 else RED if score is not None else DIM
-        dur_str = f"{dur:.1f}s" if dur else "?"
+        # Don't show 0/100 for bad/ground data — use dash
+        if verdict in ("UNUSABLE", "GROUND_ONLY") or (score is not None and score == 0):
+            sc_str = "     —"
+            sc_c = DIM
+        elif score is not None:
+            sc_str = f"{score:.0f}/100"
+            sc_c = G if score >= 85 else Y if score >= 60 else RED
+        else:
+            sc_str = "     —"
+            sc_c = DIM
+        dur_str = f"{dur:.1f}s" if dur and dur > 0.1 else "  <1s" if dur else "    —"
 
         if idle:
             status = f"{DIM}idle/ground{R}"
         else:
-            status = _verdict_short(s.get("verdict", ""))
+            status = _verdict_short(verdict)
 
         notes = ""
         if i == best_idx:
@@ -6304,11 +6398,18 @@ def _process_multi_log(log_files, args, diff_raw):
     if n_idle > 0:
         print(f"\n  {DIM}{n_idle} ground segment{'s' if n_idle > 1 else ''} skipped "
               f"(armed but no flight){R}")
-    if multi_session:
+    if n_current == 0 and current_fp:
+        # All flights predate the current config
+        print(f"\n  {Y}{B}⚠ All flights on flash predate your current FC config.{R}")
+        print(f"  {DIM}  Erase flash and fly again for analysis of your current tune.{R}")
+        print(f"  {DIM}  Showing best available flight for reference:{R}")
+    elif multi_session:
         print(f"  {DIM}{n_old} flight{'s' if n_old > 1 else ''} from previous config "
               f"(recommendations no longer apply){R}")
-    print(f"\n  Analyzing flight #{best_idx + 1} "
-          f"({best_s.get('duration', 0):.1f}s, latest config)...\n")
+
+    dur_str = f"{best_s.get('duration', 0):.1f}s" if best_s.get('duration') else "?"
+    config_label = "current config" if is_current[best_idx] else "old config — reference only"
+    print(f"\n  Analyzing flight #{best_idx + 1} ({dur_str}, {config_label})...\n")
 
     # ── Phase 5: Full analysis on the selected flight ──
     print(f"{'═' * 70}")
@@ -6348,7 +6449,7 @@ def _verdict_short(verdict):
     return {"DIALED_IN": "✓ dialed in", "NEARLY_THERE": "✓ nearly there",
             "GETTING_BETTER": "↗ getting better", "NEEDS_WORK": "⚠ needs work",
             "ROUGH": "✖ rough", "NEED_DATA": "? need data",
-            "GROUND_ONLY": "- ground"}.get(verdict, verdict or "?")
+            "GROUND_ONLY": "- ground", "UNUSABLE": "✖ bad data"}.get(verdict, verdict or "?")
 
 
 def _config_fingerprint(config):
@@ -7773,7 +7874,8 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
         if quality["grade"] == "UNUSABLE":
             print_log_quality(quality)
             print(f"  Log is not usable for analysis. Run with --check-log for details.")
-            return {"verdict": "UNUSABLE", "score": 0} if summary_only else None
+            dur = float(data["time_s"][-1]) if "time_s" in data and len(data["time_s"]) > 0 else 0
+            return {"verdict": "UNUSABLE", "score": 0, "duration": dur} if summary_only else None
         elif quality["grade"] == "MARGINAL":
             R2, B2, C2, G2, Y2, RED2, DIM2 = _colors()
             print(f"  {Y2}⚠ Log quality: MARGINAL{R2} — ", end="")
@@ -7782,7 +7884,9 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     else:
         quality = assess_log_quality(data, config, logfile)
         if not quality["usable"]:
-            return {"verdict": "UNUSABLE", "score": 0}
+            dur = float(data["time_s"][-1]) if "time_s" in data and len(data["time_s"]) > 0 else 0
+            return {"verdict": "UNUSABLE", "score": 0, "duration": dur,
+                    "idle": False, "config_key": ""}
 
     if not summary_only and nav_mode:
         # Show nav field summary instead of PID/filter info

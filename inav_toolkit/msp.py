@@ -33,7 +33,7 @@ try:
 except ImportError:
     serial = None  # Checked in open()
 
-VERSION = "2.15.1"
+VERSION = "2.16.0"
 
 # ─── MSP Command IDs ─────────────────────────────────────────────────────────
 
@@ -843,6 +843,79 @@ class INAVDevice:
 
     # ── CLI Mode (for diff all) ───────────────────────────────────────────
 
+    def _recover_after_cli(self, max_retries=5):
+        """Verify and recover serial connection after CLI mode exit.
+
+        Some STM32 targets reset their USB VCP when leaving CLI mode,
+        causing /dev/ttyACMx to disappear briefly. This method detects
+        the dead connection, waits for the port to reappear, and reopens it.
+        """
+        import serial as _serial
+        reconnecting = False
+
+        for attempt in range(max_retries):
+            # Check if port is alive with a quick MSP probe
+            try:
+                if self._ser and self._ser.is_open:
+                    self._ser.reset_input_buffer()
+                    self._rxbuf = b""
+                    result = self._request(MSP_FC_VARIANT, timeout=1.0)
+                    if result and len(result) >= 4:
+                        if reconnecting:
+                            print(" ok")
+                        return True
+            except BaseException:
+                pass  # port dead — fd gone, OSError, fileno error, etc.
+
+            # Connection dead — need to reconnect
+            if not reconnecting:
+                print("  Reconnecting after CLI exit...", end="", flush=True)
+                reconnecting = True
+
+            # Close whatever we have
+            try:
+                if self._ser:
+                    self._ser.close()
+            except BaseException:
+                pass
+            self._ser = None
+
+            # Wait for the port device node to reappear
+            wait_time = 0.5 * (attempt + 1)
+            deadline = time.monotonic() + wait_time
+            port_exists = False
+            while time.monotonic() < deadline:
+                if os.path.exists(self.port_path):
+                    port_exists = True
+                    time.sleep(0.2)  # let kernel finish setting up the device
+                    break
+                time.sleep(0.1)
+
+            if not port_exists:
+                continue  # retry — port hasn't come back yet
+
+            # Reopen
+            try:
+                self._ser = _serial.Serial(
+                    port=self.port_path,
+                    baudrate=self.baudrate,
+                    timeout=self.timeout,
+                    write_timeout=self.timeout,
+                    bytesize=_serial.EIGHTBITS,
+                    parity=_serial.PARITY_NONE,
+                    stopbits=_serial.STOPBITS_ONE,
+                )
+                time.sleep(0.2)
+                self._ser.reset_input_buffer()
+                self._ser.reset_output_buffer()
+                self._rxbuf = b""
+            except BaseException:
+                continue  # retry
+
+        if reconnecting:
+            print(" failed")
+        return False  # all retries exhausted
+
     def cli_command(self, command, timeout=5.0):
         """Send a CLI command and capture the response.
 
@@ -889,11 +962,17 @@ class INAVDevice:
                 time.sleep(0.01)
 
         # Exit CLI mode
-        ser.write(b"exit\n")
-        time.sleep(0.3)
-        # Flush the exit response
-        if ser.in_waiting:
-            ser.read(ser.in_waiting)
+        # Some FCs (especially STM32 targets) briefly reset their USB VCP
+        # when leaving CLI mode. We need to verify the connection is still
+        # alive and reconnect if it died.
+        try:
+            ser.write(b"exit\n")
+        except OSError:
+            pass  # port may already be dead
+        time.sleep(1.0)  # give FC time to reinitialize USB
+
+        # Verify connection is alive with a simple MSP probe
+        self._recover_after_cli()
 
         if not buf:
             return None
@@ -986,11 +1065,16 @@ class INAVDevice:
                 lines.append(line)
             results.append((cmd, "\n".join(lines).strip()))
 
-        # Exit CLI mode
-        ser.write(b"exit\n")
-        time.sleep(0.5)
-        if ser.in_waiting:
-            ser.read(ser.in_waiting)
+        # Exit CLI mode (if save was sent, FC will reboot — USB may reset)
+        try:
+            ser.write(b"exit\n")
+        except OSError:
+            pass
+        # save triggers a reboot (~3s), plain exit just returns to MSP (~1s)
+        time.sleep(3.0 if save else 1.0)
+
+        # Verify connection survived CLI exit / reboot
+        self._recover_after_cli(max_retries=5 if save else 3)
 
         return results
 

@@ -2,6 +2,19 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-03-27] - v2.16.0
+
+### Added
+- **USB reconnection after CLI exit**: STM32 targets (including IFLIGHT_BLITZ_F722) reset their USB VCP when leaving CLI mode, killing the serial connection. New `_recover_after_cli()` in MSP module detects the dead port, waits for `/dev/ttyACMx` to reappear via `os.path.exists()` polling, and reopens with progressive backoff. Handles both `cli_command()` (1s wait) and `cli_batch()` with save (3s wait for FC reboot). Shows "Reconnecting after CLI exit... ok" when recovery is needed.
+- **Condensed noise source display**: `format_noise_fingerprint_terminal()` rewritten to group peaks by source type (e.g. all "electrical" peaks become one line showing frequency range and count), show top 3 groups sorted by power, and collapse the rest into "+ N more peaks." Remedies truncated to 90 chars. Reduced from 9+ items with repeated advice to 3 scannable lines.
+- **Stale config detection**: When 3+ parameters differ between blackbox headers and the FC's current `diff all`, a red "STALE DATA" banner appears right after the score bar. CONFIG section shows inline deltas: "Roll P=32 I=82 D=32 (FC now: P->35, I->75, D->28)". Narrative paragraph suppressed when config is stale.
+- **All-old-config messaging**: When every flight on flash predates the current FC config, shows "All flights predate your current FC config. Erase flash and fly again." Analyzed flight labeled "old config - reference only" instead of "latest config."
+
+### Changed
+- **Multi-flight table**: UNUSABLE flights show "-" instead of "0/100". Duration shows "-" instead of "?" when missing. Added "UNUSABLE" -> "bad data" to `_verdict_short()`. UNUSABLE summary returns now include duration and config_key for proper table display.
+- **Config mismatch display**: Moved from buried mid-report to prominent early position. PID mismatches shown inline with config values. Remaining mismatches (motor protocol, filter Hz) shown compactly below. Separate mismatch list removed.
+- **Output density**: Narrative paragraph skipped when config is stale (>3 mismatches). Only shown when it adds substance beyond the verdict line.
+
 ## [2026-02-22] - v2.15.1
 
 ### Added
