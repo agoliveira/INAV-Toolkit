@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.18.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.19.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.18.0"
+REPORT_VERSION = "2.19.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -6098,10 +6098,95 @@ def count_blackbox_logs(filepath):
     return max(1, count)
 
 
+# ─── Post-Analysis Cleanup ────────────────────────────────────────────────────
+
+def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_file,
+                           archive=False, keep_logs=False):
+    """Clean up blackbox directory after successful analysis.
+
+    Default: delete raw download and all split files.
+    --archive: compress analyzed flight to archive/ first.
+    --keep-logs: skip everything.
+
+    Also cleans stale .bbl files from previous sessions.
+    """
+    if keep_logs:
+        return
+
+    R, B, C, G, Y, RED, DIM = _colors()
+    deleted = 0
+    archived = 0
+
+    # Archive the analyzed flight if requested
+    if archive and analyzed_file and os.path.isfile(analyzed_file):
+        import gzip
+        archive_dir = os.path.join(blackbox_dir, "archive")
+        os.makedirs(archive_dir, exist_ok=True)
+        gz_name = os.path.basename(analyzed_file) + ".gz"
+        gz_path = os.path.join(archive_dir, gz_name)
+        try:
+            with open(analyzed_file, "rb") as f_in:
+                with gzip.open(gz_path, "wb") as f_out:
+                    f_out.write(f_in.read())
+            archived_size = os.path.getsize(gz_path)
+            original_size = os.path.getsize(analyzed_file)
+            ratio = archived_size / original_size * 100 if original_size > 0 else 0
+            print(f"  Archived: {gz_name} ({archived_size // 1024}KB, {ratio:.0f}% of original)")
+            archived = 1
+        except Exception as e:
+            print(f"  Warning: archive failed: {e}")
+
+    # Delete the raw download file
+    if raw_download and os.path.isfile(raw_download):
+        try:
+            sz = os.path.getsize(raw_download) // 1024
+            os.remove(raw_download)
+            deleted += 1
+        except Exception:
+            pass
+
+    # Delete all split files
+    if split_files:
+        for sf in split_files:
+            if sf and os.path.isfile(sf):
+                try:
+                    os.remove(sf)
+                    deleted += 1
+                except Exception:
+                    pass
+
+    # Clean stale .bbl files from previous sessions
+    # (anything not from the current download)
+    current_base = os.path.basename(raw_download) if raw_download else ""
+    if os.path.isdir(blackbox_dir):
+        for fname in os.listdir(blackbox_dir):
+            if not fname.endswith(".bbl"):
+                continue
+            fpath = os.path.join(blackbox_dir, fname)
+            if fpath == raw_download:
+                continue  # already handled
+            if any(fpath == sf for sf in (split_files or [])):
+                continue  # already handled
+            # This is a stale .bbl from a previous session
+            try:
+                os.remove(fpath)
+                deleted += 1
+            except Exception:
+                pass
+
+    if deleted > 0 or archived > 0:
+        parts = []
+        if deleted > 0:
+            parts.append(f"{deleted} log files removed")
+        if archived > 0:
+            parts.append(f"1 archived")
+        print(f"  Cleanup: {', '.join(parts)}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.18.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.19.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -6115,8 +6200,14 @@ def main():
     parser.add_argument("--device", metavar="PORT",
                         help="Download blackbox from FC via serial. Use 'auto' to scan "
                              "or specify port (e.g., /dev/ttyACM0, COM3).")
-    parser.add_argument("--erase", action="store_true",
-                        help="Erase dataflash after successful download.")
+    parser.add_argument("--no-erase", action="store_true",
+                        help="Don't erase FC flash after successful download and analysis. "
+                             "Default: flash is erased automatically after pipeline completes.")
+    parser.add_argument("--archive", action="store_true",
+                        help="Compress the analyzed flight log to blackbox/archive/ instead of deleting. "
+                             "Builds a compressed history for re-analysis with future versions.")
+    parser.add_argument("--keep-logs", action="store_true",
+                        help="Skip all cleanup - keep raw downloads, splits, and don't erase flash.")
     parser.add_argument("--download-only", action="store_true",
                         help="Download blackbox from device but don't analyze.")
     parser.add_argument("--blackbox-dir", default="./blackbox",
@@ -6188,6 +6279,7 @@ def main():
     # ── Device mode: download blackbox from FC ──
     logfile = args.logfile
     config_raw = None
+    device_port = None
     if args.device:
         try:
             try:
@@ -6279,12 +6371,15 @@ def main():
             print()
             filepath = fc.download_blackbox(
                 output_dir=args.blackbox_dir,
-                erase_after=args.erase,
+                erase_after=False,  # erase happens after successful analysis
             )
 
             if not filepath:
                 print("  ERROR: Download failed.")
                 sys.exit(1)
+
+            # Store port for post-analysis erase
+            device_port = fc.port_path if hasattr(fc, 'port_path') else args.device
 
             if args.download_only:
                 print(f"\n  To analyze:\n    python3 {sys.argv[0]} {filepath}")
@@ -6417,17 +6512,45 @@ def main():
     # Flash may contain flights from multiple sessions (config changes between
     # arm cycles). Only the LATEST session's best flight deserves full analysis.
     # Earlier flights are stored in DB for progression but shown as one-liners.
+    analyzed_file = None
     if getattr(args, 'nav', False):
         # Nav mode: skip multi-flight tuning scan, analyze last flight directly
         target = log_files[-1]
         if len(log_files) > 1:
             print(f"\n  Nav mode: analyzing last flight ({len(log_files)} in flash)")
         _analyze_single_log(target, args, config_raw)
+        analyzed_file = target
     elif len(log_files) > 1:
-        _process_multi_log(log_files, args, config_raw)
+        analyzed_file = _process_multi_log(log_files, args, config_raw)
     else:
         # Single flight - full analysis
         _analyze_single_log(log_files[0], args, config_raw)
+        analyzed_file = log_files[0]
+
+    # ── Post-analysis cleanup (only in device mode) ──
+    if device_port and not args.keep_logs:
+        # raw_download is the original downloaded file (pre-split)
+        # For single-flight, it's the same as the analyzed file
+        raw_download = logfile
+        split_files = log_files if n_logs > 1 else []
+
+        _post_analysis_cleanup(
+            args.blackbox_dir, raw_download, split_files, analyzed_file,
+            archive=args.archive, keep_logs=args.keep_logs)
+
+        # Erase FC flash
+        if not args.no_erase:
+            try:
+                try:
+                    from inav_toolkit.msp import INAVDevice
+                except ImportError:
+                    from inav_msp import INAVDevice
+                fc2 = INAVDevice(device_port)
+                fc2.open()
+                fc2.erase_dataflash()
+                fc2.close()
+            except Exception as e:
+                print(f"  Erase failed: {e}")
 
 
 def _process_multi_log(log_files, args, config_raw):
@@ -6612,6 +6735,8 @@ def _process_multi_log(log_files, args, config_raw):
             db.close()
         except Exception:
             pass
+
+    return log_files[best_idx]
 
 
 def _verdict_short(verdict):
