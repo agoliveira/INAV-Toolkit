@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.16.1
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.17.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.16.1"
+REPORT_VERSION = "2.17.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -2542,17 +2542,34 @@ def measure_tracking_delay_xcorr(sp, gy, sr, max_delay_ms=200):
     return float(np.median(delays))
 
 
-def detect_hover_oscillation(data, sr):
+def detect_hover_oscillation(data, sr, profile=None):
     """Detect oscillation during hover (no/minimal stick input).
 
     Finds segments where setpoint is near zero, then measures gyro
     oscillation amplitude and dominant frequency. This catches the most
     dangerous tuning problem: a quad that can't hold still.
 
+    Frame-size aware: larger frames naturally have more gyro activity,
+    and low-frequency wobble (1-5Hz) outdoors is often wind buffeting,
+    not P oscillation. The cause classification accounts for this.
+
     Returns list of per-axis dicts:
         axis, gyro_rms, gyro_p2p, dominant_freq_hz, severity, cause, hover_seconds
     Or empty list if no hover segments found.
     """
+    if profile is None:
+        profile = get_frame_profile(5)
+
+    # Scale severity thresholds by frame size.
+    # Larger frames have more inertia and naturally higher gyro readings.
+    frame_inches = profile.get("frame_inches", 5)
+    size_factor = max(1.0, frame_inches / 7.0)  # 1.0 for 7", 1.43 for 10", 2.14 for 15"
+
+    # Severity thresholds (RMS deg/s) — scaled by frame size
+    sev_none = 2.0 * size_factor     # 2.0 for 7", 2.9 for 10"
+    sev_mild = 5.0 * size_factor     # 5.0 for 7", 7.1 for 10"
+    sev_moderate = 15.0 * size_factor # 15.0 for 7", 21.4 for 10"
+
     results = []
     min_hover_samples = int(sr * 0.5)  # At least 0.5s of hover
 
@@ -2609,6 +2626,7 @@ def detect_hover_oscillation(data, sr):
 
         # Dominant frequency via FFT
         dominant_freq = None
+        peak_prominence = 0  # How much the peak stands out from noise floor
         if len(hover_gyro) >= int(sr * 0.25):  # Need at least 0.25s for FFT
             freqs = rfftfreq(len(hover_gyro), 1.0 / sr)
             spectrum = np.abs(rfft(hover_gyro))
@@ -2621,29 +2639,35 @@ def detect_hover_oscillation(data, sr):
                 dominant_freq = float(masked_freqs[peak_idx])
                 peak_power = masked_spectrum[peak_idx]
                 mean_power = np.mean(masked_spectrum)
+                peak_prominence = peak_power / mean_power if mean_power > 0 else 0
                 # Only report if peak is significantly above noise floor
-                if peak_power < mean_power * 3:
+                if peak_prominence < 3:
                     dominant_freq = None  # No clear dominant frequency
 
-        # Classify severity
-        # For a well-tuned hover: gyro_rms < 2, p2p < 10
-        # Mild wobble: rms 2-8, p2p 10-30
-        # Serious oscillation: rms 8-20, p2p 30-80
-        # Dangerous: rms > 20, p2p > 80
-        if gyro_rms < 2:
+        # Classify severity (frame-size-scaled thresholds)
+        if gyro_rms < sev_none:
             severity = "none"
-        elif gyro_rms < 5:
+        elif gyro_rms < sev_mild:
             severity = "mild"
-        elif gyro_rms < 15:
+        elif gyro_rms < sev_moderate:
             severity = "moderate"
         else:
             severity = "severe"
 
-        # Classify cause from dominant frequency
+        # Classify cause from dominant frequency — frame-size aware
         cause = None
         if severity != "none" and dominant_freq is not None:
             if dominant_freq < 10:
-                cause = "P_too_high"        # Low-freq: P-term overshoot
+                # Low-frequency wobble. On large frames (10"+), this is often
+                # wind buffeting or GPS position hold corrections, NOT P oscillation.
+                # True P oscillation has a sharp spectral peak (high prominence).
+                # Wind buffeting is broadband (low prominence).
+                if frame_inches >= 10 and peak_prominence < 6:
+                    cause = "wind_buffeting"  # Likely environmental, not tuning
+                elif frame_inches >= 10 and dominant_freq < 3:
+                    cause = "wind_buffeting"  # <3Hz on 10"+ is almost certainly wind
+                else:
+                    cause = "P_too_high"
             elif dominant_freq < 25:
                 cause = "PD_interaction"     # Mid-freq: P/D fighting
             elif dominant_freq < 50:
@@ -2651,7 +2675,11 @@ def detect_hover_oscillation(data, sr):
             else:
                 cause = "filter_gap"         # High-freq noise leaking through
         elif severity != "none":
-            cause = "unknown"
+            # No dominant frequency — broadband noise, likely environmental
+            if frame_inches >= 10:
+                cause = "wind_buffeting"
+            else:
+                cause = "unknown"
 
         results.append({
             "axis": axis,
@@ -2661,6 +2689,7 @@ def detect_hover_oscillation(data, sr):
             "severity": severity,
             "cause": cause,
             "hover_seconds": total_hover_seconds,
+            "peak_prominence": peak_prominence,
         })
 
     return results
@@ -2830,6 +2859,12 @@ def compute_recommended_filter(noise_results, current_hz, filter_type="gyro", pr
        before noise starts.
     3. Avoid placing the cutoff on or near a noise peak (would amplify it).
     4. Clamp to the frame profile's min/max range.
+    5. CHECK PHASE LAG: if the recommended cutoff would add excessive phase lag
+       compared to current, don't recommend lowering. Large quads (10"+) are
+       especially sensitive to phase lag — lowering LPF from 65 to 30Hz can
+       make oscillations worse even though noise numbers improve.
+    6. If noise is well above the current LPF (all peaks >2x current cutoff),
+       the LPF can't meaningfully help — recommend notch/RPM filters instead.
 
     Returns the recommended Hz value (int, rounded to 5), or None.
     """
@@ -2881,7 +2916,7 @@ def compute_recommended_filter(noise_results, current_hz, filter_type="gyro", pr
     # Apply safety margin: place cutoff below the crossover
     ideal = worst_crossover * safety
 
-    # Avoid placing cutoff near a noise peak (within ±15Hz of any strong peak)
+    # Avoid placing cutoff near a noise peak (within +/-15Hz of any strong peak)
     all_peaks = []
     for nr in valid:
         for p in nr["peaks"]:
@@ -2893,12 +2928,83 @@ def compute_recommended_filter(noise_results, current_hz, filter_type="gyro", pr
         if abs(ideal - peak_freq) < 15:
             ideal = min(ideal, peak_freq - 20)
 
+    # ── Phase lag guard ──
+    # If lowering the filter would significantly increase phase lag, don't.
+    # This is critical for large frames where phase lag causes more problems
+    # than the noise the filter would remove.
+    if current_hz is not None and ideal < current_hz:
+        signal_freq = profile.get("phase_lag_freq", 50.0)  # typical control freq
+
+        current_lag = estimate_filter_phase_lag(current_hz, signal_freq)
+        proposed_lag = estimate_filter_phase_lag(ideal, signal_freq)
+
+        if current_lag and proposed_lag:
+            added_lag_ms = proposed_lag["ms"] - current_lag["ms"]
+            added_lag_deg = proposed_lag["degrees"] - current_lag["degrees"]
+
+            # For 10"+ frames, even 5ms extra lag is significant
+            frame_size = profile.get("frame_inches", 5)
+            max_added_lag_ms = 8.0 if frame_size <= 7 else 5.0 if frame_size <= 10 else 3.0
+
+            if added_lag_ms > max_added_lag_ms:
+                # Lowering would add too much phase lag — don't recommend
+                return None
+
+    # ── Relative change guard ──
+    # On large frames, aggressive LPF cuts cause more harm than good.
+    # The added phase lag and signal attenuation destabilize the PID loop.
+    # Don't recommend cutting the LPF by more than 30% on 10"+.
+    if current_hz is not None and ideal < current_hz:
+        frame_size = profile.get("frame_inches", 5)
+        if frame_size >= 10:
+            max_reduction = 0.30  # 30% max cut for 10"+
+        elif frame_size >= 7:
+            max_reduction = 0.40  # 40% for 7"
+        else:
+            max_reduction = 0.50  # 50% for 5"
+
+        min_allowed = current_hz * (1.0 - max_reduction)
+        if ideal < min_allowed:
+            ideal = min_allowed  # Cap the reduction
+
+    # ── Propwash guard ──
+    # If the lowest significant noise is below ~80Hz, it's likely propwash
+    # (aerodynamic turbulence). LPF changes don't effectively address propwash
+    # because it's broadband — you'd have to crush the filter so low that
+    # the phase lag makes everything worse. Propwash is fixed through D-term
+    # tuning and flight technique, not gyro LPF.
+    if current_hz is not None and all_peaks and filter_type == "gyro":
+        lowest_peak = min(all_peaks)
+        frame_size = profile.get("frame_inches", 5)
+        # For large frames, propwash typically sits at 30-80Hz
+        propwash_ceiling = 80 if frame_size >= 10 else 100
+        if lowest_peak <= propwash_ceiling and ideal < current_hz:
+            # The noise driving the recommendation is in the propwash band.
+            # Don't lower the LPF — it won't help and will add lag.
+            # Only recommend if there are also peaks well above propwash.
+            peaks_above_propwash = [p for p in all_peaks if p > propwash_ceiling * 1.5]
+            if not peaks_above_propwash:
+                return None
+            # There are higher peaks too — but don't let propwash drive the cutoff down
+            ideal = max(ideal, current_hz * 0.85)  # at most 15% cut
+
+    # ── High-frequency noise guard ──
+    # If all significant noise is well above the current LPF (>2x cutoff),
+    # lowering the LPF won't meaningfully help — the noise needs notch/RPM
+    # filters, not a lower LPF that would crush phase margin.
+    if current_hz is not None and all_peaks:
+        lowest_significant_peak = min(all_peaks)
+        if lowest_significant_peak > current_hz * 2.0:
+            # All noise is far above current LPF — LPF change won't help
+            return None
+
     # Clamp and round
     result = round(int(np.clip(ideal, min_cutoff, max_cutoff)) / 5) * 5
     return result
 
 
-def compute_recommended_pid(pid_result, current_p, current_i, current_d, profile=None):
+def compute_recommended_pid(pid_result, current_p, current_i, current_d, profile=None,
+                            current_ff=None):
     if pid_result is None:
         return None
     if profile is None:
@@ -2918,6 +3024,26 @@ def compute_recommended_pid(pid_result, current_p, current_i, current_d, profile
     dl_high = delay > ok_dl
     dl_bad = delay > bad_dl
 
+    # ── FF-aware overshoot attribution ──
+    # FF drives initial response proportional to stick speed. High FF + high P
+    # = double overshoot source. When FF is significant (>40), attribute some
+    # overshoot to FF and reduce it before cutting P aggressively.
+    ff_is_high = current_ff is not None and current_ff > 40
+    ff_contributes_overshoot = ff_is_high and os_high
+
+    if ff_contributes_overshoot:
+        # Split the blame: FF handles stick-driven overshoot, P handles error-driven.
+        # With high FF, reduce FF first, smaller P cut.
+        ff_severity = current_ff / 60.0  # 1.0 at FF=60, higher = more blame on FF
+        ff_share = min(0.6, ff_severity * 0.3)  # FF takes up to 60% of the blame
+
+        new_ff = max(15, int(current_ff * (1 - min(0.25, ff_share * 0.4))))
+        if new_ff != current_ff:
+            changes["FF"] = {"current": current_ff, "new": new_ff}
+            reasons.append(
+                f"FeedForward is {current_ff} - contributes to overshoot on stick inputs. "
+                f"Reducing FF from {current_ff} to {new_ff} before cutting P.")
+
     # ── Severity-proportional P adjustment ──
     # How far off from target determines size of correction.
     # Profile's max_change caps the adjustment for safety.
@@ -2925,7 +3051,7 @@ def compute_recommended_pid(pid_result, current_p, current_i, current_d, profile
         new_p = current_p
 
         if os_high:
-            # severity: 1.0 = at ok threshold, 2.0 = 2× the ok threshold, etc.
+            # severity: 1.0 = at ok threshold, 2.0 = 2x the ok threshold, etc.
             severity = os_pct / ok_os
             if severity > 3.0:
                 raw_cut = 0.35
@@ -2935,6 +3061,11 @@ def compute_recommended_pid(pid_result, current_p, current_i, current_d, profile
                 raw_cut = 0.18
             else:
                 raw_cut = 0.10
+
+            # If FF is taking some blame, reduce the P cut proportionally
+            if ff_contributes_overshoot:
+                ff_share_actual = min(0.6, (current_ff / 60.0) * 0.3)
+                raw_cut *= (1.0 - ff_share_actual)
 
             has_d = current_d is not None and current_d > 0
             d_hint = " and raise D" if has_d else ""
@@ -4028,6 +4159,8 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
     ok_noise = profile["ok_noise_db"]
     bad_noise = profile["bad_noise_db"]
 
+    info_items = []
+
     # ── Hover oscillation (highest priority - can't tune if quad won't hold still) ──
     if hover_osc:
         for osc in hover_osc:
@@ -4047,7 +4180,16 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
             freq_str = f" at ~{freq:.0f}Hz" if freq else ""
             amp_str = f"gyro RMS {rms:.1f}°/s, peak-to-peak {p2p:.0f}°/s{freq_str}"
 
-            if cause == "P_too_high":
+            if cause == "wind_buffeting":
+                # Low-frequency broadband wobble on large frame — likely wind, not P
+                # Don't recommend aggressive P cuts — show as informational
+                info_items.append({
+                    "text": f"{axis}: Low-frequency gyro activity ({rms:.1f}°/s RMS at ~{freq:.0f}Hz)",
+                    "detail": f"On a {profile.get('frame_inches', '?')}-inch frame, {freq:.0f}Hz wobble is "
+                              f"typically wind buffeting or GPS position corrections, not P oscillation. "
+                              f"If this happens indoors or in calm air, then P may be too high."})
+
+            elif cause == "P_too_high":
                 current_p = config.get(f"{axis_l}_p")
                 if current_p:
                     new_p = max(10, int(current_p * 0.70))  # Aggressive 30% cut
@@ -4143,7 +4285,6 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
                        f"Consider raising lowpass cutoffs or switching BIQUAD filters to PT1."})
 
     # ═══ 0b. MOTOR RESPONSE INFO (not an action - informational only) ═══
-    info_items = []
     if motor_response and motor_response["motor_response_ms"] > profile["ok_delay_ms"]:
         mr_ms = motor_response["motor_response_ms"]
         info_items.append({
@@ -4251,9 +4392,10 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
         cur_p = config.get(f"{axis.lower()}_p")
         cur_i = config.get(f"{axis.lower()}_i")
         cur_d = config.get(f"{axis.lower()}_d")
+        cur_ff = config.get(f"{axis.lower()}_ff")
 
         if has_config:
-            rec = compute_recommended_pid(pid, cur_p, cur_i, cur_d, profile)
+            rec = compute_recommended_pid(pid, cur_p, cur_i, cur_d, profile, current_ff=cur_ff)
             if rec and rec["changes"]:
                 _os = pid["avg_overshoot_pct"] or 0
                 _dl = pid["tracking_delay_ms"] or 0
@@ -4263,7 +4405,7 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
                 # Build a single merged description for all PID changes on this axis
                 change_parts = []
                 sub_actions = []  # for CLI generation
-                for term in ["P", "D", "I"]:
+                for term in ["FF", "P", "D", "I"]:
                     if term in rec["changes"]:
                         ch = rec["changes"][term]
                         direction = "Reduce" if ch["new"] < ch["current"] else "Increase"
@@ -4418,6 +4560,14 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
         for osc in hover_osc:
             rms = osc["gyro_rms"]
             sev = osc["severity"]
+            cause = osc.get("cause")
+
+            # Wind buffeting gets a much softer penalty — it's environmental,
+            # not a tuning problem. Don't tank the score for flying in wind.
+            if cause == "wind_buffeting":
+                osc_scores.append(max(60, 100 - rms * 2))  # Floor at 60
+                continue
+
             if sev == "none":
                 osc_scores.append(100)
             elif sev == "mild":
@@ -4611,9 +4761,9 @@ def create_dterm_chart(dterm_results):
 
 # Map from action plan param names to INAV CLI setting names
 INAV_CLI_MAP = {
-    "roll_p": "mc_p_roll", "roll_i": "mc_i_roll", "roll_d": "mc_d_roll",
-    "pitch_p": "mc_p_pitch", "pitch_i": "mc_i_pitch", "pitch_d": "mc_d_pitch",
-    "yaw_p": "mc_p_yaw", "yaw_i": "mc_i_yaw", "yaw_d": "mc_d_yaw",
+    "roll_p": "mc_p_roll", "roll_i": "mc_i_roll", "roll_d": "mc_d_roll", "roll_ff": "mc_cd_roll",
+    "pitch_p": "mc_p_pitch", "pitch_i": "mc_i_pitch", "pitch_d": "mc_d_pitch", "pitch_ff": "mc_cd_pitch",
+    "yaw_p": "mc_p_yaw", "yaw_i": "mc_i_yaw", "yaw_d": "mc_d_yaw", "yaw_ff": "mc_cd_yaw",
     "gyro_lowpass_hz": "gyro_main_lpf_hz", "gyro_lpf_hz": "gyro_main_lpf_hz",
     "gyro_lowpass2_hz": "gyro_main_lpf2_hz",
     "dterm_lpf_hz": "dterm_lpf_hz", "dterm_lpf2_hz": "dterm_lpf2_hz",
@@ -4626,12 +4776,15 @@ INAV_GUI_MAP = {
     "roll_p": ("PID Tuning", "Roll → P"),
     "roll_i": ("PID Tuning", "Roll → I"),
     "roll_d": ("PID Tuning", "Roll → D"),
+    "roll_ff": ("PID Tuning", "Roll → FF"),
     "pitch_p": ("PID Tuning", "Pitch → P"),
     "pitch_i": ("PID Tuning", "Pitch → I"),
     "pitch_d": ("PID Tuning", "Pitch → D"),
+    "pitch_ff": ("PID Tuning", "Pitch → FF"),
     "yaw_p": ("PID Tuning", "Yaw → P"),
     "yaw_i": ("PID Tuning", "Yaw → I"),
     "yaw_d": ("PID Tuning", "Yaw → D"),
+    "yaw_ff": ("PID Tuning", "Yaw → FF"),
     "gyro_lowpass_hz": ("Filtering", "Gyro LPF Hz"),
     "dterm_lpf_hz": ("Filtering", "D-term LPF Hz"),
 }
@@ -4708,19 +4861,26 @@ def generate_narrative(plan, pid_results, motor_analysis, noise_results, config,
 
     # Hover oscillation (most critical - mention first)
     hover_osc_data = plan["scores"].get("hover_osc", [])
-    osc_axes = [o for o in hover_osc_data if o["severity"] in ("moderate", "severe")] if hover_osc_data else []
+    # Filter out wind_buffeting — it's environmental, not a tuning problem
+    osc_axes = [o for o in hover_osc_data
+                if o["severity"] in ("moderate", "severe") and o.get("cause") != "wind_buffeting"
+                ] if hover_osc_data else []
+    wind_axes = [o for o in hover_osc_data
+                 if o["severity"] in ("moderate", "severe") and o.get("cause") == "wind_buffeting"
+                 ] if hover_osc_data else []
+
     if osc_axes:
         axis_names = [o["axis"] for o in osc_axes]
         worst = max(osc_axes, key=lambda o: o["gyro_rms"])
         if worst["severity"] == "severe":
             parts.append(
                 f"CRITICAL: The quad is oscillating during hover on {'/'.join(axis_names)} "
-                f"(worst: {worst['axis']} at {worst['gyro_rms']:.1f}°/s RMS). "
+                f"(worst: {worst['axis']} at {worst['gyro_rms']:.1f}\u00b0/s RMS). "
                 f"This must be fixed before any other tuning - the quad is fighting itself just to stay in the air.")
         else:
             parts.append(
                 f"The quad shows oscillation during hover on {'/'.join(axis_names)} "
-                f"(worst: {worst['axis']} at {worst['gyro_rms']:.1f}°/s RMS). "
+                f"(worst: {worst['axis']} at {worst['gyro_rms']:.1f}\u00b0/s RMS). "
                 f"This should be addressed first as it affects all other measurements.")
         if worst.get("dominant_freq_hz"):
             freq = worst["dominant_freq_hz"]
@@ -4732,6 +4892,14 @@ def generate_narrative(plan, pid_results, motor_analysis, noise_results, config,
                 parts.append(f"The oscillation frequency (~{freq:.0f}Hz) indicates D-term is amplifying noise into the motors.")
             else:
                 parts.append(f"The oscillation frequency (~{freq:.0f}Hz) suggests noise is leaking through the filters.")
+
+    if wind_axes and not osc_axes:
+        # Only wind buffeting detected — inform but don't alarm
+        worst_w = max(wind_axes, key=lambda o: o["gyro_rms"])
+        parts.append(
+            f"Some low-frequency gyro activity detected on hover ({worst_w['gyro_rms']:.1f}\u00b0/s RMS at "
+            f"~{worst_w['dominant_freq_hz']:.0f}Hz). On this frame size, this is likely wind buffeting "
+            f"or GPS position corrections rather than a PID problem.")
 
     # PID behavior per axis
     ok_os = profile["ok_overshoot"]
@@ -5933,7 +6101,7 @@ def count_blackbox_logs(filepath):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.16.1 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.17.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -6824,7 +6992,7 @@ def _analyze_for_compare(logfile, args, diff_raw=None):
     sr = data["sample_rate"]
 
     # Run all analyses
-    hover_osc = detect_hover_oscillation(data, sr)
+    hover_osc = detect_hover_oscillation(data, sr, profile)
     noise_results = [analyze_noise(data, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
     pid_results = [analyze_pid_response(data, i, sr) for i in range(3)]
     motor_analysis = analyze_motors(data, sr, config)
@@ -7979,8 +8147,9 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     # ── NAV-ONLY MODE: skip tuning, run navigation health analysis ──
     if nav_mode:
         # Quick oscillation check - warn if PID tuning is polluting nav readings
-        hover_osc = detect_hover_oscillation(data, sr)
-        osc_severe = [h for h in hover_osc if h["severity"] in ("moderate", "severe")]
+        hover_osc = detect_hover_oscillation(data, sr, profile)
+        osc_severe = [h for h in hover_osc
+                      if h["severity"] in ("moderate", "severe") and h.get("cause") != "wind_buffeting"]
         tune_warning = False
         if osc_severe:
             tune_warning = True
@@ -8011,7 +8180,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
             print("  Enable NAV_POS, NAV_ACC, and Attitude in blackbox settings.")
         return None
 
-    hover_osc = detect_hover_oscillation(data, sr)
+    hover_osc = detect_hover_oscillation(data, sr, profile)
     noise_results = [analyze_noise(data, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
     noise_fp = fingerprint_noise(noise_results, config, prop_harmonics)
     pid_results = [analyze_pid_response(data, i, sr) for i in range(3)]
