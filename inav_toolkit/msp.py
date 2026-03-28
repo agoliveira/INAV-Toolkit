@@ -33,7 +33,7 @@ try:
 except ImportError:
     serial = None  # Checked in open()
 
-VERSION = "2.17.0"
+VERSION = "2.18.0"
 
 # ─── MSP Command IDs ─────────────────────────────────────────────────────────
 
@@ -1004,6 +1004,17 @@ class INAVDevice:
             Raw diff output string, or None on error
         """
         return self.cli_command("diff all", timeout=timeout)
+
+    def get_dump_all(self, timeout=30.0):
+        """Pull the full 'dump all' configuration from the FC.
+
+        This is a complete backup of every parameter — much larger output
+        than 'diff all' which only shows non-defaults.
+
+        Returns:
+            Raw dump output string, or None on error
+        """
+        return self.cli_command("dump all", timeout=timeout)
 
     def cli_batch(self, commands, timeout=5.0, save=True):
         """Send multiple CLI commands in a single CLI session.

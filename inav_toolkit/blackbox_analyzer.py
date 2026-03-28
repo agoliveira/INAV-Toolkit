@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.17.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.18.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.17.0"
+REPORT_VERSION = "2.18.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -882,7 +882,7 @@ CLI_BOOL_KEYS = {
 }
 
 
-def merge_diff_into_config(config, diff_raw):
+def merge_diff_into_config(config, config_raw):
     """Merge INAV CLI 'diff all' output into the analysis config dict.
 
     Strategy:
@@ -895,19 +895,19 @@ def merge_diff_into_config(config, diff_raw):
 
     Args:
         config: Existing config dict from extract_fc_config()
-        diff_raw: Raw 'diff all' output string
+        config_raw: Raw 'diff all' output string
 
     Returns:
         Number of settings merged
     """
-    if not diff_raw:
+    if not config_raw:
         return 0
 
     try:
         from inav_toolkit.flight_db import parse_diff_output
     except ImportError:
         from inav_flight_db import parse_diff_output
-    diff_settings = parse_diff_output(diff_raw)
+    diff_settings = parse_diff_output(config_raw)
 
     merged = 0
     mismatches = []
@@ -6101,7 +6101,7 @@ def count_blackbox_logs(filepath):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.17.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.18.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -6141,11 +6141,11 @@ def main():
                         help="Omit the plain-English description of the quad's behavior.")
     parser.add_argument("--no-color", action="store_true",
                         help="Disable colored terminal output.")
-    parser.add_argument("--diff", metavar="FILE", default=None,
-                        help="Path to a CLI 'diff all' file for enriched analysis. "
+    parser.add_argument("--config", metavar="FILE", default=None,
+                        help="Path to a CLI 'dump all' or 'diff all' file for enriched analysis. "
                              "Adds config cross-referencing to nav and tuning results. "
                              "Not needed with --device (config is pulled automatically). "
-                             "Also auto-discovered if a *_diff.txt file sits next to the BBL.")
+                             "Also auto-discovered if a *_dump.txt or *_diff.txt file sits next to the BBL.")
     parser.add_argument("--nav", action="store_true",
                         help="Enable navigation health analysis (compass, GPS, baro, "
                              "estimator). Works on any flight with nav fields in the log.")
@@ -6187,7 +6187,7 @@ def main():
 
     # ── Device mode: download blackbox from FC ──
     logfile = args.logfile
-    diff_raw = None
+    config_raw = None
     if args.device:
         try:
             try:
@@ -6257,19 +6257,18 @@ def main():
             pct = summary['used_size'] * 100 // summary['total_size'] if summary['total_size'] > 0 else 0
             print(f"  Dataflash: {used_kb:.0f}KB / {total_kb:.0f}KB ({pct}% used)")
 
-            # Pull CLI diff (always when connected - enriches analysis)
-            diff_raw = None
-            print("  Pulling configuration (diff all)...", end="", flush=True)
-            diff_raw = fc.get_diff_all(timeout=10.0)
-            if diff_raw:
-                n_settings = len([l for l in diff_raw.splitlines() if l.strip().startswith("set ")])
-                print(f" {n_settings} settings")
-                # Save diff to file alongside blackbox
-                diff_path = os.path.join(args.blackbox_dir, f"{info['craft_name'] or 'fc'}_diff.txt")
+            # Pull full config dump (all parameters — used for analysis, fingerprinting, and backup)
+            config_raw = None
+            print("  Pulling configuration (dump all)...", end="", flush=True)
+            config_raw = fc.get_dump_all(timeout=30.0)
+            if config_raw:
+                n_settings = len([l for l in config_raw.splitlines() if l.strip().startswith("set ")])
+                print(f" {n_settings} parameters")
+                config_path = os.path.join(args.blackbox_dir, f"{info['craft_name'] or 'fc'}_dump.txt")
                 os.makedirs(args.blackbox_dir, exist_ok=True)
-                with open(diff_path, "w") as f:
-                    f.write(diff_raw)
-                print(f"  Saved: {diff_path}")
+                with open(config_path, "w") as f:
+                    f.write(config_raw)
+                print(f"  Saved: {config_path}")
             else:
                 print(" no response (FC may not support CLI over MSP)")
 
@@ -6311,39 +6310,42 @@ def main():
         print(f"ERROR: File not found: {logfile}"); sys.exit(1)
 
     # ── Load diff from file (when not using --device) ──
-    if diff_raw is None:
-        diff_file = None
-        if args.diff:
-            # Explicit file path: --diff my_diff.txt
-            diff_file = args.diff
+    if config_raw is None:
+        config_file = None
+        if args.config:
+            # Explicit file path: --config my_dump.txt
+            config_file = args.config
         else:
-            # Auto-discover diff files in same directory as BBL
+            # Auto-discover config files in same directory as BBL
+            # Prefer dump (complete) over diff (only changed params)
             log_dir = os.path.dirname(os.path.abspath(logfile))
             candidates = []
             for fname in os.listdir(log_dir):
-                if fname.endswith("_diff.txt") or fname == "diff.txt" or fname == "diff_all.txt":
+                if (fname.endswith("_dump.txt") or fname.endswith("_diff.txt")
+                        or fname in ("dump.txt", "dump_all.txt", "diff.txt", "diff_all.txt")):
                     candidates.append(os.path.join(log_dir, fname))
-            if len(candidates) == 1:
-                diff_file = candidates[0]
-            elif len(candidates) > 1:
-                # Pick the most recently modified
-                diff_file = max(candidates, key=os.path.getmtime)
+            if candidates:
+                # Prefer dump over diff, then most recent
+                def _score(path):
+                    is_dump = "_dump" in path or "dump" in os.path.basename(path)
+                    return (1 if is_dump else 0, os.path.getmtime(path))
+                config_file = max(candidates, key=_score)
 
-        if diff_file:
-            if os.path.isfile(diff_file):
+        if config_file:
+            if os.path.isfile(config_file):
                 try:
-                    with open(diff_file, "r", errors="ignore") as f:
-                        diff_raw = f.read()
-                    n_settings = len([l for l in diff_raw.splitlines()
+                    with open(config_file, "r", errors="ignore") as f:
+                        config_raw = f.read()
+                    n_settings = len([l for l in config_raw.splitlines()
                                       if l.strip().startswith("set ")])
                     if n_settings > 0:
-                        print(f"  Config: {os.path.basename(diff_file)} ({n_settings} settings)")
+                        print(f"  Config: {os.path.basename(config_file)} ({n_settings} settings)")
                     else:
-                        diff_raw = None  # not a valid diff file
+                        config_raw = None  # not a valid config file
                 except Exception:
-                    diff_raw = None
+                    config_raw = None
             else:
-                print(f"  Warning: Diff file not found: {diff_file}")
+                print(f"  Warning: Config file not found: {config_file}")
 
     # ── History mode: show progression and exit ──
     if args.history or args.trend:
@@ -6374,14 +6376,14 @@ def main():
         if not os.path.isfile(args.compare):
             print(f"ERROR: Comparison file not found: {args.compare}")
             sys.exit(1)
-        _run_comparison(logfile, args.compare, args, diff_raw)
+        _run_comparison(logfile, args.compare, args, config_raw)
         return
 
     # ── Replay mode: interactive HTML time-series ──
     if args.replay:
         if not logfile:
             parser.error("logfile required for --replay")
-        _run_replay(logfile, args, diff_raw)
+        _run_replay(logfile, args, config_raw)
         return
 
     # ── Log quality check mode ──
@@ -6420,15 +6422,15 @@ def main():
         target = log_files[-1]
         if len(log_files) > 1:
             print(f"\n  Nav mode: analyzing last flight ({len(log_files)} in flash)")
-        _analyze_single_log(target, args, diff_raw)
+        _analyze_single_log(target, args, config_raw)
     elif len(log_files) > 1:
-        _process_multi_log(log_files, args, diff_raw)
+        _process_multi_log(log_files, args, config_raw)
     else:
         # Single flight - full analysis
-        _analyze_single_log(log_files[0], args, diff_raw)
+        _analyze_single_log(log_files[0], args, config_raw)
 
 
-def _process_multi_log(log_files, args, diff_raw):
+def _process_multi_log(log_files, args, config_raw):
     """Handle multiple flights from a single flash download.
 
     Strategy:
@@ -6444,7 +6446,7 @@ def _process_multi_log(log_files, args, diff_raw):
     print(f"  Scanning {len(log_files)} flights...")
     summaries = []
     for lf in log_files:
-        s = _analyze_single_log(lf, args, diff_raw, summary_only=True)
+        s = _analyze_single_log(lf, args, config_raw, summary_only=True)
         if s:
             summaries.append(s)
 
@@ -6457,7 +6459,7 @@ def _process_multi_log(log_files, args, diff_raw):
     # header config matches the diff are "current session" (post-change),
     # flights that don't match are "old session" (pre-change).
     # Without a diff, fall back to comparing consecutive flights.
-    current_fp = _fingerprint_from_diff(diff_raw)
+    current_fp = _fingerprint_from_diff(config_raw)
     is_current = []  # True/False per flight
 
     if current_fp:
@@ -6581,7 +6583,7 @@ def _process_multi_log(log_files, args, diff_raw):
 
     # ── Phase 5: Full analysis on the selected flight ──
     print(f"{'═' * 70}")
-    _analyze_single_log(log_files[best_idx], args, diff_raw)
+    _analyze_single_log(log_files[best_idx], args, config_raw)
 
     # ── Phase 6: Show cross-session progression ──
     if not args.no_db:
@@ -6635,7 +6637,7 @@ def _config_fingerprint(config):
     return "|".join(parts) if parts else ""
 
 
-def _fingerprint_from_diff(diff_raw):
+def _fingerprint_from_diff(config_raw):
     """Build a config fingerprint from CLI 'diff all' output.
 
     This represents the FC's CURRENT config - the ground truth.
@@ -6643,14 +6645,14 @@ def _fingerprint_from_diff(diff_raw):
     session; flights that don't match are from before the user applied
     changes.
     """
-    if not diff_raw:
+    if not config_raw:
         return ""
 
     try:
         from inav_toolkit.flight_db import parse_diff_output
     except ImportError:
         from inav_flight_db import parse_diff_output
-    diff_settings = parse_diff_output(diff_raw)
+    diff_settings = parse_diff_output(config_raw)
 
     # Map CLI names → config keys (same mapping as merge_diff_into_config)
     config = {}
@@ -6666,8 +6668,12 @@ def _fingerprint_from_diff(diff_raw):
     return _config_fingerprint(config)
 
 
-def _print_config_review(diff_raw, config, frame_inches, plan):
-    """Run parameter analyzer on FC diff and show findings not covered by flight analysis.
+def _print_config_review(config_raw, config, frame_inches, plan):
+    """Run parameter analyzer on FC config and show findings not covered by flight analysis.
+
+    Accepts either 'dump all' or 'diff all' output. Dump is preferred since it
+    includes every parameter including unchanged defaults, which matters for
+    nav PID checks on large frames.
 
     Only shows CRITICAL and WARNING findings from categories that the blackbox
     analyzer doesn't cover (safety, nav, motor protocol, GPS, battery, RX).
@@ -6675,6 +6681,9 @@ def _print_config_review(diff_raw, config, frame_inches, plan):
     more accurate for those.
     """
     R, B, C, G, Y, RED, DIM = _colors()
+
+    if not config_raw:
+        return
 
     try:
         try:
@@ -6685,7 +6694,7 @@ def _print_config_review(diff_raw, config, frame_inches, plan):
         return  # param analyzer not available
 
     try:
-        parsed = parse_diff_all(diff_raw)
+        parsed = parse_diff_all(config_raw)
     except Exception:
         return
 
@@ -6956,15 +6965,15 @@ footer {{ text-align:center; color:#555; margin-top:30px; padding:10px; border-t
 
 # ─── Comparison Mode ─────────────────────────────────────────────────────────
 
-def _analyze_for_compare(logfile, args, diff_raw=None):
+def _analyze_for_compare(logfile, args, config_raw=None):
     """Run analysis pipeline on a single file and return structured results.
     Returns dict with: config, data, noise_results, pid_results, motor_analysis,
                         dterm_results, plan, noise_fp, hover_osc, profile
     """
     raw_params = parse_headers_from_bbl(logfile)
     config = extract_fc_config(raw_params)
-    if diff_raw:
-        merge_diff_into_config(config, diff_raw)
+    if config_raw:
+        merge_diff_into_config(config, config_raw)
 
     # Auto-detect frame
     craft = config.get("craft_name", "")
@@ -7249,7 +7258,7 @@ footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-
 </div><footer>INAV Blackbox Analyzer v{REPORT_VERSION} - Comparison Report</footer></body></html>"""
 
 
-def _run_comparison(file_a, file_b, args, diff_raw):
+def _run_comparison(file_a, file_b, args, config_raw):
     """Run comparative analysis on two flight logs."""
     R, B, C, G, Y, RED, DIM = _colors()
 
@@ -7259,12 +7268,12 @@ def _run_comparison(file_a, file_b, args, diff_raw):
     print()
 
     print(f"  Analyzing flight A...", end=" ", flush=True)
-    res_a = _analyze_for_compare(file_a, args, diff_raw)
+    res_a = _analyze_for_compare(file_a, args, config_raw)
     sa = res_a["plan"]["scores"]
     print(f"score {sa['overall']:.0f}/100")
 
     print(f"  Analyzing flight B...", end=" ", flush=True)
-    res_b = _analyze_for_compare(file_b, args, diff_raw)
+    res_b = _analyze_for_compare(file_b, args, config_raw)
     sb = res_b["plan"]["scores"]
     print(f"score {sb['overall']:.0f}/100")
 
@@ -7774,7 +7783,7 @@ allPlotIds.forEach(srcId => {{
 </script></body></html>"""
 
 
-def _run_replay(logfile, args, diff_raw):
+def _run_replay(logfile, args, config_raw):
     """Generate interactive replay HTML for a single flight."""
     R, B, C, G, Y, RED, DIM = _colors()
 
@@ -7783,8 +7792,8 @@ def _run_replay(logfile, args, diff_raw):
 
     raw_params = parse_headers_from_bbl(logfile)
     config = extract_fc_config(raw_params)
-    if diff_raw:
-        merge_diff_into_config(config, diff_raw)
+    if config_raw:
+        merge_diff_into_config(config, config_raw)
 
     ext = os.path.splitext(logfile)[1].lower()
     is_blackbox = ext in (".bbl", ".bfl", ".bbs")
@@ -7833,13 +7842,13 @@ def _run_replay(logfile, args, diff_raw):
     print()
 
 
-def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
+def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
     """Analyze a single blackbox log file.
     
     Args:
         logfile: Path to log file
         args: Command line arguments
-        diff_raw: Optional CLI diff text
+        config_raw: Optional CLI diff text
         summary_only: If True, skip verbose output/reports but still analyze
                       and store in DB. Returns a summary dict.
     
@@ -7878,8 +7887,8 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     config = extract_fc_config(raw_params)
 
     # ── Merge CLI diff if available ──
-    if diff_raw:
-        n_merged = merge_diff_into_config(config, diff_raw)
+    if config_raw:
+        n_merged = merge_diff_into_config(config, config_raw)
         mismatches = config.get("_diff_mismatches", [])
         if n_merged > 0 or mismatches:
             parts = [f"{n_merged} new settings from CLI diff"]
@@ -8226,7 +8235,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
                 db = FlightDB(args.db_path)
                 flight_id, is_new = db.store_flight(
                     plan, config, data, hover_osc, motor_analysis,
-                    pid_results, noise_results, log_file=logfile, diff_raw=diff_raw)
+                    pid_results, noise_results, log_file=logfile, config_raw=config_raw)
                 db.close()
                 summary["flight_id"] = flight_id
                 summary["is_new"] = is_new
@@ -8241,8 +8250,8 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
     # ── Config review from diff (if available) ──
     # Runs parameter analyzer checks on the FC's current config.
     # Catches safety, nav, motor protocol issues that flight data alone can't detect.
-    if diff_raw and not args.no_terminal and plan["verdict"] != "GROUND_ONLY":
-        _print_config_review(diff_raw, config, frame_inches, plan)
+    if config_raw and not args.no_terminal and plan["verdict"] != "GROUND_ONLY":
+        _print_config_review(config_raw, config, frame_inches, plan)
 
     nav_results = None  # nav analysis only runs in --nav mode
     if not args.no_html and plan["verdict"] != "GROUND_ONLY":
@@ -8284,7 +8293,7 @@ def _analyze_single_log(logfile, args, diff_raw=None, summary_only=False):
             db = FlightDB(args.db_path)
             flight_id, is_new = db.store_flight(
                 plan, config, data, hover_osc, motor_analysis,
-                pid_results, noise_results, log_file=logfile, diff_raw=diff_raw)
+                pid_results, noise_results, log_file=logfile, config_raw=config_raw)
             craft = config.get("craft_name", "unknown")
             n_flights = db.get_flight_count(craft)
             if is_new:

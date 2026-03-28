@@ -21,7 +21,7 @@ import json
 import os
 from datetime import datetime
 
-VERSION = "2.17.0"
+VERSION = "2.18.0"
 
 SCHEMA_VERSION = 1
 

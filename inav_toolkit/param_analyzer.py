@@ -21,7 +21,7 @@ import sys
 import textwrap
 from datetime import datetime
 
-VERSION = "2.17.0"
+VERSION = "2.18.0"
 
 
 def _enable_ansi_colors():
@@ -811,7 +811,7 @@ def run_all_checks(parsed, frame_inches=None, blackbox_state=None):
     findings.extend(check_motors_protocol(parsed))
     findings.extend(check_filters(parsed, frame_inches))
     findings.extend(check_pid_config(parsed, frame_inches))
-    findings.extend(check_navigation(parsed))
+    findings.extend(check_navigation(parsed, frame_inches))
     findings.extend(check_gps(parsed))
     findings.extend(check_blackbox(parsed))
     findings.extend(check_battery(parsed))
@@ -1280,7 +1280,7 @@ def check_pid_config(parsed, frame_inches=None):
 
 # ─── Navigation Checks ───────────────────────────────────────────────────────
 
-def check_navigation(parsed):
+def check_navigation(parsed, frame_inches=None):
     findings = []
 
     rth_alt = get_setting(parsed, "nav_rth_altitude", 5000)
@@ -1346,26 +1346,123 @@ def check_navigation(parsed):
                 setting="nav_mc_hover_thr",
                 current=str(hover)))
 
-    # Nav PID values from active profile
-    pos_p = profile.get("nav_mc_pos_xy_p", get_setting(parsed, "nav_mc_pos_xy_p", None))
-    heading_p = profile.get("nav_mc_heading_p", get_setting(parsed, "nav_mc_heading_p", None))
+    # ── Frame-aware nav PID checks ──
+    # INAV defaults are tuned for 5" quads. Larger frames have more inertia
+    # and need softer nav PIDs and longer deceleration time. The default
+    # values cause oscillation on deceleration, overshoot on RTH arrival,
+    # and bouncy position hold on 10"+ frames.
+    #
+    # Recommended ranges by frame size:
+    #   5":  pos_p=50-65  vel_p=35-50  vel_d=80-120  decel=100-150
+    #   7":  pos_p=40-55  vel_p=30-40  vel_d=80-120  decel=120-180
+    #   10": pos_p=30-45  vel_p=20-30  vel_d=80-120  decel=180-280
+    #   12": pos_p=25-40  vel_p=15-25  vel_d=80-120  decel=220-350
+    #   15": pos_p=20-35  vel_p=10-20  vel_d=80-120  decel=280-400
 
-    if pos_p is not None and isinstance(pos_p, (int, float)):
-        if pos_p > 50:
-            findings.append(Finding(
-                WARNING, "Navigation", f"Position hold P = {pos_p} - aggressive",
-                "High position P gain can cause oscillation (salad bowling) in position hold and RTH. "
-                "The quad overcorrects, overshoots, and oscillates around the target position.",
-                setting="nav_mc_pos_xy_p",
-                current=str(pos_p),
-                recommended="20-35",
-                cli_fix=f"set nav_mc_pos_xy_p = 30"))
-        elif pos_p < 15:
-            findings.append(Finding(
-                INFO, "Navigation", f"Position hold P = {pos_p} - conservative",
-                "Low position P may result in slow corrections and drifting in wind.",
-                setting="nav_mc_pos_xy_p",
-                current=str(pos_p)))
+    nav_rec = None
+    if frame_inches and frame_inches >= 7:
+        if frame_inches >= 15:
+            nav_rec = {"pos_p_max": 35, "vel_p_max": 20, "decel_min": 280,
+                       "pos_p_rec": 25, "vel_p_rec": 15, "vel_i_rec": 8, "decel_rec": 350}
+        elif frame_inches >= 12:
+            nav_rec = {"pos_p_max": 40, "vel_p_max": 25, "decel_min": 220,
+                       "pos_p_rec": 30, "vel_p_rec": 20, "vel_i_rec": 10, "decel_rec": 280}
+        elif frame_inches >= 10:
+            nav_rec = {"pos_p_max": 45, "vel_p_max": 30, "decel_min": 180,
+                       "pos_p_rec": 40, "vel_p_rec": 25, "vel_i_rec": 10, "decel_rec": 250}
+        elif frame_inches >= 7:
+            nav_rec = {"pos_p_max": 55, "vel_p_max": 40, "decel_min": 120,
+                       "pos_p_rec": 45, "vel_p_rec": 35, "vel_i_rec": 15, "decel_rec": 150}
+
+    # INAV defaults for nav PIDs (these won't appear in diff all if unchanged)
+    INAV_NAV_DEFAULTS = {
+        "nav_mc_pos_xy_p": 65,
+        "nav_mc_vel_xy_p": 40,
+        "nav_mc_vel_xy_i": 15,
+        "nav_mc_pos_deceleration_time": 120,
+        "nav_mc_heading_p": 60,
+    }
+
+    pos_p = profile.get("nav_mc_pos_xy_p",
+                        get_setting(parsed, "nav_mc_pos_xy_p", INAV_NAV_DEFAULTS["nav_mc_pos_xy_p"]))
+    vel_p = profile.get("nav_mc_vel_xy_p",
+                        get_setting(parsed, "nav_mc_vel_xy_p", INAV_NAV_DEFAULTS["nav_mc_vel_xy_p"]))
+    vel_i = profile.get("nav_mc_vel_xy_i",
+                        get_setting(parsed, "nav_mc_vel_xy_i", INAV_NAV_DEFAULTS["nav_mc_vel_xy_i"]))
+    decel = get_setting(parsed, "nav_mc_pos_deceleration_time",
+                        INAV_NAV_DEFAULTS["nav_mc_pos_deceleration_time"])
+    heading_p = profile.get("nav_mc_heading_p",
+                            get_setting(parsed, "nav_mc_heading_p", INAV_NAV_DEFAULTS["nav_mc_heading_p"]))
+
+    if nav_rec:
+        is_default_pos = (pos_p == INAV_NAV_DEFAULTS["nav_mc_pos_xy_p"])
+        is_default_vel = (vel_p == INAV_NAV_DEFAULTS["nav_mc_vel_xy_p"])
+        is_default_decel = (decel == INAV_NAV_DEFAULTS["nav_mc_pos_deceleration_time"])
+        default_note = " (INAV default - tuned for 5-inch)"
+
+        # Frame-aware checks
+        if pos_p is not None and isinstance(pos_p, (int, float)):
+            if pos_p > nav_rec["pos_p_max"]:
+                val_note = default_note if is_default_pos else ""
+                findings.append(Finding(
+                    WARNING, "Navigation",
+                    f"Position P = {pos_p}{val_note} - too aggressive for {frame_inches}-inch",
+                    f"On {frame_inches}-inch with more "
+                    f"inertia, high position P causes overshoot and oscillation on RTH arrival "
+                    f"and position hold. The quad overshoots the target position, corrects back, "
+                    f"overshoots again.",
+                    setting="nav_mc_pos_xy_p",
+                    current=str(pos_p),
+                    recommended=str(nav_rec["pos_p_rec"]),
+                    cli_fix=f"set nav_mc_pos_xy_p = {nav_rec['pos_p_rec']}"))
+
+        if vel_p is not None and isinstance(vel_p, (int, float)):
+            if vel_p > nav_rec["vel_p_max"]:
+                val_note = default_note if is_default_vel else ""
+                findings.append(Finding(
+                    WARNING, "Navigation",
+                    f"Velocity XY P = {vel_p}{val_note} - too aggressive for {frame_inches}-inch",
+                    f"Controls how hard the quad brakes when decelerating. "
+                    f"On {frame_inches}-inch, the quad can't stop as fast due to momentum, "
+                    f"so high velocity P causes oscillation in the direction of travel when "
+                    f"stopping or changing direction.",
+                    setting="nav_mc_vel_xy_p",
+                    current=str(vel_p),
+                    recommended=str(nav_rec["vel_p_rec"]),
+                    cli_fix=f"set nav_mc_vel_xy_p = {nav_rec['vel_p_rec']}"))
+
+        if decel is not None and isinstance(decel, (int, float)):
+            if decel < nav_rec["decel_min"]:
+                val_note = default_note if is_default_decel else ""
+                findings.append(Finding(
+                    WARNING, "Navigation",
+                    f"Deceleration time = {decel} ({decel/100:.1f}s){val_note} - too short for {frame_inches}-inch",
+                    f"This controls how quickly the quad tries to stop from cruise speed. "
+                    f"A {frame_inches}-inch has much more "
+                    f"momentum and needs more distance/time to decelerate smoothly. "
+                    f"Too short causes overshoot and oscillation on RTH and position hold transitions.",
+                    setting="nav_mc_pos_deceleration_time",
+                    current=f"{decel} ({decel/100:.1f}s)",
+                    recommended=f"{nav_rec['decel_rec']} ({nav_rec['decel_rec']/100:.1f}s)",
+                    cli_fix=f"set nav_mc_pos_deceleration_time = {nav_rec['decel_rec']}"))
+    else:
+        # Generic checks (no frame size or small frame)
+        if pos_p is not None and isinstance(pos_p, (int, float)):
+            if pos_p > 50:
+                findings.append(Finding(
+                    WARNING, "Navigation", f"Position hold P = {pos_p} - aggressive",
+                    "High position P gain can cause oscillation in position hold and RTH. "
+                    "The quad overcorrects, overshoots, and oscillates around the target position.",
+                    setting="nav_mc_pos_xy_p",
+                    current=str(pos_p),
+                    recommended="20-35",
+                    cli_fix=f"set nav_mc_pos_xy_p = 30"))
+            elif pos_p < 15:
+                findings.append(Finding(
+                    INFO, "Navigation", f"Position hold P = {pos_p} - conservative",
+                    "Low position P may result in slow corrections and drifting in wind.",
+                    setting="nav_mc_pos_xy_p",
+                    current=str(pos_p)))
 
     if heading_p is not None and isinstance(heading_p, (int, float)):
         if heading_p > 60:
