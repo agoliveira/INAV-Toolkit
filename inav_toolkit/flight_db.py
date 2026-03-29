@@ -21,7 +21,7 @@ import json
 import os
 from datetime import datetime
 
-VERSION = "2.21.0"
+VERSION = "2.3.0"
 
 SCHEMA_VERSION = 1
 
@@ -441,6 +441,213 @@ class FlightDB:
         else:
             row = conn.execute("SELECT COUNT(*) FROM flights").fetchone()
         return row[0]
+
+    def get_flight_diff(self, craft, current_flight_id):
+        """Compare current flight with the previous flight for the same craft.
+
+        Returns dict with:
+            has_previous (bool): True if a previous flight exists
+            current (dict): Current flight summary
+            previous (dict): Previous flight summary
+            score_delta (float): Score change
+            config_changes (list): [{param, old, new}]
+            metric_changes (list): [{metric, axis, old, new, direction}]
+            verdict (str): Human-readable interpretation
+        """
+        conn = self._connect()
+
+        # Get previous flight (most recent before current)
+        current_ts = conn.execute(
+            "SELECT timestamp FROM flights WHERE id = ?",
+            (current_flight_id,)).fetchone()
+        if not current_ts:
+            return {"has_previous": False}
+
+        prev = conn.execute("""
+            SELECT * FROM flights
+            WHERE craft = ? AND id != ? AND timestamp < ?
+              AND verdict != 'GROUND_ONLY' AND overall_score IS NOT NULL
+            ORDER BY timestamp DESC LIMIT 1
+        """, (craft, current_flight_id, current_ts["timestamp"])).fetchone()
+
+        if not prev:
+            return {"has_previous": False}
+
+        curr = conn.execute(
+            "SELECT * FROM flights WHERE id = ?",
+            (current_flight_id,)).fetchone()
+
+        # Get axis data for both
+        def get_axes(fid):
+            rows = conn.execute(
+                "SELECT * FROM flight_axes WHERE flight_id = ?", (fid,)).fetchall()
+            return {r["axis"]: dict(r) for r in rows}
+
+        curr_axes = get_axes(curr["id"])
+        prev_axes = get_axes(prev["id"])
+
+        # Get config for both
+        def get_config(fid):
+            rows = conn.execute(
+                "SELECT param, value FROM flight_config WHERE flight_id = ?",
+                (fid,)).fetchall()
+            return {r["param"]: r["value"] for r in rows}
+
+        curr_config = get_config(curr["id"])
+        prev_config = get_config(prev["id"])
+
+        # Build summaries
+        def flight_summary(f, axes):
+            return {
+                "id": f["id"], "timestamp": f["timestamp"],
+                "score": f["overall_score"], "noise": f["noise_score"],
+                "pid": f["pid_score"], "motor": f["motor_score"],
+                "verdict": f["verdict"], "duration": f["duration_s"],
+            }
+
+        result = {
+            "has_previous": True,
+            "current": flight_summary(curr, curr_axes),
+            "previous": flight_summary(prev, prev_axes),
+            "score_delta": (curr["overall_score"] or 0) - (prev["overall_score"] or 0),
+            "config_changes": [],
+            "metric_changes": [],
+            "verdict": "",
+        }
+
+        # Config changes (PID-relevant params)
+        interesting_params = [
+            "roll_p", "roll_i", "roll_d", "roll_ff",
+            "pitch_p", "pitch_i", "pitch_d", "pitch_ff",
+            "yaw_p", "yaw_i", "yaw_d", "yaw_ff",
+            "gyro_lpf_hz", "dterm_lpf_hz", "dyn_notch_min_hz",
+            "rpm_filter_enabled", "motor_protocol",
+            "gyro_main_lpf_hz", "dterm_lpf_type",
+            "mc_p_roll", "mc_i_roll", "mc_d_roll", "mc_cd_roll",
+            "mc_p_pitch", "mc_i_pitch", "mc_d_pitch", "mc_cd_pitch",
+            "mc_p_yaw", "mc_i_yaw", "mc_d_yaw", "mc_cd_yaw",
+        ]
+        all_params = set(list(curr_config.keys()) + list(prev_config.keys()))
+        for param in sorted(all_params):
+            if param not in interesting_params:
+                continue
+            old_val = prev_config.get(param)
+            new_val = curr_config.get(param)
+            if old_val != new_val and old_val is not None and new_val is not None:
+                result["config_changes"].append({
+                    "param": param, "old": old_val, "new": new_val
+                })
+
+        # Metric changes per axis
+        for axis in ["Roll", "Pitch", "Yaw"]:
+            ca = curr_axes.get(axis, {})
+            pa = prev_axes.get(axis, {})
+
+            # Overshoot
+            co = ca.get("overshoot_pct")
+            po = pa.get("overshoot_pct")
+            if co is not None and po is not None:
+                delta = co - po
+                if abs(delta) > 3:
+                    result["metric_changes"].append({
+                        "metric": "overshoot", "axis": axis,
+                        "old": po, "new": co, "unit": "%",
+                        "direction": "worse" if delta > 0 else "better",
+                    })
+
+            # Delay
+            cd = ca.get("delay_ms")
+            pd = pa.get("delay_ms")
+            if cd is not None and pd is not None:
+                delta = cd - pd
+                if abs(delta) > 2:
+                    result["metric_changes"].append({
+                        "metric": "delay", "axis": axis,
+                        "old": pd, "new": cd, "unit": "ms",
+                        "direction": "worse" if delta > 0 else "better",
+                    })
+
+            # Hover oscillation
+            cr = ca.get("hover_rms")
+            pr = pa.get("hover_rms")
+            if cr is not None and pr is not None:
+                delta = cr - pr
+                if abs(delta) > 1.5:
+                    result["metric_changes"].append({
+                        "metric": "hover RMS", "axis": axis,
+                        "old": pr, "new": cr, "unit": "°/s",
+                        "direction": "worse" if delta > 0 else "better",
+                    })
+
+        # Score sub-components
+        for label, key in [("Noise", "noise_score"), ("PID", "pid_score"), ("Motor", "motor_score")]:
+            cv = curr.get(key)
+            pv = prev.get(key)
+            if cv is not None and pv is not None:
+                delta = cv - pv
+                if abs(delta) > 3:
+                    result["metric_changes"].append({
+                        "metric": label + " score", "axis": "",
+                        "old": pv, "new": cv, "unit": "",
+                        "direction": "better" if delta > 0 else "worse",
+                    })
+
+        # Generate verdict
+        result["verdict"] = _generate_diff_verdict(result)
+        return result
+
+
+def _generate_diff_verdict(diff):
+    """Generate a human-readable verdict explaining why the score changed."""
+    delta = diff["score_delta"]
+    changes = diff["config_changes"]
+    metrics = diff["metric_changes"]
+
+    if abs(delta) < 3:
+        return "Score is stable — changes had minimal effect."
+
+    parts = []
+    direction = "improved" if delta > 0 else "dropped"
+
+    # Correlate config changes with metric changes
+    p_changed = any("_p" in c["param"] or c["param"].startswith("mc_p_") for c in changes)
+    d_changed = any("_d" in c["param"] or c["param"].startswith("mc_d_") for c in changes)
+    ff_changed = any("_ff" in c["param"] or c["param"].startswith("mc_cd_") for c in changes)
+    lpf_changed = any("lpf" in c["param"] for c in changes)
+
+    os_worse = any(m["metric"] == "overshoot" and m["direction"] == "worse" for m in metrics)
+    os_better = any(m["metric"] == "overshoot" and m["direction"] == "better" for m in metrics)
+    delay_better = any(m["metric"] == "delay" and m["direction"] == "better" for m in metrics)
+    delay_worse = any(m["metric"] == "delay" and m["direction"] == "worse" for m in metrics)
+    hover_worse = any(m["metric"] == "hover RMS" and m["direction"] == "worse" for m in metrics)
+    hover_better = any(m["metric"] == "hover RMS" and m["direction"] == "better" for m in metrics)
+
+    if p_changed and os_worse:
+        parts.append("P increase caused more overshoot")
+    if p_changed and delay_better:
+        parts.append("P increase reduced delay")
+    if p_changed and hover_worse:
+        parts.append("P increase destabilized hover")
+    if p_changed and hover_better:
+        parts.append("P reduction stabilized hover")
+    if d_changed and os_better:
+        parts.append("D increase helped dampen overshoot")
+    if ff_changed and os_worse:
+        parts.append("FF increase added overshoot")
+    if ff_changed and os_better:
+        parts.append("FF reduction helped overshoot")
+    if lpf_changed and hover_worse:
+        parts.append("LPF change let more noise through")
+    if lpf_changed and hover_better:
+        parts.append("LPF change reduced noise in hover")
+
+    if not parts:
+        if delta > 0:
+            parts.append("overall metrics improved")
+        else:
+            parts.append("overall metrics degraded")
+
+    return f"Score {direction} by {abs(delta):.0f} points. {'; '.join(parts)}."
 
 
 def parse_diff_output(diff_text):

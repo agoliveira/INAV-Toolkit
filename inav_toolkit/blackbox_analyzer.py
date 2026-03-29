@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.21.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.3.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.21.0"
+REPORT_VERSION = "2.3.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -6062,9 +6062,164 @@ def _print_section_cli(plan):
         print(f"  {G}  No changes needed — nothing to paste.{R}")
 
 
+def _sparkline(values, width=30, min_val=0, max_val=100):
+    """Render an ASCII sparkline from a list of values.
+
+    Returns a string like: ▁▂▃▅▇█▇▅▃
+    """
+    blocks = " ▁▂▃▄▅▆▇█"
+    if not values:
+        return ""
+    vmin = min_val if min_val is not None else min(values)
+    vmax = max_val if max_val is not None else max(values)
+    if vmax <= vmin:
+        return blocks[4] * len(values)
+
+    result = []
+    for v in values:
+        if v is None:
+            result.append(" ")
+            continue
+        normalized = (v - vmin) / (vmax - vmin)
+        idx = int(normalized * (len(blocks) - 1))
+        idx = max(0, min(len(blocks) - 1, idx))
+        result.append(blocks[idx])
+    return "".join(result)
+
+
+def _print_section_history(prog, flight_diff=None):
+    """Print flight history with sparklines and trend."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}FLIGHT HISTORY:{R}")
+
+    flights = prog.get("flights", [])
+    if not flights:
+        print(f"  {DIM}  No flight history available.{R}")
+        return
+
+    # Score sparkline
+    scores = [f.get("score") for f in flights]
+    valid_scores = [s for s in scores if s is not None]
+
+    trend_icon = {"improving": f"{G}↗ Improving", "degrading": f"{RED}↘ Degrading",
+                  "stable": f"{Y}→ Stable", "insufficient": f"{DIM}? First flight"}.get(prog.get("trend", ""), "")
+    print(f"\n  Trend: {trend_icon}{R}")
+
+    if len(valid_scores) >= 2:
+        spark = _sparkline(valid_scores)
+        print(f"\n  {B}Score:{R}  {spark}  {DIM}{valid_scores[0]:.0f} → {valid_scores[-1]:.0f}{R}")
+
+        # Sub-score sparklines
+        noise_scores = [f.get("noise") for f in flights]
+        pid_scores = [f.get("pid") for f in flights]
+        motor_scores = [f.get("motor") for f in flights]
+
+        if any(s is not None for s in noise_scores):
+            spark_n = _sparkline([s if s is not None else 0 for s in noise_scores])
+            print(f"  {DIM}Noise:{R}  {spark_n}")
+        if any(s is not None for s in pid_scores):
+            spark_p = _sparkline([s if s is not None else 0 for s in pid_scores])
+            print(f"  {DIM}PID:  {R}  {spark_p}")
+        if any(s is not None for s in motor_scores):
+            spark_m = _sparkline([s if s is not None else 0 for s in motor_scores])
+            print(f"  {DIM}Motor:{R}  {spark_m}")
+
+    # Flight table
+    print(f"\n  {B}{'#':>3}  {'Score':>6}  {'Noise':>6}  {'PID':>6}  {'Duration':>8}  Verdict{R}")
+    print(f"  {DIM}{'─'*60}{R}")
+    for f in flights:
+        fid = f.get("id", "?")
+        score = f"{f['score']:.0f}" if f.get("score") is not None else "-"
+        noise = f"{f['noise']:.0f}" if f.get("noise") is not None else "-"
+        pid = f"{f['pid']:.0f}" if f.get("pid") is not None else "-"
+        dur = f"{f['duration']:.0f}s" if f.get("duration") is not None else "-"
+        verdict = f.get("verdict", "").replace("_", " ").lower()
+        sc = G if (f.get("score") or 0) >= 85 else Y if (f.get("score") or 0) >= 60 else RED
+        print(f"  {sc}{fid:>3}{R}  {sc}{score:>6}{R}  {noise:>6}  {pid:>6}  {dur:>8}  {DIM}{verdict}{R}")
+
+    # Changes since last
+    changes = prog.get("changes", [])
+    if changes:
+        print(f"\n  {B}Latest changes:{R}")
+        for ch in changes:
+            print(f"    {ch}")
+
+
+def _print_section_diff(flight_diff):
+    """Print flight-to-flight comparison section."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}COMPARED TO PREVIOUS FLIGHT:{R}")
+
+    if not flight_diff or not flight_diff.get("has_previous"):
+        print(f"  {DIM}  No previous flight to compare against.{R}")
+        return
+
+    prev = flight_diff["previous"]
+    curr = flight_diff["current"]
+    delta = flight_diff["score_delta"]
+
+    # Timestamp of previous
+    from datetime import datetime as _dt
+    try:
+        prev_ts = _dt.fromisoformat(prev["timestamp"])
+        now = _dt.now()
+        age = now - prev_ts
+        if age.days > 0:
+            age_str = f"{age.days}d ago"
+        elif age.seconds > 3600:
+            age_str = f"{age.seconds // 3600}h ago"
+        else:
+            age_str = f"{age.seconds // 60}m ago"
+    except Exception:
+        age_str = prev["timestamp"][:16]
+
+    print(f"  {DIM}Flight #{prev['id']} ({age_str}){R}")
+
+    # Score delta
+    dc = G if delta > 0 else RED if delta < 0 else Y
+    arrow = "↗" if delta > 0 else "↘" if delta < 0 else "→"
+    print(f"\n  Score: {prev['score']:.0f} → {curr['score']:.0f}  {dc}{arrow} {delta:+.0f}{R}")
+
+    # Metric changes
+    metrics = flight_diff.get("metric_changes", [])
+    if metrics:
+        print()
+        for m in metrics:
+            mc = G if m["direction"] == "better" else RED
+            arrow = "↗" if m["direction"] == "better" else "↘"
+            ax_str = f"{m['axis']} " if m["axis"] else ""
+            if isinstance(m["old"], float):
+                print(f"    {ax_str}{m['metric']}: {m['old']:.1f}{m['unit']} → {mc}{m['new']:.1f}{m['unit']}  {arrow} {m['direction']}{R}")
+            else:
+                print(f"    {ax_str}{m['metric']}: {m['old']}{m['unit']} → {mc}{m['new']}{m['unit']}  {arrow} {m['direction']}{R}")
+
+    # Config changes
+    config_changes = flight_diff.get("config_changes", [])
+    if config_changes:
+        print(f"\n  {B}Config changes since last flight:{R}")
+        for ch in config_changes:
+            try:
+                old_f = float(ch["old"])
+                new_f = float(ch["new"])
+                pct = ((new_f - old_f) / old_f * 100) if old_f != 0 else 0
+                pct_str = f"  ({pct:+.0f}%)" if abs(pct) > 1 else ""
+            except (ValueError, ZeroDivisionError):
+                pct_str = ""
+            print(f"    {ch['param']}: {ch['old']} → {ch['new']}{pct_str}")
+
+    # Verdict
+    verdict = flight_diff.get("verdict", "")
+    if verdict:
+        vc = G if delta > 0 else Y if abs(delta) < 3 else RED
+        print(f"\n  {vc}{verdict}{R}")
+
+
 def _build_section_statuses(plan, pid_results, noise_fp, motor_analysis,
                             config_review_text, progression_text,
-                            nav_perf=None, nav_results=None):
+                            nav_perf=None, nav_results=None, flight_diff=None,
+                            prog_data=None):
     """Build one-line status per section for the menu display."""
     R, B, C, G, Y, RED, DIM = _colors()
     statuses = {}
@@ -6135,7 +6290,12 @@ def _build_section_statuses(plan, pid_results, noise_fp, motor_analysis,
         statuses["config"] = f"{DIM}no config loaded{R}"
 
     # History status
-    if progression_text and progression_text.strip():
+    if prog_data and len(prog_data.get("flights", [])) >= 2:
+        scores = [f.get("score") for f in prog_data["flights"] if f.get("score") is not None]
+        spark = _sparkline(scores) if scores else ""
+        n = len(prog_data["flights"])
+        statuses["history"] = f"{n} flights {spark}"
+    elif progression_text and progression_text.strip():
         statuses["history"] = f"available"
     else:
         statuses["history"] = f"{DIM}no history{R}"
@@ -6180,18 +6340,30 @@ def _build_section_statuses(plan, pid_results, noise_fp, motor_analysis,
     else:
         statuses["nav_sensors"] = f"{DIM}no sensor data{R}"
 
+    # Flight diff status
+    if flight_diff and flight_diff.get("has_previous"):
+        delta = flight_diff["score_delta"]
+        dc = G if delta > 0 else RED if delta < 0 else Y
+        arrow = "↗" if delta > 0 else "↘" if delta < 0 else "→"
+        n_changes = len(flight_diff.get("config_changes", []))
+        statuses["diff"] = f"{dc}{arrow} {delta:+.0f}{R} ({n_changes} config change{'s' if n_changes != 1 else ''})"
+    else:
+        statuses["diff"] = f"{DIM}no previous flight{R}"
+
     return statuses
 
 
 def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
                       profile, config_review_text, progression_text,
-                      nav_perf=None, nav_results=None):
+                      nav_perf=None, nav_results=None, flight_diff=None,
+                      prog_data=None):
     """Run interactive menu loop for exploring analysis results."""
     R, B, C, G, Y, RED, DIM = _colors()
 
     statuses = _build_section_statuses(plan, pid_results, noise_fp, motor_analysis,
                                         config_review_text, progression_text,
-                                        nav_perf=nav_perf, nav_results=nav_results)
+                                        nav_perf=nav_perf, nav_results=nav_results,
+                                        flight_diff=flight_diff, prog_data=prog_data)
 
     sections = {
         "1": ("PID Tuning", statuses["pid"]),
@@ -6201,6 +6373,7 @@ def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
         "5": ("Nav Sensors", statuses["nav_sensors"]),
         "6": ("Config Review", statuses["config"]),
         "7": ("Flight History", statuses["history"]),
+        "8": ("vs Previous", statuses["diff"]),
         "c": ("CLI Commands", statuses["cli"]),
         "a": ("Show All", ""),
         "q": ("Quit", ""),
@@ -6221,7 +6394,7 @@ def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
         print(f"  {B}{'─'*66}{R}")
 
         try:
-            choice = input(f"\n  {B}Section (1-7, C, A, Q): {R}").strip().lower()
+            choice = input(f"\n  {B}Section (1-8, C, A, Q): {R}").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -6264,10 +6437,17 @@ def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
         elif choice == "7":
             print("\033[2J\033[H", end="")
             _print_score_bar(plan, config, data)
-            if progression_text and progression_text.strip():
+            if prog_data and prog_data.get("flights"):
+                _print_section_history(prog_data, flight_diff)
+            elif progression_text and progression_text.strip():
                 print(progression_text)
             else:
                 print(f"\n  {DIM}No flight history available.{R}")
+            _wait_for_enter()
+        elif choice == "8":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            _print_section_diff(flight_diff)
             _wait_for_enter()
         elif choice == "c":
             print("\033[2J\033[H", end="")
@@ -6294,7 +6474,10 @@ def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
                 print(f"\n  {B}Nav PID commands:{R}")
                 for a in nav_perf["nav_actions"]:
                     print(f"    {G}{a['cli']}{R}")
-            if progression_text and progression_text.strip():
+            _print_section_diff(flight_diff)
+            if prog_data and prog_data.get("flights"):
+                _print_section_history(prog_data, flight_diff)
+            elif progression_text and progression_text.strip():
                 print(progression_text)
             _wait_for_enter()
 
@@ -6837,10 +7020,568 @@ new Chart(document.getElementById('componentChart'), {{
         f.write(html)
 
 
-def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm_results, config, data, charts, nav_results=None):
+def _generate_nav_perf_html(nav_perf):
+    """Generate HTML section for nav controller performance."""
+    if not nav_perf or not nav_perf.get("findings"):
+        return ""
+
+    html = '<section id="sec-nav"><h2>Navigation Performance</h2>'
+    nav_score = nav_perf.get("score")
+    if nav_score is not None:
+        sc = "good" if nav_score >= 85 else "warn" if nav_score >= 60 else "bad"
+        html += f'<div class="cc"><span class="{sc}" style="font-size:1.2rem">Nav Score: {nav_score}/100</span></div>'
+
+    # Deceleration
+    decel = nav_perf.get("deceleration", [])
+    if decel:
+        avg_peak = sum(e["peak_error_cm"] for e in decel) / len(decel)
+        avg_osc = sum(e["oscillation_count"] for e in decel) / len(decel)
+        avg_settle = sum(e["settling_time_s"] for e in decel) / len(decel)
+        worst = max(decel, key=lambda e: e["peak_error_cm"])
+        html += f'<div class="cc"><h3>Deceleration ({len(decel)} events)</h3>'
+        html += f'<table><tr><th>Metric</th><th>Value</th></tr>'
+        html += f'<tr><td>Avg overshoot</td><td>{avg_peak:.0f}cm</td></tr>'
+        html += f'<tr><td>Avg oscillations</td><td>{avg_osc:.1f}</td></tr>'
+        html += f'<tr><td>Avg settling time</td><td>{avg_settle:.1f}s</td></tr>'
+        html += f'<tr><td>Worst overshoot</td><td class="bad">{worst["peak_error_cm"]:.0f}cm at {worst["time_s"]:.1f}s</td></tr>'
+        html += '</table></div>'
+
+    # Position hold
+    ph = nav_perf.get("poshold")
+    if ph:
+        cep_c = "good" if ph["cep_cm"] < 150 else "warn" if ph["cep_cm"] < 400 else "bad"
+        html += f'<div class="cc"><h3>Position Hold ({ph["hold_duration_s"]:.0f}s)</h3>'
+        html += f'<table><tr><th>Metric</th><th>Value</th></tr>'
+        html += f'<tr><td>CEP</td><td class="{cep_c}">{ph["cep_cm"]:.0f}cm</td></tr>'
+        html += f'<tr><td>Max drift</td><td>{ph["max_drift_cm"]:.0f}cm</td></tr>'
+        html += f'<tr><td>RMS error</td><td>{ph["rms_error_cm"]:.0f}cm</td></tr>'
+        if ph.get("toilet_bowl"):
+            html += f'<tr><td>Toilet bowl</td><td class="bad">Detected (period {ph["tb_period_s"]:.1f}s)</td></tr>'
+        html += '</table></div>'
+
+    # Altitude hold
+    ah = nav_perf.get("althold")
+    if ah:
+        alt_c = "good" if ah["rms_error_cm"] < 50 else "warn" if ah["rms_error_cm"] < 150 else "bad"
+        html += f'<div class="cc"><h3>Altitude Hold ({ah["hold_duration_s"]:.0f}s)</h3>'
+        html += f'<table><tr><th>Metric</th><th>Value</th></tr>'
+        html += f'<tr><td>RMS error</td><td class="{alt_c}">{ah["rms_error_cm"]:.0f}cm</td></tr>'
+        html += f'<tr><td>Max error</td><td>{ah["max_error_cm"]:.0f}cm</td></tr>'
+        if ah.get("oscillation"):
+            html += f'<tr><td>Oscillation</td><td class="warn">{ah["osc_freq_hz"]:.1f}Hz</td></tr>'
+        html += '</table></div>'
+
+    # Findings
+    for f in nav_perf.get("findings", []):
+        fc = "warning" if f["level"] == "WARNING" else "info"
+        html += f'<div class="nav-findings"><div class="finding {fc}">{f["text"]}</div></div>'
+
+    # Nav actions
+    nav_actions = nav_perf.get("nav_actions", [])
+    if nav_actions:
+        html += '<div class="cc"><h3>Nav PID Recommendations</h3>'
+        for a in nav_actions:
+            html += f'<div style="margin:8px 0"><strong>{a["action"]}</strong>'
+            html += f'<div style="color:var(--dm);font-size:.8rem">{a["reason"]}</div>'
+            html += f'<code style="color:var(--gn)">{a["cli"]}</code></div>'
+        html += '</div>'
+
+    html += '</section>'
+    return html
+
+
+def _generate_whatif_html(config, plan, pid_results, noise_results):
+    """Generate the interactive What-If simulation section for the HTML report."""
+
+    # Extract current values
+    axes = ["roll", "pitch", "yaw"]
+    current = {}
+    for ax in axes:
+        current[ax] = {
+            "p": config.get(f"{ax}_p", 40),
+            "i": config.get(f"{ax}_i", 30),
+            "d": config.get(f"{ax}_d", 25),
+            "ff": config.get(f"{ax}_ff", 60),
+        }
+
+    # Extract recommended values from plan actions
+    recommended = {ax: dict(current[ax]) for ax in axes}
+    for a in plan.get("actions", []):
+        if a.get("deferred"):
+            continue
+        subs = a.get("sub_actions", [])
+        for sa in subs:
+            param = sa.get("param", "")
+            for ax in axes:
+                for term in ["p", "i", "d", "ff"]:
+                    if param == f"{ax}_{term}":
+                        recommended[ax][term] = sa.get("new", current[ax][term])
+
+    # Extract measurements
+    measurements = {}
+    for pid in (pid_results or []):
+        if pid is None:
+            continue
+        ax = pid["axis"].lower()
+        measurements[ax] = {
+            "overshoot": pid.get("avg_overshoot_pct"),
+            "delay": pid.get("tracking_delay_ms"),
+        }
+
+    # Filter values
+    gyro_lpf = config.get("gyro_lowpass_hz", 100)
+    dterm_lpf = config.get("dterm_lpf_hz", 100)
+
+    # Downsample spectrum for embedding (max 200 points)
+    spectrum_data = []
+    for nr in (noise_results or []):
+        if nr is None:
+            continue
+        freqs = nr["freqs"]
+        psd = nr["psd_db"]
+        if hasattr(freqs, 'tolist'):
+            # Downsample to 200 points
+            step = max(1, len(freqs) // 200)
+            spectrum_data.append({
+                "axis": nr["axis"],
+                "freqs": [float(f) for f in freqs[::step]],
+                "psd": [float(p) for p in psd[::step]],
+            })
+
+    # Build JSON data for JS
+    import json as _json
+    whatif_data = _json.dumps({
+        "current": current,
+        "recommended": recommended,
+        "measurements": measurements,
+        "gyro_lpf": gyro_lpf,
+        "dterm_lpf": dterm_lpf,
+        "spectrum": spectrum_data,
+    })
+
+    return f'''<section id="sec-whatif"><h2>What-If Simulation</h2>
+<div class="cc" style="padding:20px">
+<p style="color:var(--dm);font-size:.8rem;margin-bottom:16px">
+Explore how PID and filter changes would affect your tune. The "Current" column shows what was flying.
+"Recommended" shows the analyzer's suggestions. Adjust the sliders in "Your Scenario" to see predicted effects.
+<strong>Predictions are estimates</strong> — fly and re-analyze for real data.</p>
+
+<div id="wif-container"></div>
+
+<div style="margin-top:20px">
+<h3>Filter Preview</h3>
+<p style="color:var(--dm);font-size:.8rem">Drag the slider to see how different LPF cutoff frequencies affect the noise spectrum.</p>
+<div style="display:flex;align-items:center;gap:16px;margin:12px 0">
+  <label style="color:var(--bl)">Gyro LPF:</label>
+  <input type="range" id="wif-glpf" min="20" max="200" value="{gyro_lpf}" style="flex:1">
+  <span id="wif-glpf-val" style="color:var(--gn);min-width:50px">{gyro_lpf}Hz</span>
+  <span id="wif-glpf-lag" style="color:var(--dm);font-size:.8rem"></span>
+</div>
+<canvas id="wif-spectrum" width="800" height="250" style="width:100%;background:var(--bg);border:1px solid var(--bd);border-radius:4px"></canvas>
+</div>
+
+<div style="margin-top:20px;text-align:center">
+<button id="wif-copy" style="background:var(--bl);color:var(--bg);border:none;padding:10px 24px;border-radius:6px;cursor:pointer;font-weight:600;font-size:.9rem">
+Copy CLI Commands</button>
+<span id="wif-copied" style="color:var(--gn);margin-left:12px;display:none">Copied!</span>
+</div>
+</div>
+
+<script>
+(function() {{
+const D = {whatif_data};
+const axes = ["roll","pitch","yaw"];
+const terms = ["p","i","d","ff"];
+const termLabels = {{"p":"P","i":"I","d":"D","ff":"FF"}};
+const cliMap = {{"roll_p":"mc_p_roll","roll_i":"mc_i_roll","roll_d":"mc_d_roll","roll_ff":"mc_cd_roll",
+"pitch_p":"mc_p_pitch","pitch_i":"mc_i_pitch","pitch_d":"mc_d_pitch","pitch_ff":"mc_cd_pitch",
+"yaw_p":"mc_p_yaw","yaw_i":"mc_i_yaw","yaw_d":"mc_d_yaw","yaw_ff":"mc_cd_yaw"}};
+
+// Build PID table
+const ct = document.getElementById("wif-container");
+let h = '<table style="width:100%"><tr><th>Axis</th><th>Term</th><th>Current</th><th>Recommended</th><th colspan="2">Your Scenario</th><th>Predicted Effect</th></tr>';
+
+axes.forEach(ax => {{
+  terms.forEach((t,ti) => {{
+    const cur = D.current[ax][t];
+    const rec = D.recommended[ax][t];
+    const maxVal = t==="ff"?120:t==="p"?200:t==="i"?200:150;
+    const axLabel = ti===0 ? `<td rowspan="4" class="ax-${{ax}}" style="font-weight:700;font-size:1.1rem">${{ax.charAt(0).toUpperCase()+ax.slice(1)}}</td>` : "";
+    const changed = rec !== cur;
+    const recStyle = changed ? 'style="color:var(--yl)"' : '';
+    h += `<tr>${{axLabel}}<td>${{termLabels[t]}}</td><td>${{cur}}</td><td ${{recStyle}}>${{rec}}</td>`;
+    h += `<td><input type="range" id="wif-${{ax}}-${{t}}" min="0" max="${{maxVal}}" value="${{rec}}" style="width:120px"></td>`;
+    h += `<td id="wif-${{ax}}-${{t}}-val" style="min-width:30px;color:var(--gn)">${{rec}}</td>`;
+    h += `<td id="wif-${{ax}}-${{t}}-fx" style="color:var(--dm);font-size:.8rem"></td></tr>`;
+  }});
+}});
+h += '</table>';
+
+// Prediction display
+h += '<div style="margin-top:16px;display:grid;grid-template-columns:repeat(3,1fr);gap:12px">';
+axes.forEach(ax => {{
+  h += `<div class="cc" style="text-align:center"><h3 class="ax-${{ax}}">${{ax.charAt(0).toUpperCase()+ax.slice(1)}}</h3>`;
+  h += `<div id="wif-pred-${{ax}}" style="font-size:.85rem"></div></div>`;
+}});
+h += '</div>';
+ct.innerHTML = h;
+
+// Simple prediction model
+function predict(ax) {{
+  const p = parseInt(document.getElementById(`wif-${{ax}}-p`).value);
+  const d = parseInt(document.getElementById(`wif-${{ax}}-d`).value);
+  const ff = parseInt(document.getElementById(`wif-${{ax}}-ff`).value);
+  const curP = D.current[ax].p;
+  const curD = D.current[ax].d;
+  const curFF = D.current[ax].ff;
+  const m = D.measurements[ax];
+
+  if (!m || m.overshoot===null) {{
+    document.getElementById(`wif-pred-${{ax}}`).innerHTML = '<span style="color:var(--dm)">No measurement data</span>';
+    return;
+  }}
+
+  // Overshoot model: scales with effective gain (P + FF*0.5) / damping (D)
+  const curGain = curP + curFF * 0.5;
+  const curDamp = Math.max(curD, 1);
+  const newGain = p + ff * 0.5;
+  const newDamp = Math.max(d, 1);
+  const gainRatio = (newGain / newDamp) / (curGain / curDamp);
+  const predOS = Math.max(0, m.overshoot * gainRatio);
+
+  // Delay model: inversely proportional to P
+  const predDelay = m.delay ? m.delay * (curP / Math.max(p, 5)) : null;
+
+  const osColor = predOS > 30 ? "var(--rd)" : predOS > 15 ? "var(--yl)" : "var(--gn)";
+  const dlColor = predDelay && predDelay > 35 ? "var(--yl)" : "var(--gn)";
+
+  let html = `<div>Overshoot: <span style="color:var(--dm)">${{m.overshoot.toFixed(0)}}%</span> -> <span style="color:${{osColor}}">${{predOS.toFixed(0)}}%</span></div>`;
+  if (predDelay !== null) {{
+    html += `<div>Delay: <span style="color:var(--dm)">${{m.delay.toFixed(0)}}ms</span> -> <span style="color:${{dlColor}}">${{predDelay.toFixed(0)}}ms</span></div>`;
+  }}
+  document.getElementById(`wif-pred-${{ax}}`).innerHTML = html;
+}}
+
+// Slider event listeners
+axes.forEach(ax => {{
+  terms.forEach(t => {{
+    const sl = document.getElementById(`wif-${{ax}}-${{t}}`);
+    sl.addEventListener("input", () => {{
+      document.getElementById(`wif-${{ax}}-${{t}}-val`).textContent = sl.value;
+      const cur = D.current[ax][t];
+      const diff = parseInt(sl.value) - cur;
+      const fx = document.getElementById(`wif-${{ax}}-${{t}}-fx`);
+      if (diff > 0) fx.textContent = `+${{diff}} from current`;
+      else if (diff < 0) fx.textContent = `${{diff}} from current`;
+      else fx.textContent = "= current";
+      predict(ax);
+    }});
+    // Trigger initial prediction
+    sl.dispatchEvent(new Event("input"));
+  }});
+}});
+
+// Spectrum canvas
+const canvas = document.getElementById("wif-spectrum");
+const ctx = canvas.getContext("2d");
+const glpfSlider = document.getElementById("wif-glpf");
+const glpfVal = document.getElementById("wif-glpf-val");
+const glpfLag = document.getElementById("wif-glpf-lag");
+
+function drawSpectrum() {{
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if (!D.spectrum || !D.spectrum.length) return;
+
+  const maxFreq = 500;
+  const minDb = -80, maxDb = 0;
+  const xScale = w / maxFreq;
+  const yScale = h / (maxDb - minDb);
+  const cutoff = parseInt(glpfSlider.value);
+
+  // Draw grid
+  ctx.strokeStyle = "#2a2d3e";
+  ctx.lineWidth = 0.5;
+  for (let f = 0; f <= maxFreq; f += 50) {{
+    const x = f * xScale;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+    ctx.fillStyle = "#565f89"; ctx.font = "10px monospace";
+    ctx.fillText(f + "Hz", x + 2, h - 4);
+  }}
+
+  // Draw spectra
+  const colors = ["#ff6b6b","#4ecdc4","#ffd93d"];
+  D.spectrum.forEach((sp, si) => {{
+    if (!sp.freqs.length) return;
+
+    // Original spectrum
+    ctx.strokeStyle = colors[si % 3];
+    ctx.globalAlpha = 0.4;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    sp.freqs.forEach((f, i) => {{
+      const x = f * xScale;
+      const y = h - (sp.psd[i] - minDb) * yScale;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }});
+    ctx.stroke();
+
+    // Filtered spectrum (after LPF)
+    ctx.strokeStyle = colors[si % 3];
+    ctx.globalAlpha = 1.0;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    sp.freqs.forEach((f, i) => {{
+      const x = f * xScale;
+      // PT1 filter attenuation: -20dB/decade above cutoff
+      const ratio = f / cutoff;
+      const attenuation = -10 * Math.log10(1 + ratio * ratio);
+      const filteredDb = sp.psd[i] + attenuation;
+      const y = h - (filteredDb - minDb) * yScale;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }});
+    ctx.stroke();
+  }});
+  ctx.globalAlpha = 1.0;
+
+  // Draw cutoff line
+  const cx = cutoff * xScale;
+  ctx.strokeStyle = "#9ece6a";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([5, 5]);
+  ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#9ece6a"; ctx.font = "12px monospace";
+  ctx.fillText(cutoff + "Hz", cx + 4, 16);
+
+  // Legend
+  ctx.font = "10px monospace";
+  ctx.globalAlpha = 0.4;
+  ctx.fillStyle = colors[0]; ctx.fillText("Roll (raw)", 10, 16);
+  ctx.fillStyle = colors[1]; ctx.fillText("Pitch (raw)", 10, 28);
+  ctx.fillStyle = colors[2]; ctx.fillText("Yaw (raw)", 10, 40);
+  ctx.globalAlpha = 1.0;
+  ctx.fillStyle = "#c0caf5"; ctx.fillText("Bold = filtered", 10, 56);
+
+  // Phase lag at 50Hz for this cutoff
+  const sigFreq = 50;
+  const lagDeg = Math.atan(sigFreq / cutoff) * (180 / Math.PI);
+  const lagMs = lagDeg / (360 * sigFreq) * 1000;
+  glpfVal.textContent = cutoff + "Hz";
+  glpfLag.textContent = `Phase lag: ${{lagDeg.toFixed(0)}} deg / ${{lagMs.toFixed(1)}}ms at ${{sigFreq}}Hz`;
+}}
+
+glpfSlider.addEventListener("input", drawSpectrum);
+drawSpectrum();
+
+// Copy CLI button
+document.getElementById("wif-copy").addEventListener("click", () => {{
+  let cmds = [];
+  axes.forEach(ax => {{
+    terms.forEach(t => {{
+      const val = parseInt(document.getElementById(`wif-${{ax}}-${{t}}`).value);
+      const cur = D.current[ax][t];
+      if (val !== cur) {{
+        const key = cliMap[ax + "_" + t];
+        if (key) cmds.push(`set ${{key}} = ${{val}}`);
+      }}
+    }});
+  }});
+  const glpf = parseInt(glpfSlider.value);
+  if (glpf !== D.gyro_lpf) cmds.push(`set gyro_main_lpf_hz = ${{glpf}}`);
+  if (cmds.length) cmds.push("save");
+  else cmds.push("# No changes from current config");
+
+  navigator.clipboard.writeText(cmds.join("\\n")).then(() => {{
+    const cp = document.getElementById("wif-copied");
+    cp.style.display = "inline";
+    setTimeout(() => cp.style.display = "none", 2000);
+  }});
+}});
+}})();
+</script>
+</section>'''
+
+
+def _generate_history_html(flight_diff, prog_data):
+    """Generate HTML section for flight history with chart and diff."""
+    if not flight_diff and not prog_data:
+        return ""
+
+    html = ""
+
+    # Flight-to-flight diff
+    if flight_diff and flight_diff.get("has_previous"):
+        prev = flight_diff["previous"]
+        curr = flight_diff["current"]
+        delta = flight_diff["score_delta"]
+        dc = "good" if delta > 0 else "bad" if delta < 0 else "warn"
+        arrow = "↗" if delta > 0 else "↘" if delta < 0 else "→"
+
+        html += '<section><h2>vs Previous Flight</h2>'
+        html += f'<div class="cc"><span class="{dc}" style="font-size:1.3rem">'
+        html += f'Score: {prev["score"]:.0f} → {curr["score"]:.0f}  {arrow} {delta:+.0f}</span></div>'
+
+        # Metric changes
+        metrics = flight_diff.get("metric_changes", [])
+        if metrics:
+            html += '<div class="cc"><h3>Metric Changes</h3><table>'
+            html += '<tr><th>Metric</th><th>Previous</th><th>Current</th><th>Direction</th></tr>'
+            for m in metrics:
+                mc = "good" if m["direction"] == "better" else "bad"
+                ax_str = f'{m["axis"]} ' if m["axis"] else ""
+                old_str = f'{m["old"]:.1f}{m["unit"]}' if isinstance(m["old"], float) else f'{m["old"]}{m["unit"]}'
+                new_str = f'{m["new"]:.1f}{m["unit"]}' if isinstance(m["new"], float) else f'{m["new"]}{m["unit"]}'
+                html += f'<tr><td>{ax_str}{m["metric"]}</td><td>{old_str}</td>'
+                html += f'<td class="{mc}">{new_str}</td>'
+                html += f'<td class="{mc}">{"↗" if m["direction"] == "better" else "↘"} {m["direction"]}</td></tr>'
+            html += '</table></div>'
+
+        # Config changes
+        config_changes = flight_diff.get("config_changes", [])
+        if config_changes:
+            html += '<div class="cc"><h3>Config Changes Since Last Flight</h3><table>'
+            html += '<tr><th>Parameter</th><th>Previous</th><th>Current</th></tr>'
+            for ch in config_changes:
+                html += f'<tr><td style="color:var(--bl)">{ch["param"]}</td>'
+                html += f'<td>{ch["old"]}</td><td>{ch["new"]}</td></tr>'
+            html += '</table></div>'
+
+        # Verdict
+        verdict = flight_diff.get("verdict", "")
+        if verdict:
+            vc = "good" if delta > 0 else "warn" if abs(delta) < 3 else "bad"
+            html += f'<div class="cc"><span class="{vc}">{verdict}</span></div>'
+        html += '</section>'
+
+    # Flight progression chart
+    if prog_data and len(prog_data.get("flights", [])) >= 2:
+        flights = prog_data["flights"]
+        import json as _json
+
+        chart_data = _json.dumps([{
+            "id": f.get("id"),
+            "score": f.get("score"),
+            "noise": f.get("noise"),
+            "pid": f.get("pid"),
+            "motor": f.get("motor"),
+        } for f in flights])
+
+        html += f'''<section><h2>Score Progression</h2>
+<div class="cc" style="padding:20px">
+<canvas id="hist-chart" width="700" height="250" style="width:100%;background:var(--bg);border-radius:4px"></canvas>
+</div>
+
+<div class="cc"><h3>Flight Table</h3><table>
+<tr><th>#</th><th>Score</th><th>Noise</th><th>PID</th><th>Motor</th></tr>'''
+
+        for f in flights:
+            sc = "good" if (f.get("score") or 0) >= 85 else "warn" if (f.get("score") or 0) >= 60 else "bad"
+            score = f'{f["score"]:.0f}' if f.get("score") is not None else "-"
+            noise = f'{f["noise"]:.0f}' if f.get("noise") is not None else "-"
+            pid = f'{f["pid"]:.0f}' if f.get("pid") is not None else "-"
+            motor = f'{f["motor"]:.0f}' if f.get("motor") is not None else "-"
+            html += f'<tr><td class="{sc}">{f.get("id","?")}</td><td class="{sc}">{score}</td>'
+            html += f'<td>{noise}</td><td>{pid}</td><td>{motor}</td></tr>'
+
+        html += f'''</table></div>
+
+<script>
+(function() {{
+const flights = {chart_data};
+const canvas = document.getElementById("hist-chart");
+if (!canvas) return;
+const ctx = canvas.getContext("2d");
+const w = canvas.width, h = canvas.height;
+const pad = {{t:20,r:20,b:30,l:40}};
+const pw = w-pad.l-pad.r, ph = h-pad.t-pad.b;
+
+// Grid
+ctx.strokeStyle = "#2a2d3e"; ctx.lineWidth = 0.5;
+for (let y = 0; y <= 100; y += 20) {{
+  const py = pad.t + ph * (1 - y/100);
+  ctx.beginPath(); ctx.moveTo(pad.l,py); ctx.lineTo(w-pad.r,py); ctx.stroke();
+  ctx.fillStyle = "#565f89"; ctx.font = "10px monospace";
+  ctx.fillText(y+"", pad.l-25, py+4);
+}}
+
+function drawLine(key, color) {{
+  const vals = flights.map(f => f[key]);
+  if (vals.every(v => v === null)) return;
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.beginPath();
+  let started = false;
+  vals.forEach((v,i) => {{
+    if (v === null) return;
+    const x = pad.l + (i/(flights.length-1||1)) * pw;
+    const y = pad.t + ph * (1 - v/100);
+    if (!started) {{ ctx.moveTo(x,y); started = true; }}
+    else ctx.lineTo(x,y);
+    // Dot
+    ctx.fillStyle = color;
+    ctx.fillRect(x-3,y-3,6,6);
+  }});
+  ctx.stroke();
+}}
+
+drawLine("score", "#7aa2f7");
+drawLine("noise", "#9ece6a");
+drawLine("pid", "#bb9af7");
+drawLine("motor", "#e0af68");
+
+// Legend
+ctx.font = "10px monospace";
+[["Score","#7aa2f7"],["Noise","#9ece6a"],["PID","#bb9af7"],["Motor","#e0af68"]].forEach(([l,c],i) => {{
+  ctx.fillStyle = c;
+  ctx.fillRect(pad.l + i*80, h-12, 10, 10);
+  ctx.fillText(l, pad.l + i*80 + 14, h-3);
+}});
+
+// X labels
+ctx.fillStyle = "#565f89"; ctx.font = "10px monospace";
+flights.forEach((f,i) => {{
+  const x = pad.l + (i/(flights.length-1||1)) * pw;
+  ctx.fillText("#"+f.id, x-5, h-16);
+}});
+}})();
+</script>
+</section>'''
+
+    return html
+
+
+def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm_results, config, data, charts, nav_results=None, nav_perf=None, flight_diff=None, prog_data=None, preflight=None):
     scores = plan["scores"]
     overall = scores["overall"]
     sg = "linear-gradient(90deg, #9ece6a, #73daca)" if overall >= 85 else "linear-gradient(90deg, #e0af68, #ff9e64)" if overall >= 60 else "linear-gradient(90deg, #f7768e, #ff6b6b)"
+
+    # Pre-flight checklist HTML
+    pf_html = ""
+    if preflight and preflight.get("items"):
+        n_crit = preflight["n_critical"]
+        n_warn = preflight["n_warning"]
+        if n_crit:
+            border_color = "var(--rd)"
+            header = f"⚠ Pre-Flight Safety: {n_crit} critical issue{'s' if n_crit > 1 else ''}"
+            if n_warn:
+                header += f", {n_warn} warning{'s' if n_warn > 1 else ''}"
+        elif n_warn:
+            border_color = "var(--yl)"
+            header = f"Pre-Flight: {n_warn} warning{'s' if n_warn > 1 else ''}"
+        else:
+            border_color = "var(--dm)"
+            header = "Pre-Flight Notes"
+
+        pf_html = f'<div class="cc" style="border-left:4px solid {border_color}">'
+        pf_html += f'<h3 style="color:{border_color}">{header}</h3>'
+        for item in preflight["items"]:
+            ic = "var(--rd)" if item["level"] == "CRITICAL" else "var(--yl)" if item["level"] == "WARNING" else "var(--dm)"
+            icon = "✗" if item["level"] == "CRITICAL" else "⚠" if item["level"] == "WARNING" else "ℹ"
+            pf_html += f'<div style="margin:8px 0;color:{ic}"><strong>{icon}</strong> {item["text"]}</div>'
+            if item.get("fix"):
+                for fix_line in item["fix"].split(" && "):
+                    pf_html += f'<div style="margin-left:20px;color:var(--gn);font-size:.8rem">Fix: {fix_line}</div>'
+        pf_html += '</div>'
 
     ah = ""
     active_actions = [a for a in plan["actions"] if not a.get("deferred")]
@@ -6907,22 +7648,55 @@ def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm
     ci = lambda k: f'<img src="data:image/png;base64,{charts[k]}">' if charts.get(k) else ""
     vc = plan["verdict"].lower().replace("_","-")
 
+    # Build firmware string properly
+    fw_str = config.get("firmware_revision", "")
+    if not fw_str:
+        fw_str = f"{config.get('firmware_version', '')}"
+    if "INAV" not in fw_str and "inav" not in fw_str.lower():
+        fw_str = f"INAV {fw_str}" if fw_str else "INAV"
+
+    # Nav sections
+    nav_perf_html = _generate_nav_perf_html(nav_perf) if nav_perf else ""
+    nav_sensors_html = generate_nav_html_section(nav_results) if nav_results else ""
+    whatif_html = _generate_whatif_html(config, plan, pid_results, noise_results)
+    history_html = _generate_history_html(flight_diff, prog_data)
+    has_nav = bool(nav_perf_html or nav_sensors_html)
+
+    # CLI commands
+    cli_html = ""
+    active_actions = [a for a in plan["actions"] if not a.get("deferred")]
+    cli_cmds = generate_cli_commands(active_actions)
+    if cli_cmds:
+        cli_html = '<div class="cc"><h3>Paste into INAV Configurator CLI tab:</h3><pre style="color:var(--gn);margin:12px 0">'
+        cli_html += "\n".join(cli_cmds)
+        cli_html += '</pre></div>'
+
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>INAV Tuning Report</title><style>
+<title>INAV Tuning Report — {config.get('craft_name','')}</title><style>
 :root{{--bg:#0f1117;--cd:#1a1b26;--ca:#1e2030;--bd:#2a2d3e;--tx:#c0caf5;--dm:#7982a9;--bl:#7aa2f7;--gn:#9ece6a;--rd:#f7768e;--yl:#e0af68;--tl:#4ecdc4;--pp:#bb9af7;--or:#ff9e64}}
 *{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:'SF Mono','Cascadia Code','JetBrains Mono',monospace;background:var(--bg);color:var(--tx);line-height:1.6}}
-.ct{{max-width:1200px;margin:0 auto;padding:24px}}header{{background:linear-gradient(135deg,#1a1b26,#24283b);border-bottom:2px solid var(--bl);padding:24px 0;text-align:center}}
-header h1{{font-size:1.5rem;letter-spacing:3px;text-transform:uppercase;color:var(--bl)}}.mt{{color:var(--dm);font-size:.8rem;margin-top:8px}}
-.ss{{text-align:center;padding:32px 0}}.sb{{width:300px;height:24px;background:var(--cd);border-radius:12px;margin:12px auto;overflow:hidden;border:1px solid var(--bd)}}
-.sf{{height:100%;background:{sg};border-radius:12px;width:{overall:.0f}%}}.sv{{font-size:2.5rem;font-weight:700;color:var(--bl)}}.sl{{font-size:.75rem;color:var(--dm);text-transform:uppercase;letter-spacing:2px}}
-.sd{{display:flex;justify-content:center;gap:32px;margin-top:12px;font-size:.8rem;color:var(--dm)}}
-.vd{{padding:16px 24px;border-radius:8px;font-weight:600;text-align:center;margin:16px auto;max-width:600px}}
+.ct{{max-width:1200px;margin:0 auto;padding:0 24px 24px}}
+header{{background:linear-gradient(135deg,#1a1b26,#24283b);border-bottom:2px solid var(--bl);padding:20px 24px;position:sticky;top:0;z-index:100}}
+header h1{{font-size:1.2rem;letter-spacing:3px;text-transform:uppercase;color:var(--bl);display:inline}}
+.hdr-info{{color:var(--dm);font-size:.75rem;margin-top:6px}}
+.hdr-score{{display:inline-block;float:right;text-align:right}}
+.hdr-score .sv{{font-size:1.8rem;font-weight:700;color:var(--bl)}}
+.hdr-score .sl{{font-size:.6rem;color:var(--dm);text-transform:uppercase;letter-spacing:1px}}
+.hdr-sub{{display:flex;gap:20px;font-size:.75rem;color:var(--dm);margin-top:4px}}
+.tabs{{display:flex;gap:0;background:var(--cd);border-bottom:2px solid var(--bd);position:sticky;top:85px;z-index:99;overflow-x:auto}}
+.tab{{padding:10px 18px;cursor:pointer;color:var(--dm);font-size:.75rem;letter-spacing:1px;text-transform:uppercase;border-bottom:2px solid transparent;transition:all .2s;white-space:nowrap}}
+.tab:hover{{color:var(--tx);background:var(--ca)}}.tab.active{{color:var(--bl);border-bottom-color:var(--bl);background:var(--ca)}}
+.tab-panel{{display:none}}.tab-panel.active{{display:block}}
+.ss{{text-align:center;padding:24px 0}}.sb{{width:300px;height:20px;background:var(--cd);border-radius:10px;margin:8px auto;overflow:hidden;border:1px solid var(--bd)}}
+.sf{{height:100%;background:{sg};border-radius:10px;width:{overall:.0f}%}}
+.sd{{display:flex;justify-content:center;gap:24px;margin-top:8px;font-size:.8rem;color:var(--dm)}}
+.vd{{padding:12px 20px;border-radius:8px;font-weight:600;text-align:center;margin:12px auto;max-width:600px}}
 .vd.dialed-in{{background:rgba(158,206,106,.12);color:var(--gn);border:1px solid rgba(158,206,106,.3)}}
 .vd.nearly-there{{background:rgba(158,206,106,.08);color:var(--gn);border:1px solid rgba(158,206,106,.2)}}
 .vd.getting-better{{background:rgba(224,175,104,.1);color:var(--yl);border:1px solid rgba(224,175,104,.2)}}
 .vd.needs-work{{background:rgba(224,175,104,.1);color:var(--or);border:1px solid rgba(224,175,104,.2)}}
 .vd.rough{{background:rgba(247,118,142,.1);color:var(--rd);border:1px solid rgba(247,118,142,.2)}}
-section{{margin:32px 0}}h2{{font-size:1rem;color:var(--bl);letter-spacing:2px;text-transform:uppercase;border-bottom:1px solid var(--bd);padding-bottom:8px;margin-bottom:16px}}
+section{{margin:24px 0}}h2{{font-size:1rem;color:var(--bl);letter-spacing:2px;text-transform:uppercase;border-bottom:1px solid var(--bd);padding-bottom:8px;margin-bottom:16px}}
 h3{{font-size:.85rem;color:var(--pp);margin-bottom:8px}}.cc{{background:var(--cd);border:1px solid var(--bd);border-radius:8px;padding:16px;margin:12px 0;overflow-x:auto}}
 .cc img{{width:100%;height:auto;display:block;border-radius:4px}}
 .ac{{display:flex;gap:16px;background:var(--cd);border:1px solid var(--bd);border-left:4px solid var(--bd);border-radius:6px;padding:16px 20px;margin:10px 0;align-items:flex-start}}
@@ -6938,19 +7712,89 @@ td{{padding:7px 14px;border-bottom:1px solid var(--bd);font-size:.85rem}}.good{{
 .nav-section{{margin:24px 0}}.nav-scores{{width:100%;border-collapse:collapse}}.nav-scores td,.nav-scores th{{padding:7px 14px;border-bottom:1px solid var(--bd);font-size:.85rem}}.nav-findings{{margin:12px 0}}.nav-findings .finding{{padding:6px 12px;margin:4px 0;border-radius:4px;font-size:.85rem}}.nav-findings .warning{{background:rgba(255,215,0,0.1);border-left:3px solid var(--yl)}}.nav-findings .info{{background:rgba(100,149,237,0.1);border-left:3px solid var(--pp)}}
 footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-top:1px solid var(--bd);margin-top:40px}}
 </style></head><body>
-<header><h1>▲ INAV Tuning Report</h1><div class="mt">{config.get('craft_name','')} {'| ' if config.get('craft_name') else ''}{config.get('firmware_type','INAV')} {config.get('firmware_version','')} | {data['time_s'][-1]:.1f}s | {data['sample_rate']:.0f}Hz | {datetime.now().strftime('%Y-%m-%d %H:%M')}</div></header>
+<header>
+<div style="display:flex;justify-content:space-between;align-items:center;max-width:1200px;margin:0 auto">
+<div>
+<h1>▲ INAV Tuning Report</h1>
+<div class="hdr-info">{config.get('craft_name','')} — {fw_str}</div>
+<div class="hdr-sub"><span>Duration: {data['time_s'][-1]:.1f}s</span><span>Sample rate: {data['sample_rate']:.0f}Hz</span><span>{datetime.now().strftime('%Y-%m-%d %H:%M')}</span></div>
+</div>
+<div class="hdr-score"><div class="sl">Score</div><div class="sv">{overall:.0f}<span style="font-size:.9rem;color:var(--dm)">/100</span></div>
+<div class="hdr-sub" style="justify-content:flex-end">{'<span>Noise:'+f'{scores["noise"]:.0f}'+'</span>' if scores["noise"] is not None else ''}{'<span>PID:'+f'{scores["pid"]:.0f}'+'</span>' if scores["pid"] is not None else ''}<span>Motors:{scores['motor']:.0f}</span></div>
+</div></div>
+</header>
+
+<div class="tabs" id="tabbar">
+<div class="tab active" data-tab="overview">Overview</div>
+<div class="tab" data-tab="pid">PID Tuning</div>
+<div class="tab" data-tab="noise">Noise & Filters</div>
+<div class="tab" data-tab="motors">Motors</div>
+{'<div class="tab" data-tab="navperf">Nav Performance</div>' if nav_perf_html else ''}
+{'<div class="tab" data-tab="navsensors">Nav Sensors</div>' if nav_sensors_html else ''}
+{'<div class="tab" data-tab="history">History</div>' if history_html else ''}
+<div class="tab" data-tab="whatif">What-If</div>
+</div>
+
 <div class="ct">
-<div class="ss"><div class="sl">Tune Quality</div><div class="sv">{overall:.0f}</div><div class="sb"><div class="sf"></div></div>
+
+<!-- OVERVIEW TAB -->
+<div class="tab-panel active" id="tab-overview">
+<div class="ss"><div class="sb"><div class="sf"></div></div>
 <div class="sd">{'<span>Noise:'+f'{scores["noise"]:.0f}'+'</span>' if scores["noise"] is not None else ''}{'<span>PID:'+f'{scores["pid"]:.0f}'+'</span>' if scores["pid"] is not None else ''}<span>Motors:{scores['motor']:.0f}</span></div></div>
 <div class="vd {vc}">▸ {plan['verdict_text']}</div>
-<section><h2>Do This</h2>{ah}</section>
+{pf_html}
+<section><h2>Actions</h2>{ah}</section>
+{cli_html}
 {ch}
-<section><h2>PID Response</h2><div class="cc"><table><tr><th>Axis</th><th>Delay</th><th>Overshoot</th><th>RMS Error</th></tr>{pt}</table></div><div class="cc">{ci("pid")}</div></section>
-<section><h2>Noise</h2><div class="cc">{ci("noise")}</div></section>
+</div>
+
+<!-- PID TUNING TAB -->
+<div class="tab-panel" id="tab-pid">
+<section><h2>PID Response</h2>
+<div class="cc"><table><tr><th>Axis</th><th>Delay</th><th>Overshoot</th><th>RMS Error</th></tr>{pt}</table></div>
+<div class="cc">{ci("pid")}</div>
+</section>
+</div>
+
+<!-- NOISE & FILTERS TAB -->
+<div class="tab-panel" id="tab-noise">
+<section><h2>Noise Spectrum</h2><div class="cc">{ci("noise")}</div></section>
 {'<section><h2>D-Term Noise</h2><div class="cc">'+ci("dterm")+'</div></section>' if charts.get("dterm") else ''}
-{'<section><h2>Motors</h2><div class="cc"><table><tr><th>Motor</th><th>Avg</th><th>StdDev</th><th>Saturation</th></tr>'+mt+'</table></div><div class="cc">'+ci("motor")+'</div></section>' if motor_analysis else ''}
-{generate_nav_html_section(nav_results) if nav_results else ''}
-</div><footer>INAV Blackbox Analyzer v{REPORT_VERSION} - Test changes with props off first</footer></body></html>"""
+</div>
+
+<!-- MOTORS TAB -->
+<div class="tab-panel" id="tab-motors">
+{'<section><h2>Motor Balance</h2><div class="cc"><table><tr><th>Motor</th><th>Avg</th><th>StdDev</th><th>Saturation</th></tr>'+mt+'</table></div><div class="cc">'+ci("motor")+'</div></section>' if motor_analysis else '<section><h2>Motors</h2><div class="cc" style="color:var(--dm)">No motor data available.</div></section>'}
+</div>
+
+<!-- NAV PERFORMANCE TAB -->
+{'<div class="tab-panel" id="tab-navperf">' + nav_perf_html + '</div>' if nav_perf_html else ''}
+
+<!-- NAV SENSORS TAB -->
+{'<div class="tab-panel" id="tab-navsensors">' + nav_sensors_html + '</div>' if nav_sensors_html else ''}
+
+<!-- HISTORY TAB -->
+{'<div class="tab-panel" id="tab-history">' + history_html + '</div>' if history_html else ''}
+
+<!-- WHAT-IF TAB -->
+<div class="tab-panel" id="tab-whatif">
+{whatif_html}
+</div>
+
+</div>
+<footer>INAV Blackbox Analyzer v{REPORT_VERSION} — Test changes with props off first</footer>
+
+<script>
+document.querySelectorAll('.tab').forEach(tab => {{
+  tab.addEventListener('click', () => {{
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+  }});
+}});
+</script>
+</body></html>"""
 
 
 # ─── Markdown Report ─────────────────────────────────────────────────────────
@@ -7296,6 +8140,197 @@ def check_blackbox_readiness_from_dump(config_text):
             "has_blackbox": has_blackbox, "bb_device": bb_device, "bb_rate": bb_rate}
 
 
+def preflight_checklist(config_text, frame_inches=None):
+    """Run pre-flight safety checklist on FC dump config.
+
+    Checks for dangerous configuration issues that should be fixed
+    before flying. Warns sternly but doesn't block.
+
+    Args:
+        config_text: Raw dump/diff text from FC
+        frame_inches: Frame size for context-aware checks
+
+    Returns dict with:
+        items (list of dicts): [{level, text, fix}] — CRITICAL/WARNING/INFO
+        n_critical (int): Number of critical issues
+        n_warning (int): Number of warnings
+    """
+    items = []
+
+    if not config_text:
+        return {"items": [], "n_critical": 0, "n_warning": 0}
+
+    # Parse features and settings
+    features = []
+    features_disabled = []
+    beepers_disabled = []
+    settings = {}
+    for line in config_text.splitlines():
+        line = line.strip()
+        if line.startswith("feature -"):
+            features_disabled.append(line[9:].strip())
+        elif line.startswith("feature "):
+            features.append(line[8:].strip())
+        elif line.startswith("beeper -"):
+            beepers_disabled.append(line[8:].strip())
+        elif line.startswith("set "):
+            m = re.match(r"set\s+(\S+)\s*=\s*(.*)", line)
+            if m:
+                settings[m.group(1).strip()] = m.group(2).strip()
+
+    # ═══ CRITICAL: Safety beepers ═══
+    critical_beepers = ["BAT_CRIT_LOW", "BAT_LOW", "RX_LOST", "RX_LOST_LANDING", "HW_FAILURE"]
+    missing_beepers = [b for b in critical_beepers if b in beepers_disabled]
+    if missing_beepers:
+        items.append({
+            "level": "CRITICAL",
+            "text": f"Safety beepers DISABLED: {', '.join(missing_beepers)}. "
+                    f"No audible warning for low battery, signal loss, or hardware failure.",
+            "fix": " && ".join(f"beeper {b}" for b in missing_beepers),
+        })
+
+    # ═══ CRITICAL: Failsafe procedure ═══
+    failsafe = settings.get("failsafe_procedure", "").upper()
+    if failsafe == "DROP":
+        items.append({
+            "level": "CRITICAL",
+            "text": "Failsafe set to DROP — quad will fall out of the sky on signal loss. "
+                    "Use SET-THR, RTH, or LAND instead.",
+            "fix": "set failsafe_procedure = RTH",
+        })
+
+    # ═══ CRITICAL: No failsafe throttle with SET-THR ═══
+    if failsafe == "SET-THR":
+        fs_thr = settings.get("failsafe_throttle", "1000")
+        try:
+            if int(fs_thr) <= 1000:
+                items.append({
+                    "level": "CRITICAL",
+                    "text": f"Failsafe procedure is SET-THR but throttle is {fs_thr}µs — "
+                            f"this will not maintain flight. Set to hover throttle (~1400-1500).",
+                    "fix": "set failsafe_throttle = 1450",
+                })
+        except ValueError:
+            pass
+
+    # ═══ WARNING: Battery voltage limits ═══
+    min_cell = settings.get("vbat_min_cell_voltage", "")
+    warn_cell = settings.get("vbat_warning_cell_voltage", "")
+    try:
+        if min_cell and float(min_cell) / 100 < 3.0:
+            items.append({
+                "level": "WARNING",
+                "text": f"Battery min cell voltage very low ({float(min_cell)/100:.2f}V). "
+                        f"LiPo should not go below 3.3V, Li-ion not below 2.8V.",
+                "fix": "set vbat_min_cell_voltage = 330",
+            })
+    except ValueError:
+        pass
+
+    # ═══ WARNING: Motor protocol for frame size ═══
+    motor_proto = settings.get("motor_pwm_protocol", "").upper()
+    if motor_proto in ("STANDARD", "ONESHOT125", "ONESHOT42", "MULTISHOT"):
+        items.append({
+            "level": "WARNING",
+            "text": f"Motor protocol is {motor_proto} — consider DSHOT300 or DSHOT600 "
+                    f"for better reliability and ESC telemetry support.",
+            "fix": "set motor_pwm_protocol = DSHOT300",
+        })
+
+    # ═══ WARNING: Arming without GPS fix ═══
+    nav_extra_arming = settings.get("nav_extra_arming_safety", "").upper()
+    if nav_extra_arming in ("OFF", "ALLOW_BYPASS"):
+        has_gps = "GPS" in features
+        if has_gps:
+            items.append({
+                "level": "WARNING",
+                "text": "GPS arming safety disabled — quad can arm without GPS fix. "
+                        "RTH and position hold won't work without a fix.",
+                "fix": "set nav_extra_arming_safety = ON",
+            })
+
+    # ═══ WARNING: RTH altitude ═══
+    rth_alt = settings.get("nav_rth_altitude", "")
+    try:
+        if rth_alt and int(rth_alt) < 1500:
+            items.append({
+                "level": "WARNING",
+                "text": f"RTH altitude is {int(rth_alt)/100:.0f}m — very low. "
+                        f"Risk of hitting obstacles during return. 30-50m recommended.",
+                "fix": "set nav_rth_altitude = 3000",
+            })
+    except ValueError:
+        pass
+
+    # ═══ WARNING: D-term LPF too high for frame ═══
+    if frame_inches and frame_inches >= 8:
+        dterm_lpf = settings.get("dterm_lpf_hz", "")
+        try:
+            if dterm_lpf and int(dterm_lpf) > 80:
+                items.append({
+                    "level": "WARNING",
+                    "text": f"D-term LPF at {dterm_lpf}Hz — high for {frame_inches}-inch. "
+                            f"45-75Hz typical. High values let motor noise through → hot motors.",
+                    "fix": f"set dterm_lpf_hz = {min(75, int(dterm_lpf))}",
+                })
+        except ValueError:
+            pass
+
+    # ═══ INFO: Blackbox logging suggestions ═══
+    bb_rate_denom = settings.get("blackbox_rate_denom", "1")
+    try:
+        if int(bb_rate_denom) > 2:
+            items.append({
+                "level": "INFO",
+                "text": f"Blackbox logging at 1/{bb_rate_denom} rate. "
+                        f"Full rate (1/1) gives best analysis data.",
+                "fix": "set blackbox_rate_denom = 1",
+            })
+    except ValueError:
+        pass
+
+    n_critical = sum(1 for i in items if i["level"] == "CRITICAL")
+    n_warning = sum(1 for i in items if i["level"] == "WARNING")
+    return {"items": items, "n_critical": n_critical, "n_warning": n_warning}
+
+
+def _print_preflight(checklist):
+    """Print pre-flight checklist results to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+
+    if not checklist["items"]:
+        print(f"  {G}✓ Pre-flight checklist: all good{R}")
+        return
+
+    n_crit = checklist["n_critical"]
+    n_warn = checklist["n_warning"]
+
+    if n_crit:
+        print(f"\n  {RED}{B}{'━'*66}{R}")
+        print(f"  {RED}{B}  ⚠  PRE-FLIGHT SAFETY CHECK — {n_crit} CRITICAL ISSUE{'S' if n_crit != 1 else ''}{R}")
+        print(f"  {RED}{B}{'━'*66}{R}")
+    elif n_warn:
+        print(f"\n  {Y}{'─'*66}{R}")
+        print(f"  {Y}  Pre-flight check: {n_warn} warning{'s' if n_warn != 1 else ''}{R}")
+        print(f"  {Y}{'─'*66}{R}")
+
+    icons = {"CRITICAL": f"{RED}✗", "WARNING": f"{Y}⚠", "INFO": f"{DIM}ℹ"}
+
+    for item in checklist["items"]:
+        level = item["level"]
+        icon = icons.get(level, "?")
+        print(f"\n  {icon} {B}{item['text']}{R}")
+        if item.get("fix"):
+            fix_lines = item["fix"].split(" && ")
+            for fl in fix_lines:
+                print(f"    {G}Fix: {fl}{R}")
+
+    if n_crit:
+        print(f"\n  {RED}{B}  FIX THESE BEFORE FLYING!{R}")
+        print(f"  {RED}{B}{'━'*66}{R}")
+    print()
+
+
 def check_blackbox_readiness_from_headers(raw_params, nav_mode=False):
     """Check field availability from BBL headers (pre-analysis).
 
@@ -7392,6 +8427,206 @@ def _print_readiness(check_result, source="config"):
                 print(f"  {DIM}  Fix: {fix_line.strip()}{R}")
 
 
+# ─── Config Backup Vault ──────────────────────────────────────────────────────
+
+def _vault_dir(blackbox_dir="./blackbox"):
+    """Get the config vault directory path."""
+    return os.path.join(blackbox_dir, "config_vault")
+
+
+def vault_archive(config_raw, craft_name, blackbox_dir="./blackbox"):
+    """Archive a config dump with timestamp.
+
+    Saves to blackbox/config_vault/{craft}_{timestamp}.txt
+    Returns the archive path.
+    """
+    vault = _vault_dir(blackbox_dir)
+    os.makedirs(vault, exist_ok=True)
+
+    craft = (craft_name or "fc").replace(" ", "_")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{craft}_{ts}.txt"
+    path = os.path.join(vault, filename)
+
+    with open(path, "w") as f:
+        f.write(config_raw)
+
+    return path
+
+
+def vault_list(craft_name=None, blackbox_dir="./blackbox", limit=20):
+    """List archived configs, newest first.
+
+    Returns list of dicts: [{path, craft, timestamp, n_settings, age_str}]
+    """
+    vault = _vault_dir(blackbox_dir)
+    if not os.path.isdir(vault):
+        return []
+
+    entries = []
+    for fname in sorted(os.listdir(vault), reverse=True):
+        if not fname.endswith(".txt"):
+            continue
+
+        # Parse filename: CRAFT_NAME_YYYYMMDD_HHMMSS.txt
+        parts = fname[:-4].rsplit("_", 2)
+        if len(parts) < 3:
+            continue
+
+        try:
+            ts_str = f"{parts[-2]}_{parts[-1]}"
+            ts = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+            craft = "_".join(parts[:-2])
+        except ValueError:
+            continue
+
+        if craft_name and craft.replace("_", " ").lower() != craft_name.lower():
+            continue
+
+        # Count settings
+        fpath = os.path.join(vault, fname)
+        try:
+            with open(fpath, "r") as f:
+                text = f.read()
+            n_settings = len([l for l in text.splitlines() if l.strip().startswith("set ")])
+        except Exception:
+            n_settings = 0
+
+        # Age string
+        age = datetime.now() - ts
+        if age.days > 0:
+            age_str = f"{age.days}d ago"
+        elif age.seconds > 3600:
+            age_str = f"{age.seconds // 3600}h ago"
+        else:
+            age_str = f"{age.seconds // 60}m ago"
+
+        entries.append({
+            "path": fpath,
+            "filename": fname,
+            "craft": craft.replace("_", " "),
+            "timestamp": ts,
+            "ts_str": ts.strftime("%Y-%m-%d %H:%M"),
+            "n_settings": n_settings,
+            "age_str": age_str,
+        })
+
+        if len(entries) >= limit:
+            break
+
+    return entries
+
+
+def vault_diff(path_a, path_b):
+    """Diff two config files from the vault.
+
+    Returns dict with:
+        added (list): settings only in B
+        removed (list): settings only in A
+        changed (list): [{param, old, new}]
+        unchanged (int): count of identical settings
+    """
+    def parse_settings(path):
+        settings = {}
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("set ") and " = " in line:
+                        parts = line[4:].split(" = ", 1)
+                        if len(parts) == 2:
+                            settings[parts[0].strip()] = parts[1].strip()
+        except Exception:
+            pass
+        return settings
+
+    a = parse_settings(path_a)
+    b = parse_settings(path_b)
+
+    all_params = sorted(set(list(a.keys()) + list(b.keys())))
+    added = []
+    removed = []
+    changed = []
+    unchanged = 0
+
+    for param in all_params:
+        va = a.get(param)
+        vb = b.get(param)
+        if va is None and vb is not None:
+            added.append({"param": param, "value": vb})
+        elif va is not None and vb is None:
+            removed.append({"param": param, "value": va})
+        elif va != vb:
+            changed.append({"param": param, "old": va, "new": vb})
+        else:
+            unchanged += 1
+
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "unchanged": unchanged,
+    }
+
+
+def _print_vault_list(entries):
+    """Print vault listing to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    if not entries:
+        print(f"\n  {DIM}No configs in vault. Configs are archived automatically "
+              f"when using --device auto.{R}")
+        return
+
+    print(f"\n  {B}CONFIG VAULT:{R} {len(entries)} archived config{'s' if len(entries) != 1 else ''}")
+    print(f"  {B}{'#':>3}  {'Date':16s}  {'Settings':>8}  {'Age':>8}  Craft{R}")
+    print(f"  {DIM}{'─'*60}{R}")
+    for i, e in enumerate(entries, 1):
+        print(f"  {DIM}{i:>3}{R}  {e['ts_str']:16s}  {e['n_settings']:>8}  {e['age_str']:>8}  {e['craft']}")
+    print(f"\n  {DIM}Path: {os.path.dirname(entries[0]['path'])}{R}")
+    print(f"  {DIM}Use --config-diff N M to compare config #N with #M{R}")
+
+
+def _print_vault_diff(diff, path_a, path_b):
+    """Print vault diff to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+
+    n_changes = len(diff["changed"]) + len(diff["added"]) + len(diff["removed"])
+    if n_changes == 0:
+        print(f"\n  {G}✓ Configs are identical ({diff['unchanged']} settings).{R}")
+        return
+
+    print(f"\n  {B}CONFIG DIFF:{R} {n_changes} difference{'s' if n_changes != 1 else ''}, "
+          f"{diff['unchanged']} unchanged")
+    print(f"  {DIM}A: {os.path.basename(path_a)}{R}")
+    print(f"  {DIM}B: {os.path.basename(path_b)}{R}")
+
+    if diff["changed"]:
+        print(f"\n  {B}Changed ({len(diff['changed'])}):{R}")
+        for ch in diff["changed"]:
+            try:
+                old_f = float(ch["old"])
+                new_f = float(ch["new"])
+                pct = ((new_f - old_f) / old_f * 100) if old_f != 0 else 0
+                pct_str = f"  {DIM}({pct:+.0f}%){R}" if abs(pct) > 1 else ""
+            except (ValueError, ZeroDivisionError):
+                pct_str = ""
+            print(f"    {Y}{ch['param']}{R}: {ch['old']} → {ch['new']}{pct_str}")
+
+    if diff["added"]:
+        print(f"\n  {B}Added in B ({len(diff['added'])}):{R}")
+        for a in diff["added"][:20]:
+            print(f"    {G}+ {a['param']}{R} = {a['value']}")
+        if len(diff["added"]) > 20:
+            print(f"    {DIM}... and {len(diff['added']) - 20} more{R}")
+
+    if diff["removed"]:
+        print(f"\n  {B}Removed from B ({len(diff['removed'])}):{R}")
+        for r in diff["removed"][:20]:
+            print(f"    {RED}- {r['param']}{R} = {r['value']}")
+        if len(diff["removed"]) > 20:
+            print(f"    {DIM}... and {len(diff['removed']) - 20} more{R}")
+
+
 # ─── Post-Analysis Cleanup ────────────────────────────────────────────────────
 
 def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_file,
@@ -7480,7 +8715,7 @@ def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_fil
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.21.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.3.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -7488,6 +8723,8 @@ def main():
                              "Optional when --device is used.")
     parser.add_argument("-o", "--output", help="HTML report filename")
     parser.add_argument("--no-html", action="store_true")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="Don't open the HTML report in the default browser.")
     parser.add_argument("--no-terminal", action="store_true")
     parser.add_argument("--previous", help="Previous state .json for comparison")
     # Device communication
@@ -7552,6 +8789,13 @@ def main():
     parser.add_argument("--check-log", action="store_true",
                         help="Assess log quality and exit. Reports duration, sample rate, "
                              "field completeness, corrupt frames, and usability grade.")
+    parser.add_argument("--config-history", action="store_true",
+                        help="List archived FC configs from the vault, then exit. "
+                             "Configs are archived automatically on each --device auto run.")
+    parser.add_argument("--config-diff", nargs=2, metavar=("N", "M"), type=int,
+                        help="Compare two archived configs from the vault by number. "
+                             "Use --config-history to see available configs. "
+                             "Usage: inav-analyze --config-diff 1 2")
     parser.add_argument("--report", metavar="FORMAT", choices=["md", "markdown"],
                         help="Generate Markdown report alongside HTML. "
                              "Usage: inav-analyze flight.bbl --report md")
@@ -7656,6 +8900,10 @@ def main():
                 with open(config_path, "w") as f:
                     f.write(config_raw)
                 print(f"  Saved: {config_path}")
+
+                # Archive to config vault
+                vault_path = vault_archive(config_raw, info.get("craft_name"), args.blackbox_dir)
+                print(f"  Vault: {vault_path}")
             else:
                 print(" no response (FC may not support CLI over MSP)")
 
@@ -7667,6 +8915,11 @@ def main():
                     sys.exit(1)
                 if readiness["items"]:
                     _print_readiness(readiness)
+
+            # Pre-flight safety checklist
+            if config_raw:
+                checklist = preflight_checklist(config_raw, frame_inches=args.frame)
+                _print_preflight(checklist)
 
             if summary['used_size'] == 0:
                 print("  No blackbox data to download.")
@@ -7763,6 +9016,27 @@ def main():
                     config_raw = None
             else:
                 print(f"  Warning: Config file not found: {config_file}")
+
+    # ── Config vault: list or diff archived configs ──
+    if getattr(args, 'config_history', False):
+        entries = vault_list(blackbox_dir=args.blackbox_dir)
+        _print_vault_list(entries)
+        sys.exit(0)
+
+    if getattr(args, 'config_diff', None):
+        n, m = args.config_diff
+        entries = vault_list(blackbox_dir=args.blackbox_dir, limit=100)
+        if not entries:
+            print("  No configs in vault.")
+            sys.exit(1)
+        if n < 1 or n > len(entries) or m < 1 or m > len(entries):
+            print(f"  Invalid config numbers. Use --config-history to see {len(entries)} available.")
+            sys.exit(1)
+        path_a = entries[n - 1]["path"]
+        path_b = entries[m - 1]["path"]
+        diff = vault_diff(path_a, path_b)
+        _print_vault_diff(diff, path_a, path_b)
+        sys.exit(0)
 
     # ── History mode: show progression and exit ──
     if args.history or args.trend:
@@ -9674,20 +10948,15 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
             if config_review_text:
                 print(config_review_text, end="")
 
+    # ── Generate charts (slow, do before DB) ──
+    charts = {}
     if not args.no_html and plan["verdict"] != "GROUND_ONLY":
-        print("  Generating report...")
-        charts = {}
+        print("  Generating charts...")
         vn = [n for n in noise_results if n]
         if vn: charts["noise"] = create_noise_chart(vn)
         charts["pid"] = create_pid_response_chart(pid_results, sr)
         if motor_analysis: charts["motor"] = create_motor_chart(motor_analysis, data["time_s"])
         if dterm_results: charts["dterm"] = create_dterm_chart(dterm_results)
-
-        html = generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm_results, config, data, charts, nav_results=nav_results)
-        on = args.output or os.path.splitext(os.path.basename(logfile))[0] + "_report.html"
-        op = os.path.join(os.path.dirname(logfile) or ".", on)
-        with open(op, "w", encoding="utf-8") as f: f.write(html)
-        print(f"\n  ✓ {t('report.html_saved', path=op)}")
 
     # ── Save state with profile ──
     config["_profile_name"] = profile["name"]
@@ -9705,6 +10974,8 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
 
     # ── Store in flight database ──
     progression_text = ""
+    flight_diff = None
+    prog_data = None
     if not args.no_db:
         try:
             try:
@@ -9725,6 +10996,7 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
             # Capture progression for interactive menu
             if n_flights >= 2:
                 prog = db.get_progression(craft)
+                prog_data = prog
                 if prog["changes"]:
                     R, B, C, G, Y, RED, DIM = _colors()
                     trend_icon = {"improving": f"{G}↗ Improving", "degrading": f"{RED}↘ Degrading",
@@ -9734,11 +11006,45 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
                         prog_lines.append(f"    {ch}")
                     progression_text = "\n".join(prog_lines)
                     if not interactive:
-                        print(progression_text)
+                        _print_section_history(prog)
+                elif not interactive and len(prog.get("flights", [])) >= 2:
+                    _print_section_history(prog)
+
+                # Flight-to-flight diff
+                flight_diff = db.get_flight_diff(craft, flight_id)
+                if flight_diff and flight_diff.get("has_previous") and not interactive:
+                    _print_section_diff(flight_diff)
 
             db.close()
         except Exception as e:
             print(f"  ⚠ Database: {e}")
+
+    # ── HTML report (assembled after DB so we have history data) ──
+    if not args.no_html and plan["verdict"] != "GROUND_ONLY":
+        # Generate preflight checklist for report
+        pf_data = None
+        if config_raw:
+            pf_data = preflight_checklist(config_raw, frame_inches=frame_inches)
+            if not pf_data.get("items"):
+                pf_data = None
+
+        html = generate_html_report(plan, noise_results, pid_results, motor_analysis,
+                                     dterm_results, config, data, charts,
+                                     nav_results=nav_results, nav_perf=nav_perf,
+                                     flight_diff=flight_diff, prog_data=prog_data,
+                                     preflight=pf_data)
+        on = args.output or os.path.splitext(os.path.basename(logfile))[0] + "_report.html"
+        op = os.path.join(os.path.dirname(logfile) or ".", on)
+        with open(op, "w", encoding="utf-8") as f: f.write(html)
+        print(f"\n  ✓ {t('report.html_saved', path=op)}")
+
+        # Auto-open in browser
+        if not getattr(args, 'no_browser', False):
+            try:
+                import webbrowser
+                webbrowser.open(f"file://{os.path.abspath(op)}")
+            except Exception:
+                pass
 
     # ── Markdown report ──
     if getattr(args, 'report', None) in ('md', 'markdown') and not summary_only:
@@ -9755,7 +11061,8 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         print()
         _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
                           profile, config_review_text, progression_text,
-                          nav_perf=nav_perf, nav_results=nav_results)
+                          nav_perf=nav_perf, nav_results=nav_results,
+                          flight_diff=flight_diff, prog_data=prog_data)
     else:
         print()
 
