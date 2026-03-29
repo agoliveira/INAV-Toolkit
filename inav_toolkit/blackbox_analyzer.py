@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.3.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.4.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.3.0"
+REPORT_VERSION = "2.4.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1000,6 +1000,9 @@ class BlackboxDecoder:
         self.p_def = self._parse_field_def('P', fallback_names=self.i_def)
         self.s_def = self._parse_field_def('S')
         self.g_def = self._parse_field_def('G')
+        self._prev_gps = None  # Previous G-frame values for delta accumulation
+        self._gps_home = [0, 0]  # GPS home position from H-frame
+        self._h_def = self._parse_field_def('H')  # Home frame definition
 
         self.minthrottle = self._int_param('minthrottle', 1050)
         self.vbatref = self._int_param('vbatref', 0)
@@ -1296,16 +1299,63 @@ class BlackboxDecoder:
             self._resync()
 
     def _decode_aux_frame(self, field_def):
-        """Decode an S or G frame and return {field_name: value} dict.
-        S/G frames use predictor 0 (raw values) - no delta prediction needed."""
+        """Decode an S frame and return {field_name: value} dict.
+        S-frames use predictor 0 (raw values) - no delta prediction needed."""
         if field_def is None:
             self._resync()
             return None
         try:
             raw = self._decode_raw_values(field_def)
-            # S and G frames are independently encoded (predictor 0 = raw).
-            # Don't apply I-frame predictors which use a different field count.
             return dict(zip(field_def['names'], raw))
+        except (IndexError, ValueError):
+            self._resync()
+            return None
+
+    def _decode_gps_frame(self):
+        """Decode a G-frame with predictor-aware accumulation.
+
+        GPS coordinates use predictor 7 (delta from GPS home position stored
+        in H-frame). Other fields may use predictor 1 (delta from previous)
+        or predictor 0 (raw). Without this, GPS coords show as small deltas
+        instead of absolute lat/lon values.
+        """
+        field_def = self.g_def
+        if field_def is None:
+            self._resync()
+            return None
+        try:
+            raw = self._decode_raw_values(field_def)
+            predictors = field_def.get('predictor', [])
+
+            # Initialize previous values on first G-frame
+            if self._prev_gps is None:
+                self._prev_gps = [0] * len(raw)
+
+            # Apply predictors per field
+            accumulated = []
+            home_idx = 0  # tracks which GPS_home coordinate to use
+            for i, val in enumerate(raw):
+                pred = predictors[i] if i < len(predictors) else 0
+                if pred == 7:
+                    # Predictor 7: GPS home + delta
+                    if home_idx < len(self._gps_home):
+                        acc = self._gps_home[home_idx] + val
+                    else:
+                        acc = val
+                    home_idx += 1
+                    accumulated.append(acc)
+                elif pred == 1:
+                    # Predictor 1: delta from previous value
+                    acc = self._prev_gps[i] + val
+                    accumulated.append(acc)
+                else:
+                    # Predictor 0 and others: raw value
+                    accumulated.append(val)
+
+            # Store for predictor-1 fields on next frame
+            self._prev_gps = list(accumulated)
+
+            return dict(zip(field_def['names'], accumulated))
         except (IndexError, ValueError):
             self._resync()
             return None
@@ -1510,16 +1560,26 @@ class BlackboxDecoder:
             elif byte == self.FRAME_G:
                 self.pos += 1
                 frame_idx = len(all_frames)
-                result = self._decode_aux_frame(self.g_def)
+                result = self._decode_gps_frame()
                 if result is not None:
                     self.gps_frames.append((frame_idx, result))
                 self.stats['skipped_gps'] += 1
 
             elif byte == self.FRAME_H:
                 self.pos += 1
-                # GPS Home frame - read its field definitions
-                if self.g_def:
-                    # H-frame has its own field definition
+                # GPS Home frame — decode to capture home position
+                if self._h_def:
+                    try:
+                        raw = self._decode_raw_values(self._h_def)
+                        home_dict = dict(zip(self._h_def['names'], raw))
+                        # Store home coordinates
+                        h0 = home_dict.get("GPS_home[0]")
+                        h1 = home_dict.get("GPS_home[1]")
+                        if h0 is not None and h1 is not None:
+                            self._gps_home = [int(h0), int(h1)]
+                    except (IndexError, ValueError):
+                        self._resync()
+                elif self.g_def:
                     h_def = self._parse_field_def('H')
                     if h_def:
                         self._skip_frame(h_def)
@@ -2863,6 +2923,266 @@ def analyze_dterm_noise(data, sr):
         results.append({"axis": axis, "freqs": freqs, "psd_db": psd_db,
                          "peaks": peaks, "rms": float(np.sqrt(np.mean(clean**2)))})
     return results
+
+
+# ─── Accelerometer Vibration Analysis ─────────────────────────────────────────
+
+_ACCEL_AXIS_MAP = {"X": "acc_x", "Y": "acc_y", "Z": "acc_z"}
+
+def analyze_accel_vibration(data, sr, prop_harmonics=None):
+    """Analyze accelerometer data for structural vibration signatures.
+
+    Accelerometer FFT catches frame resonances, loose hardware, and
+    prop/motor issues that gyro filtering may mask. The accel sees
+    physical vibration directly, while gyro sees rotational effects.
+
+    Args:
+        data: Decoded flight data dict
+        sr: Sample rate in Hz
+        prop_harmonics: Optional prop harmonic predictions from RPM estimate
+
+    Returns dict with:
+        axes (list): Per-axis results [{axis, freqs, psd_db, peaks, rms_g, findings}]
+        overall_rms_g (float): Combined RMS across all axes
+        score (int): 0-100 vibration health score
+        findings (list): [{level, text, detail}]
+    """
+    results = {
+        "axes": [],
+        "overall_rms_g": None,
+        "score": 100,
+        "findings": [],
+    }
+
+    has_accel = all(k in data for k in ["acc_x", "acc_y", "acc_z"])
+    if not has_accel:
+        return results
+
+    all_rms = []
+    score = 100
+
+    for axis_name, key in _ACCEL_AXIS_MAP.items():
+        raw = data[key]
+        clean = raw[~np.isnan(raw)]
+        if len(clean) < 512:
+            continue
+
+        # Convert to g (INAV accel is in cm/s², 1g = 981 cm/s²)
+        # Remove DC offset (gravity) — we only care about vibration
+        clean_g = clean / 981.0
+        clean_g = clean_g - np.mean(clean_g)
+
+        rms_g = float(np.sqrt(np.mean(clean_g**2)))
+        all_rms.append(rms_g)
+
+        # FFT
+        freqs, psd_db = compute_psd(clean_g, sr)
+        peaks = find_noise_peaks(freqs, psd_db, min_height_db=-30)
+        # Filter out DC/sub-5Hz (gravity residual, not real vibration)
+        peaks = [pk for pk in peaks if pk["freq_hz"] >= 5]
+
+        axis_findings = []
+
+        # Classify peaks
+        for pk in peaks:
+            freq = pk["freq_hz"]
+            power = pk["power_db"]
+
+            # Match against prop harmonics if available
+            matched_harmonic = None
+            if prop_harmonics:
+                for h in prop_harmonics:
+                    if h["min_hz"] <= freq <= h["max_hz"]:
+                        matched_harmonic = h["label"]
+                        break
+
+            if matched_harmonic:
+                axis_findings.append({
+                    "level": "INFO",
+                    "text": f"{axis_name}: {freq:.0f}Hz matches {matched_harmonic}",
+                    "detail": "Prop/motor vibration at expected harmonic. "
+                              "Check prop balance and tightness.",
+                    "source": "prop_harmonic",
+                })
+            elif freq < 50:
+                axis_findings.append({
+                    "level": "WARNING",
+                    "text": f"{axis_name}: Low-frequency vibration at {freq:.0f}Hz ({power:.0f}dB)",
+                    "detail": "Sub-50Hz accel vibration suggests loose mounting, "
+                              "frame flex, or a failing bearing.",
+                    "source": "structural_low",
+                })
+            elif 50 <= freq <= 200:
+                axis_findings.append({
+                    "level": "INFO",
+                    "text": f"{axis_name}: Mid-frequency vibration at {freq:.0f}Hz ({power:.0f}dB)",
+                    "detail": "Likely motor/prop related. Check prop balance, "
+                              "motor shaft straightness, and bell bearing play.",
+                    "source": "motor_prop",
+                })
+            elif freq > 200:
+                axis_findings.append({
+                    "level": "INFO",
+                    "text": f"{axis_name}: High-frequency vibration at {freq:.0f}Hz ({power:.0f}dB)",
+                    "detail": "Electrical noise or high-order resonance. "
+                              "Check motor wire routing and ESC shielding.",
+                    "source": "electrical_hf",
+                })
+
+        # RMS severity per axis
+        if rms_g > 0.5:
+            score -= 15
+            axis_findings.append({
+                "level": "WARNING",
+                "text": f"{axis_name}: High vibration ({rms_g:.2f}g RMS)",
+                "detail": "Excessive vibration — check props, motors, frame hardware.",
+                "source": "rms_high",
+            })
+        elif rms_g > 0.2:
+            score -= 5
+            axis_findings.append({
+                "level": "INFO",
+                "text": f"{axis_name}: Moderate vibration ({rms_g:.2f}g RMS)",
+                "detail": "Some vibration present. Monitor for degradation.",
+                "source": "rms_moderate",
+            })
+
+        results["axes"].append({
+            "axis": axis_name,
+            "freqs": freqs,
+            "psd_db": psd_db,
+            "peaks": peaks,
+            "rms_g": rms_g,
+            "findings": axis_findings,
+        })
+
+    if all_rms:
+        results["overall_rms_g"] = float(np.sqrt(np.mean(np.array(all_rms)**2)))
+
+    # Cross-axis comparison: Z should be highest (gravity axis), X/Y similar
+    axis_rms = {a["axis"]: a["rms_g"] for a in results["axes"]}
+    if "X" in axis_rms and "Y" in axis_rms:
+        xy_ratio = max(axis_rms["X"], axis_rms["Y"]) / max(min(axis_rms["X"], axis_rms["Y"]), 0.001)
+        if xy_ratio > 3.0:
+            worse_axis = "X" if axis_rms["X"] > axis_rms["Y"] else "Y"
+            results["findings"].append({
+                "level": "WARNING",
+                "text": f"{worse_axis}-axis vibration {xy_ratio:.1f}× higher than the other — "
+                        f"asymmetric issue (prop, motor, or arm on that side)",
+                "detail": f"X={axis_rms.get('X', 0):.2f}g, Y={axis_rms.get('Y', 0):.2f}g. "
+                          f"Swap props between {worse_axis}-axis motors to isolate.",
+            })
+
+    # Aggregate axis findings into top-level
+    for ax in results["axes"]:
+        for f in ax["findings"]:
+            if f["level"] == "WARNING":
+                results["findings"].append(f)
+
+    results["score"] = max(0, score)
+    return results
+
+
+def _print_section_vibration(vib_results):
+    """Print accelerometer vibration section to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}STRUCTURAL VIBRATION (Accelerometer):{R}")
+
+    if not vib_results or not vib_results.get("axes"):
+        print(f"  {DIM}  No accelerometer data available.{R}")
+        return
+
+    score = vib_results.get("score", 100)
+    sc = G if score >= 85 else Y if score >= 60 else RED
+    overall = vib_results.get("overall_rms_g", 0)
+    print(f"  {sc}  Vibration score: {score}/100  (overall {overall:.2f}g RMS){R}")
+
+    for ax in vib_results["axes"]:
+        rms = ax["rms_g"]
+        rc = G if rms < 0.1 else Y if rms < 0.3 else RED
+        n_peaks = len(ax["peaks"])
+        print(f"    {ax['axis']}-axis: {rc}{rms:.3f}g{R} RMS  ({n_peaks} peaks)")
+
+    for f in vib_results.get("findings", []):
+        if f["level"] == "WARNING":
+            print(f"\n  {Y}⚠ {f['text']}{R}")
+            if f.get("detail"):
+                print(f"    {DIM}{f['detail']}{R}")
+        elif f["level"] == "INFO":
+            print(f"\n  {DIM}ℹ {f['text']}{R}")
+
+
+def _print_section_recipe(recipe):
+    """Print tuning recipe section to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}TUNING RECIPE: {recipe['recipe_name']}{R}")
+    print(f"  {DIM}{recipe['description']}{R}")
+
+    print(f"\n  {B}Filter stack:{R}")
+    for param, val in recipe["stack"].items():
+        print(f"    {G}set {param} = {val}{R}")
+
+    print(f"\n  {B}Reasoning:{R}")
+    for r in recipe["reasoning"]:
+        print(f"    {DIM}• {r}{R}")
+
+
+def _print_section_power(power):
+    """Print power/efficiency section to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}POWER & BATTERY:{R}")
+
+    if not power or power.get("avg_cell_v") is None:
+        print(f"  {DIM}  No battery voltage data available.{R}")
+        return
+
+    vc = G if power["min_cell_v"] > 3.5 else Y if power["min_cell_v"] > 3.3 else RED
+    print(f"    Cell voltage: avg {power['avg_cell_v']:.2f}V  min {vc}{power['min_cell_v']:.2f}V{R}  sag {power['sag_v']:.2f}V")
+
+    if power.get("avg_current_a") is not None:
+        print(f"    Current: avg {power['avg_current_a']:.1f}A  Power: {power['avg_power_w']:.0f}W")
+        print(f"    Consumed: {power['total_mah']:.0f}mAh ({power['total_wh']:.1f}Wh)")
+
+    for f in power.get("findings", []):
+        icon = f"{Y}⚠" if f["level"] == "WARNING" else f"{DIM}ℹ"
+        print(f"\n  {icon} {f['text']}{R}")
+        if f.get("detail"):
+            print(f"    {DIM}{f['detail']}{R}")
+
+
+def _print_section_propwash(propwash):
+    """Print propwash scoring section to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}PROPWASH:{R}")
+
+    if not propwash or not propwash.get("events"):
+        for f in propwash.get("findings", []) if propwash else []:
+            print(f"  {G}✓ {f['text']}{R}")
+        return
+
+    score = propwash.get("score", 100)
+    sc = G if score >= 85 else Y if score >= 60 else RED
+    worst = propwash.get("worst_axis", "?")
+    n_events = len(propwash["events"])
+    print(f"  {sc}  Propwash score: {score}/100  ({n_events} events, worst on {worst}){R}")
+
+    # Event summary by severity
+    for sev in ["severe", "moderate", "mild"]:
+        evts = [e for e in propwash["events"] if e["severity"] == sev]
+        if evts:
+            avg_rms = np.mean([e["rms"] for e in evts])
+            avg_freq = np.mean([e["freq_hz"] for e in evts])
+            print(f"    {sev.capitalize()}: {len(evts)} events, {avg_rms:.1f}°/s RMS at {avg_freq:.0f}Hz")
+
+    for f in propwash.get("findings", []):
+        icon = f"{Y}⚠" if f["level"] == "WARNING" else f"{DIM}ℹ" if f["level"] == "INFO" else f"{G}✓"
+        print(f"\n  {icon} {f['text']}{R}")
+        if f.get("detail"):
+            print(f"    {DIM}{f['detail']}{R}")
 
 
 # ─── Prescriptive Recommendation Engine ──────────────────────────────────────
@@ -5157,6 +5477,519 @@ def generate_action_plan(noise_results, pid_results, motor_analysis, dterm_resul
     return {"actions": actions, "info": info_items, "scores": scores, "verdict": verdict, "verdict_text": vtext}
 
 
+# ─── Tuning Recipe Engine ─────────────────────────────────────────────────────
+
+def generate_tuning_recipe(noise_results, noise_fp, config, profile, accel_vib=None):
+    """Generate a holistic filter stack recommendation based on the overall noise picture.
+
+    Instead of tweaking one filter at a time, analyzes the noise sources and
+    recommends a complete filter configuration as a coherent "recipe."
+
+    Returns dict with:
+        recipe_name (str): Short label for the recipe type
+        description (str): What this recipe does
+        stack (dict): {param: value} — complete filter settings
+        cli_commands (list): Ready-to-paste CLI commands
+        reasoning (list): Why each choice was made
+    """
+    frame_inches = profile.get("frame_inches", 5)
+    reasoning = []
+
+    # Detect dominant noise characteristics
+    has_prop_harmonics = False
+    has_electrical = False
+    has_propwash = False
+    noise_floor_db = -60
+    dominant_freq = None
+
+    if noise_fp and noise_fp.get("peaks"):
+        for pk in noise_fp["peaks"]:
+            src = pk.get("source", "")
+            if "prop" in src and "wash" not in src:
+                has_prop_harmonics = True
+            elif "electrical" in src:
+                has_electrical = True
+            elif "propwash" in src:
+                has_propwash = True
+
+    # Compute average noise floor from results
+    for nr in noise_results:
+        if nr:
+            noise_floor_db = max(noise_floor_db, nr.get("rms_high", -60))
+
+    # Current filter state
+    current_gyro_lpf = config.get("gyro_lowpass_hz", 100)
+    current_dterm_lpf = config.get("dterm_lpf_hz", 100)
+    rpm_enabled = config.get("rpm_filter_enabled") not in (None, 0, "0", "OFF")
+    dyn_notch_enabled = config.get("dyn_notch_enabled") not in (None, 0, "0", "OFF")
+
+    # Has accel vibration issues?
+    has_structural = False
+    if accel_vib and accel_vib.get("score", 100) < 70:
+        has_structural = True
+
+    # ── Select recipe ──
+    stack = {}
+
+    if rpm_enabled and noise_floor_db < -45:
+        # Clean with RPM filter — open up filters
+        recipe_name = "RPM Clean"
+        description = ("RPM filter is handling motor harmonics. Open up gyro and D-term LPF "
+                       "for minimum delay. Keep dynamic notch as backup for non-harmonic noise.")
+        target_gyro = min(profile["gyro_lpf_range"][1], max(100, int(current_gyro_lpf * 1.2)))
+        target_dterm = max(60, int(target_gyro * 0.7))
+        stack = {
+            "gyro_main_lpf_hz": target_gyro,
+            "dterm_lpf_hz": target_dterm,
+            "dterm_lpf_type": "PT3",
+            "dynamic_gyro_notch_mode": "3D",
+            "dynamic_gyro_notch_min_hz": max(50, profile["gyro_lpf_range"][0]),
+        }
+        reasoning.append(f"RPM filter active — gyro LPF can go higher ({target_gyro}Hz) for less delay")
+        reasoning.append(f"D-term PT3 at {target_dterm}Hz — smooth D without excessive lag")
+
+    elif has_prop_harmonics and not rpm_enabled:
+        # Strong prop harmonics, no RPM filter — rely on dynamic notch + tight LPF
+        recipe_name = "Harmonic Defense"
+        description = ("Strong prop/motor harmonics without RPM filter. Dynamic notch tracks "
+                       "the harmonics, tight LPF catches the rest. Consider wiring ESC telemetry "
+                       "for RPM filter — it would allow much higher LPF and better response.")
+        target_gyro = max(profile["gyro_lpf_range"][0], min(80, int(current_gyro_lpf * 0.85)))
+        target_dterm = max(45, int(target_gyro * 0.65))
+        stack = {
+            "gyro_main_lpf_hz": target_gyro,
+            "dterm_lpf_hz": target_dterm,
+            "dterm_lpf_type": "PT3",
+            "dynamic_gyro_notch_mode": "3D",
+            "dynamic_gyro_notch_min_hz": max(40, profile["gyro_lpf_range"][0] - 10),
+            "dynamic_gyro_notch_q": 300,
+        }
+        reasoning.append(f"Prop harmonics detected — dynamic notch Q=300 for precise tracking")
+        reasoning.append(f"Gyro LPF at {target_gyro}Hz — tight to catch residual noise")
+        reasoning.append("Enable RPM filter for best results (requires ESC telemetry UART)")
+
+    elif has_propwash and frame_inches >= 8:
+        # Large frame propwash — can't filter, need to live with it
+        recipe_name = "Large Frame Propwash"
+        description = ("Propwash at sub-80Hz on a large frame. This is aerodynamic, not fixable "
+                       "with filters. Keep LPF above the propwash frequency to avoid adding delay "
+                       "that makes it worse. Fly smoothly and avoid aggressive descents.")
+        target_gyro = max(70, current_gyro_lpf)
+        target_dterm = max(55, int(target_gyro * 0.75))
+        stack = {
+            "gyro_main_lpf_hz": target_gyro,
+            "dterm_lpf_hz": target_dterm,
+            "dterm_lpf_type": "PT3",
+        }
+        reasoning.append(f"Propwash is aerodynamic on {frame_inches}\" — filtering it adds delay and makes it worse")
+        reasoning.append(f"Gyro LPF at {target_gyro}Hz — above propwash band to preserve response")
+
+    elif noise_floor_db > -35:
+        # Very noisy — aggressive filtering needed
+        recipe_name = "Noise Suppression"
+        description = ("High overall noise floor. Aggressive filtering needed to protect motors. "
+                       "Fix the noise source (vibration, wiring, prop balance) then re-analyze — "
+                       "this recipe trades response for safety.")
+        target_gyro = max(profile["gyro_lpf_range"][0], min(60, int(current_gyro_lpf * 0.7)))
+        target_dterm = max(40, int(target_gyro * 0.6))
+        stack = {
+            "gyro_main_lpf_hz": target_gyro,
+            "dterm_lpf_hz": target_dterm,
+            "dterm_lpf_type": "PT3",
+            "dynamic_gyro_notch_mode": "3D",
+            "dynamic_gyro_notch_min_hz": max(30, profile["gyro_lpf_range"][0] - 15),
+            "dynamic_gyro_notch_q": 200,
+        }
+        reasoning.append(f"High noise floor ({noise_floor_db:.0f}dB) — aggressive LPF needed")
+        reasoning.append("Fix noise source first: prop balance, motor wiring, soft mount")
+
+    else:
+        # Reasonably clean — balanced setup
+        recipe_name = "Balanced"
+        description = "Noise is manageable. Balanced filter setup for good response with adequate filtering."
+        target_gyro = max(profile["gyro_lpf_range"][0], min(profile["gyro_lpf_range"][1],
+                          int((current_gyro_lpf + profile["gyro_lpf_range"][1]) / 2)))
+        target_dterm = max(50, int(target_gyro * 0.7))
+        stack = {
+            "gyro_main_lpf_hz": target_gyro,
+            "dterm_lpf_hz": target_dterm,
+            "dterm_lpf_type": "PT3",
+        }
+        reasoning.append(f"Clean noise profile — balanced LPF at {target_gyro}Hz")
+
+    if has_structural:
+        reasoning.append("Structural vibration detected — check frame hardware, soft-mount FC")
+
+    # Generate CLI
+    cli_commands = [f"set {k} = {v}" for k, v in stack.items()]
+    cli_commands.append("save")
+
+    return {
+        "recipe_name": recipe_name,
+        "description": description,
+        "stack": stack,
+        "cli_commands": cli_commands,
+        "reasoning": reasoning,
+    }
+
+
+# ─── Power/Efficiency Analysis ───────────────────────────────────────────────
+
+def analyze_power(data, sr, config=None):
+    """Analyze battery voltage and current for efficiency metrics.
+
+    Returns dict with:
+        avg_current_a (float): Average current draw in amps
+        avg_power_w (float): Average power in watts
+        total_mah (float): Estimated mAh consumed
+        total_wh (float): Estimated Wh consumed
+        min_cell_v (float): Minimum cell voltage during flight
+        avg_cell_v (float): Average cell voltage
+        sag_v (float): Voltage sag (avg - min)
+        efficiency (dict): Power vs throttle curve data
+        findings (list): [{level, text, detail}]
+    """
+    results = {
+        "avg_current_a": None, "avg_power_w": None,
+        "total_mah": None, "total_wh": None,
+        "min_cell_v": None, "avg_cell_v": None, "sag_v": None,
+        "efficiency": None, "findings": [],
+    }
+
+    has_vbat = "vbat" in data
+    has_amp = "amperage" in data
+
+    if not has_vbat:
+        return results
+
+    vbat = data["vbat"]
+    clean_v = vbat[~np.isnan(vbat)]
+    if len(clean_v) < 100:
+        return results
+
+    # INAV vbat is in 0.01V units
+    voltage = clean_v / 100.0
+
+    # Detect cell count
+    cells = config.get("_cell_count") if config else None
+    if not cells:
+        max_v = float(np.max(voltage))
+        cells = round(max_v / 4.2)
+        if cells < 1:
+            cells = 1
+
+    cell_voltage = voltage / cells
+    min_cell = float(np.min(cell_voltage))
+    avg_cell = float(np.mean(cell_voltage))
+    sag = avg_cell - min_cell
+
+    results["min_cell_v"] = round(min_cell, 2)
+    results["avg_cell_v"] = round(avg_cell, 2)
+    results["sag_v"] = round(sag, 2)
+
+    if has_amp:
+        amp = data["amperage"]
+        clean_a = amp[~np.isnan(amp)]
+        if len(clean_a) > 100:
+            # INAV amperage is in 0.01A units
+            current = clean_a / 100.0
+            avg_current = float(np.mean(current))
+            duration_s = len(clean_a) / sr
+
+            # Match lengths for power calculation
+            min_len = min(len(voltage), len(current))
+            power = voltage[:min_len] * current[:min_len]
+            avg_power = float(np.mean(power))
+
+            total_mah = avg_current * (duration_s / 3600) * 1000
+            total_wh = avg_power * (duration_s / 3600)
+
+            results["avg_current_a"] = round(avg_current, 1)
+            results["avg_power_w"] = round(avg_power, 1)
+            results["total_mah"] = round(total_mah, 0)
+            results["total_wh"] = round(total_wh, 2)
+
+    # Findings
+    if min_cell < 3.3:
+        results["findings"].append({
+            "level": "WARNING",
+            "text": f"Cell voltage dropped to {min_cell:.2f}V — below safe LiPo minimum (3.3V)",
+            "detail": "Landing voltage too low. Raise battery warning threshold or shorten flights.",
+        })
+    elif min_cell < 3.5:
+        results["findings"].append({
+            "level": "INFO",
+            "text": f"Minimum cell voltage {min_cell:.2f}V — acceptable but not much margin",
+            "detail": "Consider landing earlier for battery longevity.",
+        })
+
+    if sag > 0.5:
+        results["findings"].append({
+            "level": "WARNING",
+            "text": f"Voltage sag {sag:.2f}V/cell — battery may be aging or undersized",
+            "detail": "High sag means the pack can't deliver the current needed. "
+                      "Check C-rating, consider a higher-capacity or higher-C pack.",
+        })
+
+    return results
+
+
+# ─── Failsafe Event Reconstruction ───────────────────────────────────────────
+
+def analyze_failsafe_events(data, sr):
+    """Reconstruct failsafe events from slow frame flight mode flags.
+
+    Detects transitions into and out of failsafe modes (RX_LOST,
+    RTH triggered by failsafe) and builds a timeline.
+
+    Returns dict with:
+        events (list): [{start_s, end_s, duration_s, type, recovered}]
+        total_failsafe_s (float): Total time in failsafe
+        findings (list): [{level, text, detail}]
+    """
+    results = {"events": [], "total_failsafe_s": 0, "findings": []}
+
+    slow_frames = data.get("_slow_frames", [])
+    if not slow_frames:
+        return results
+
+    # INAV failsafe shows as specific flight mode bits or flags
+    # flightModeFlags bit 7 = NAV_RTH, we also look for failsafe-specific flags
+    MODE_RTH = 7
+    MODE_ARM = 0
+
+    # Track mode transitions to find failsafe patterns
+    transitions = []
+    for frame_idx, fields in slow_frames:
+        mode_flags = fields.get("flightModeFlags")
+        if mode_flags is None:
+            for k in fields:
+                if "flight" in k.lower() and "mode" in k.lower():
+                    mode_flags = fields[k]
+                    break
+        if mode_flags is not None:
+            try:
+                flags = int(mode_flags)
+                t_s = frame_idx / sr if sr > 0 else 0
+                transitions.append({"time_s": t_s, "flags": flags, "idx": frame_idx})
+            except (ValueError, TypeError):
+                pass
+
+    # Look for failsafe flags in event frames
+    event_frames = data.get("_event_frames", [])
+    for frame_idx, event_type, event_data in (event_frames or []):
+        # Event type 15 = FLIGHT_MODE with failsafe flags
+        if event_type == 15 and event_data:
+            try:
+                flags = int(event_data) if isinstance(event_data, (int, float)) else 0
+                # Check for failsafe-related flags
+                # Bit patterns vary by INAV version, but RX_LOSS typically
+                # triggers an emergency RTH
+            except (ValueError, TypeError):
+                pass
+
+    # Detect RTH that appears suddenly (not user-commanded)
+    # Heuristic: RTH that starts without a preceding AUX channel change
+    # is likely failsafe-triggered
+    events = []
+    in_rth = False
+    rth_start = None
+
+    for i, tr in enumerate(transitions):
+        is_rth = bool(tr["flags"] & (1 << MODE_RTH))
+        is_armed = bool(tr["flags"] & (1 << MODE_ARM))
+
+        if is_rth and not in_rth:
+            # RTH just started
+            in_rth = True
+            rth_start = tr["time_s"]
+
+            # Check if this looks like failsafe (sudden, no user input pattern)
+            # Simple heuristic: if there's no RC data change near this point
+            # it's likely automatic
+            is_failsafe = False  # would need RC data correlation for accurate detection
+
+        elif not is_rth and in_rth:
+            # RTH ended
+            in_rth = False
+            if rth_start is not None:
+                duration = tr["time_s"] - rth_start
+                events.append({
+                    "start_s": rth_start,
+                    "end_s": tr["time_s"],
+                    "duration_s": duration,
+                    "type": "RTH",
+                    "recovered": True,
+                })
+
+        if not is_armed and in_rth:
+            # Disarmed during RTH — landed
+            in_rth = False
+            if rth_start is not None:
+                events.append({
+                    "start_s": rth_start,
+                    "end_s": tr["time_s"],
+                    "duration_s": tr["time_s"] - rth_start,
+                    "type": "RTH_LANDING",
+                    "recovered": True,
+                })
+
+    results["events"] = events
+    results["total_failsafe_s"] = sum(e["duration_s"] for e in events)
+
+    if events:
+        results["findings"].append({
+            "level": "INFO",
+            "text": f"{len(events)} RTH event(s) detected, total {results['total_failsafe_s']:.1f}s",
+            "detail": "Check if these were intentional RTH commands or failsafe-triggered.",
+        })
+
+    return results
+
+
+# ─── Propwash Scoring ─────────────────────────────────────────────────────────
+
+def analyze_propwash(data, sr, profile=None):
+    """Detect and score propwash oscillation during descents and direction reversals.
+
+    Propwash happens when the quad descends through its own turbulent wake.
+    It manifests as oscillation on pitch and roll during descents and throttle
+    reversals. Separate from general noise analysis.
+
+    Returns dict with:
+        events (list): [{start_s, end_s, severity, axis, rms, freq_hz, vert_speed}]
+        score (int): 0-100 propwash severity score
+        worst_axis (str): Axis most affected
+        findings (list): [{level, text, detail}]
+    """
+    results = {"events": [], "score": 100, "worst_axis": None, "findings": []}
+    frame_inches = profile.get("frame_inches", 5) if profile else 5
+
+    # Need throttle and gyro data
+    if "throttle" not in data or "gyro_roll" not in data:
+        return results
+
+    throttle = data["throttle"]
+    time_s = data.get("time_s")
+    if time_s is None or len(time_s) < sr * 2:
+        return results
+
+    # Detect descent segments: throttle below hover (midpoint) for >0.3s
+    # or vertical speed negative if nav data available
+    thr_clean = throttle[~np.isnan(throttle)]
+    if len(thr_clean) < sr:
+        return results
+
+    thr_mid = float(np.median(thr_clean))  # approximate hover throttle
+    thr_low = thr_mid - 50  # threshold for "descending"
+
+    # Window-based analysis: 0.5s windows
+    window = int(sr * 0.5)
+    step = int(sr * 0.25)
+    events = []
+    axis_rms_sum = {"Roll": 0, "Pitch": 0}
+    axis_event_count = {"Roll": 0, "Pitch": 0}
+
+    for start in range(0, len(throttle) - window, step):
+        end = start + window
+        thr_seg = throttle[start:end]
+
+        # Check if this is a descent segment (low throttle)
+        thr_mean = float(np.nanmean(thr_seg))
+        if thr_mean > thr_low:
+            continue
+
+        # Check for preceding high throttle (throttle reversal = propwash trigger)
+        lookback = max(0, start - int(sr * 0.5))
+        thr_before = float(np.nanmean(throttle[lookback:start])) if lookback < start else thr_mid
+        if thr_before < thr_mid:
+            continue  # no reversal, sustained low throttle
+
+        # Analyze gyro during this descent window
+        for axis in ["Roll", "Pitch"]:
+            key = f"gyro_{axis.lower()}"
+            if key not in data:
+                continue
+            gyro_seg = data[key][start:end]
+            clean = gyro_seg[~np.isnan(gyro_seg)]
+            if len(clean) < window // 2:
+                continue
+
+            rms = float(np.sqrt(np.mean(clean**2)))
+
+            # Frame-scaled threshold
+            rms_threshold = 8.0 * (frame_inches / 7.0)
+            if rms < rms_threshold:
+                continue
+
+            # FFT to find propwash frequency
+            from scipy.fft import rfft, rfftfreq
+            freqs = rfftfreq(len(clean), 1.0 / sr)
+            spec = np.abs(rfft(clean - np.mean(clean)))
+            # Propwash is typically 20-80Hz
+            band = (freqs >= 15) & (freqs <= 100)
+            if not np.any(band):
+                continue
+            peak_freq = float(freqs[band][np.argmax(spec[band])])
+
+            severity = "severe" if rms > rms_threshold * 3 else "moderate" if rms > rms_threshold * 1.5 else "mild"
+            t_start = float(time_s[start]) if start < len(time_s) else start / sr
+
+            events.append({
+                "start_s": t_start,
+                "end_s": t_start + window / sr,
+                "severity": severity,
+                "axis": axis,
+                "rms": rms,
+                "freq_hz": peak_freq,
+                "vert_speed": thr_mid - thr_mean,  # proxy for descent rate
+            })
+
+            axis_rms_sum[axis] += rms
+            axis_event_count[axis] += 1
+
+    results["events"] = events
+
+    if not events:
+        results["findings"].append({
+            "level": "OK",
+            "text": "No significant propwash detected during descents",
+            "detail": "",
+        })
+        return results
+
+    # Score
+    n_severe = sum(1 for e in events if e["severity"] == "severe")
+    n_moderate = sum(1 for e in events if e["severity"] == "moderate")
+    score = max(0, 100 - n_severe * 20 - n_moderate * 8 - len(events) * 2)
+    results["score"] = score
+
+    # Worst axis
+    worst = max(axis_rms_sum, key=lambda a: axis_rms_sum[a] / max(axis_event_count[a], 1))
+    results["worst_axis"] = worst
+
+    avg_freq = np.mean([e["freq_hz"] for e in events])
+    avg_rms = np.mean([e["rms"] for e in events])
+
+    if n_severe > 0:
+        results["findings"].append({
+            "level": "WARNING",
+            "text": f"Propwash: {len(events)} events ({n_severe} severe), "
+                    f"worst on {worst} at {avg_freq:.0f}Hz, {avg_rms:.1f}°/s RMS",
+            "detail": f"Propwash oscillation during throttle reversals and descents. "
+                      f"{'On ' + str(frame_inches) + '\"-inch, this is mostly aerodynamic — avoid aggressive descents. ' if frame_inches >= 8 else ''}"
+                      f"RPM filter and lower D-term LPF can help. Smoother flying style reduces it.",
+        })
+    else:
+        results["findings"].append({
+            "level": "INFO",
+            "text": f"Mild propwash: {len(events)} events on {worst} at {avg_freq:.0f}Hz",
+            "detail": "Some propwash present during descents. Normal for most frames.",
+        })
+
+    return results
+
+
 # ─── Chart Generation ─────────────────────────────────────────────────────────
 
 def fig_to_base64(fig, dpi=120):
@@ -6356,7 +7189,7 @@ def _build_section_statuses(plan, pid_results, noise_fp, motor_analysis,
 def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
                       profile, config_review_text, progression_text,
                       nav_perf=None, nav_results=None, flight_diff=None,
-                      prog_data=None):
+                      prog_data=None, accel_vib=None):
     """Run interactive menu loop for exploring analysis results."""
     R, B, C, G, Y, RED, DIM = _colors()
 
@@ -6410,6 +7243,8 @@ def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
             print("\033[2J\033[H", end="")
             _print_score_bar(plan, config, data)
             _print_section_noise(plan, noise_fp)
+            if accel_vib and accel_vib.get("axes"):
+                _print_section_vibration(accel_vib)
             _wait_for_enter()
         elif choice == "3":
             print("\033[2J\033[H", end="")
@@ -6464,6 +7299,8 @@ def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
             _print_score_bar(plan, config, data)
             _print_section_pid(plan, pid_results, config, profile)
             _print_section_noise(plan, noise_fp)
+            if accel_vib and accel_vib.get("axes"):
+                _print_section_vibration(accel_vib)
             _print_section_hover(plan, motor_analysis)
             _print_section_nav(nav_perf)
             _print_section_nav_sensors(nav_results)
@@ -6489,6 +7326,114 @@ def _wait_for_enter():
         input(f"\n  {DIM}Press Enter to return to menu...{R}")
     except (EOFError, KeyboardInterrupt):
         pass
+
+
+def _offer_auto_apply(cli_cmds, args):
+    """Offer to push CLI commands directly to the FC.
+
+    Reconnects to the FC, verifies a vault backup exists, sends commands
+    via cli_batch, and handles the post-save USB reconnection.
+    """
+    R, B, C, G, Y, RED, DIM = _colors()
+
+    # Filter out 'save' — cli_batch adds it automatically
+    cmds_to_send = [c for c in cli_cmds if c.strip().lower() != "save"]
+    if not cmds_to_send:
+        return
+
+    # Check vault has a backup
+    vault_entries = vault_list(blackbox_dir=getattr(args, 'blackbox_dir', './blackbox'), limit=1)
+    if not vault_entries:
+        print(f"\n  {Y}⚠ No config backup in vault — run a download first to create a backup.{R}")
+        print(f"  {DIM}  Auto-apply requires a vault backup for safety.{R}")
+        return
+
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}APPLY CHANGES TO FC{R}")
+    print(f"  {DIM}Vault backup: {vault_entries[0]['filename']} ({vault_entries[0]['age_str']}){R}")
+    print()
+    for cmd in cmds_to_send:
+        print(f"    {G}{cmd}{R}")
+    print(f"    {DIM}save{R}")
+    print()
+
+    try:
+        answer = input(f"  {B}Apply these {len(cmds_to_send)} changes to the FC? (y/N): {R}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if answer != "y":
+        print(f"  {DIM}Skipped.{R}")
+        return
+
+    # Reconnect to FC
+    try:
+        try:
+            from inav_toolkit.msp import INAVDevice, auto_detect_fc
+        except ImportError:
+            from inav_msp import INAVDevice, auto_detect_fc
+
+        port = None
+        if args.device == "auto":
+            port = auto_detect_fc()
+            if not port:
+                print(f"  {RED}✗ No FC found. Is it still connected?{R}")
+                return
+        else:
+            port = args.device
+
+        print(f"  Connecting to {port}...", end="", flush=True)
+        fc = INAVDevice(port)
+        info = fc.identify()
+        if not info:
+            print(f" {RED}failed{R}")
+            fc.close()
+            return
+        print(f" {info.get('craft_name', '')} - {info.get('firmware', '')}")
+
+        # Send commands
+        print(f"  Sending {len(cmds_to_send)} commands...", end="", flush=True)
+        results = fc.cli_batch(cmds_to_send, timeout=5.0, save=True)
+
+        # Check results for errors
+        errors = []
+        for cmd, response in results:
+            if "invalid" in response.lower() or "error" in response.lower():
+                errors.append((cmd, response.strip()))
+
+        if errors:
+            print(f" {Y}done with {len(errors)} warning(s){R}")
+            for cmd, resp in errors:
+                print(f"    {Y}⚠ {cmd}: {resp}{R}")
+        else:
+            print(f" {G}done{R}")
+
+        print(f"  {DIM}FC will reboot after save...{R}")
+
+        # Wait for USB reset after save
+        import time as _time3
+        _time3.sleep(3.0)
+
+        # Reconnect to verify
+        try:
+            fc.close()
+        except Exception:
+            pass
+        _time3.sleep(2.0)
+
+        try:
+            fc2 = INAVDevice(port)
+            info2 = fc2.identify()
+            if info2:
+                print(f"  {G}✓ FC reconnected: {info2.get('craft_name', '')} - changes applied{R}")
+            fc2.close()
+        except Exception:
+            print(f"  {DIM}FC rebooting — changes saved, reconnect manually to verify{R}")
+
+    except Exception as e:
+        print(f"\n  {RED}✗ Auto-apply failed: {e}{R}")
+        print(f"  {DIM}  Paste the CLI commands manually into INAV Configurator.{R}")
 
 
 # ─── HTML Report ──────────────────────────────────────────────────────────────
@@ -7018,6 +7963,342 @@ new Chart(document.getElementById('componentChart'), {{
 
     with open(output_path, "w") as f:
         f.write(html)
+
+
+def _generate_vibration_html(accel_vib):
+    """Generate HTML section for accelerometer vibration analysis."""
+    if not accel_vib or not accel_vib.get("axes"):
+        return ""
+
+    score = accel_vib.get("score", 100)
+    sc = "good" if score >= 85 else "warn" if score >= 60 else "bad"
+    overall = accel_vib.get("overall_rms_g", 0)
+
+    html = f'<section><h2>Structural Vibration</h2>'
+    html += f'<div class="cc"><span class="{sc}" style="font-size:1rem">'
+    html += f'Vibration Score: {score}/100 — {overall:.3f}g RMS overall</span></div>'
+
+    # Per-axis table
+    html += '<div class="cc"><table><tr><th>Axis</th><th>RMS (g)</th><th>Peaks</th><th>Status</th></tr>'
+    for ax in accel_vib["axes"]:
+        rms = ax["rms_g"]
+        rc = "good" if rms < 0.1 else "warn" if rms < 0.3 else "bad"
+        n_peaks = len(ax["peaks"])
+        peak_freqs = ", ".join(f'{p["freq_hz"]:.0f}Hz' for p in ax["peaks"][:3])
+        status = "Clean" if rms < 0.1 else "Moderate" if rms < 0.3 else "High"
+        html += f'<tr><td style="font-weight:700">{ax["axis"]}</td>'
+        html += f'<td class="{rc}">{rms:.3f}</td>'
+        html += f'<td style="color:var(--dm)">{peak_freqs or "—"}</td>'
+        html += f'<td class="{rc}">{status}</td></tr>'
+    html += '</table></div>'
+
+    # Findings
+    findings = accel_vib.get("findings", [])
+    if findings:
+        html += '<div class="cc">'
+        for f in findings:
+            fc = "warning" if f["level"] == "WARNING" else "info"
+            html += f'<div class="nav-findings"><div class="finding {fc}">'
+            html += f'<strong>{f["text"]}</strong>'
+            if f.get("detail"):
+                html += f'<div style="color:var(--dm);font-size:.8rem;margin-top:4px">{f["detail"]}</div>'
+            html += '</div></div>'
+        html += '</div>'
+
+    # Per-axis peak details
+    for ax in accel_vib["axes"]:
+        if ax["findings"]:
+            html += f'<div class="cc"><h3>{ax["axis"]}-Axis Details</h3>'
+            for f in ax["findings"]:
+                fc = "warning" if f["level"] == "WARNING" else "info"
+                html += f'<div class="nav-findings"><div class="finding {fc}">{f["text"]}</div></div>'
+            html += '</div>'
+
+    html += '</section>'
+    return html
+
+
+def _generate_map_html(data, nav_perf=None):
+    """Generate HTML section with Leaflet map showing GPS flight track.
+
+    Colors track by flight mode, marks deceleration events and home position.
+    Returns empty string if no GPS data available.
+    """
+    gps_frames = data.get("_gps_frames", [])
+    if not gps_frames or len(gps_frames) < 10:
+        return ""
+
+    sr = data.get("sample_rate", 1000)
+
+    # Flexible field lookup for GPS frames (field names vary by firmware/decoder)
+    def _gps_field(fields, *candidates):
+        """Find a GPS field by trying multiple name variants."""
+        for name in candidates:
+            if name in fields:
+                return fields[name]
+        # Case-insensitive fallback
+        fields_lower = {k.lower(): v for k, v in fields.items()}
+        for name in candidates:
+            if name.lower() in fields_lower:
+                return fields_lower[name.lower()]
+        return None
+
+    # Extract GPS coordinates
+    points = []
+    for idx, fields in gps_frames:
+        lat = _gps_field(fields, "GPS_coord[0]", "GPS_coord_0", "gps_coord[0]", "GPS_lat", "gps_lat")
+        lon = _gps_field(fields, "GPS_coord[1]", "GPS_coord_1", "gps_coord[1]", "GPS_lon", "gps_lon")
+        if lat is None or lon is None:
+            # Debug: log what fields are available on first frame
+            if idx == gps_frames[0][0] and not points:
+                pass  # fields not matching — skip silently
+            continue
+        try:
+            lat_deg = float(lat) / 1e7
+            lon_deg = float(lon) / 1e7
+        except (ValueError, TypeError):
+            continue
+        if abs(lat_deg) < 0.1 and abs(lon_deg) < 0.1:
+            continue  # no fix
+
+        speed = _gps_field(fields, "GPS_speed", "GPS_ground_speed", "gps_speed") or 0
+        alt = _gps_field(fields, "GPS_altitude", "GPS_alt", "gps_altitude") or 0
+        sats = _gps_field(fields, "GPS_numSat", "GPS_numsat", "gps_numsat") or 0
+        time_s = idx / sr if sr > 0 else 0
+
+        try:
+            speed = float(speed)
+            alt = float(alt)
+            sats = int(sats)
+        except (ValueError, TypeError):
+            speed = 0
+            alt = 0
+            sats = 0
+
+        points.append({
+            "lat": lat_deg, "lon": lon_deg,
+            "speed": speed, "alt": alt,
+            "sats": sats, "t": round(time_s, 1),
+            "idx": idx,
+        })
+
+    if len(points) < 5:
+        return ""
+
+    # Get flight mode at each GPS point using slow frames
+    slow_frames = data.get("_slow_frames", [])
+    mode_transitions = []
+    for frame_idx, fields in slow_frames:
+        mode_flags = fields.get("flightModeFlags")
+        if mode_flags is None:
+            for k in fields:
+                if "flight" in k.lower() and "mode" in k.lower():
+                    mode_flags = fields[k]
+                    break
+        if mode_flags is not None:
+            try:
+                flags = int(mode_flags)
+                mode_transitions.append((frame_idx, flags))
+            except (ValueError, TypeError):
+                pass
+
+    # Assign mode to each GPS point
+    MODE_POSHOLD = 8
+    MODE_RTH = 7
+    MODE_ALTHOLD = 3
+    MODE_ARM = 0
+
+    def get_mode_at(idx):
+        """Get flight mode name at a frame index."""
+        flags = 0
+        for fi, fl in mode_transitions:
+            if fi <= idx:
+                flags = fl
+            else:
+                break
+        if flags & (1 << MODE_RTH):
+            return "rth"
+        if flags & (1 << MODE_POSHOLD):
+            return "poshold"
+        if flags & (1 << MODE_ALTHOLD):
+            return "althold"
+        if flags & (1 << MODE_ARM):
+            return "manual"
+        return "disarmed"
+
+    for p in points:
+        p["mode"] = get_mode_at(p["idx"])
+
+    # Downsample to ~500 points
+    if len(points) > 500:
+        step = len(points) // 500
+        points = points[::step]
+
+    # Home position (first valid point)
+    home = points[0]
+
+    # Deceleration events from nav_perf
+    decel_markers = []
+    if nav_perf and nav_perf.get("deceleration"):
+        for ev in nav_perf["deceleration"]:
+            ev_t = ev["time_s"]
+            # Find closest GPS point
+            closest = min(points, key=lambda p: abs(p["t"] - ev_t))
+            decel_markers.append({
+                "lat": closest["lat"], "lon": closest["lon"],
+                "t": ev_t, "overshoot_cm": ev["peak_error_cm"],
+            })
+
+    # Poshold CEP circle
+    poshold_circle = None
+    if nav_perf and nav_perf.get("poshold"):
+        ph = nav_perf["poshold"]
+        # Find center of poshold (average of poshold points)
+        ph_points = [p for p in points if p["mode"] == "poshold"]
+        if ph_points:
+            center_lat = sum(p["lat"] for p in ph_points) / len(ph_points)
+            center_lon = sum(p["lon"] for p in ph_points) / len(ph_points)
+            poshold_circle = {
+                "lat": center_lat, "lon": center_lon,
+                "cep_m": ph["cep_cm"] / 100,
+                "max_drift_m": ph["max_drift_cm"] / 100,
+                "toilet_bowl": ph.get("toilet_bowl", False),
+            }
+
+    import json as _json
+    map_data = _json.dumps({
+        "points": [{"lat": p["lat"], "lon": p["lon"], "speed": p["speed"],
+                     "alt": p["alt"], "mode": p["mode"], "t": p["t"]}
+                    for p in points],
+        "home": {"lat": home["lat"], "lon": home["lon"]},
+        "decel": decel_markers,
+        "poshold_circle": poshold_circle,
+    })
+
+    mode_colors = {
+        "poshold": "#2d8a30",
+        "rth": "#2563eb",
+        "althold": "#d97706",
+        "manual": "#6b7280",
+        "disarmed": "#9ca3af",
+    }
+
+    return f'''<section id="sec-map"><h2>Flight Track</h2>
+<div class="cc" style="padding:0;overflow:hidden;border-radius:8px">
+<div id="flight-map" style="height:500px;width:100%"></div>
+</div>
+<div style="display:flex;gap:16px;margin:8px 0;font-size:.75rem;color:var(--dm)">
+<span><span style="color:#2d8a30">━</span> POSHOLD</span>
+<span><span style="color:#2563eb">━</span> RTH</span>
+<span><span style="color:#d97706">━</span> ALTHOLD</span>
+<span><span style="color:#6b7280">━</span> Manual</span>
+<span><span style="color:#f7768e">●</span> Decel overshoot</span>
+<span><span style="color:#bb9af7">◯</span> CEP circle</span>
+</div>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+const D = {map_data};
+const modeColors = {_json.dumps(mode_colors)};
+
+const map = L.map('flight-map', {{
+    zoomControl: true,
+    attributionControl: true,
+}});
+window._flightMap = map;
+
+const streets = L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}@2x.png', {{
+    attribution: '© <a href="https://www.openstreetmap.org/copyright">OSM</a> © <a href="https://carto.com/">CARTO</a>',
+    maxZoom: 19,
+    subdomains: 'abcd',
+}});
+const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+    attribution: '© Esri, Maxar, Earthstar Geographics',
+    maxZoom: 19,
+}});
+streets.addTo(map);
+L.control.layers({{ "Street": streets, "Satellite": satellite }}, {{}}, {{ position: 'topright' }}).addTo(map);
+
+// Draw track segments colored by mode
+let currentMode = null;
+let segment = [];
+
+function flushSegment() {{
+    if (segment.length > 1 && currentMode) {{
+        L.polyline(segment, {{
+            color: modeColors[currentMode] || '#6b7280',
+            weight: 4, opacity: 0.9,
+        }}).addTo(map);
+    }}
+    segment = [];
+}}
+
+D.points.forEach(p => {{
+    if (p.mode !== currentMode) {{
+        flushSegment();
+        currentMode = p.mode;
+    }}
+    segment.push([p.lat, p.lon]);
+}});
+flushSegment();
+
+// Home marker
+L.circleMarker([D.home.lat, D.home.lon], {{
+    radius: 8, color: '#ff9e64', fillColor: '#ff9e64',
+    fillOpacity: 0.9, weight: 2,
+}}).addTo(map).bindPopup('<b>Home</b>');
+
+// Deceleration overshoot markers
+D.decel.forEach(d => {{
+    L.circleMarker([d.lat, d.lon], {{
+        radius: 7, color: '#f7768e', fillColor: '#f7768e',
+        fillOpacity: 0.8, weight: 2,
+    }}).addTo(map).bindPopup(
+        `<b>Decel overshoot</b><br>${{d.overshoot_cm.toFixed(0)}}cm at ${{d.t.toFixed(1)}}s`
+    );
+}});
+
+// Poshold CEP circle
+if (D.poshold_circle) {{
+    const pc = D.poshold_circle;
+    L.circle([pc.lat, pc.lon], {{
+        radius: pc.cep_m, color: '#bb9af7', fillColor: '#bb9af7',
+        fillOpacity: 0.1, weight: 2, dashArray: '5,5',
+    }}).addTo(map).bindPopup(
+        `<b>POSHOLD CEP</b><br>${{pc.cep_m.toFixed(1)}}m (50th pct)<br>Max drift: ${{pc.max_drift_m.toFixed(1)}}m`
+        + (pc.toilet_bowl ? '<br><span style="color:#f7768e">Toilet bowl detected</span>' : '')
+    );
+    // Max drift circle
+    L.circle([pc.lat, pc.lon], {{
+        radius: pc.max_drift_m, color: '#f7768e',
+        fillOpacity: 0, weight: 1, dashArray: '3,6',
+    }}).addTo(map);
+}}
+
+// Track hover popup
+const trackPoints = D.points.map(p => [p.lat, p.lon]);
+if (trackPoints.length > 0) {{
+    // Fit bounds
+    const bounds = L.latLngBounds(trackPoints);
+    map.fitBounds(bounds, {{ padding: [30, 30] }});
+}}
+
+// Click on track for info
+D.points.forEach((p, i) => {{
+    if (i % 5 !== 0) return;  // every 5th point for performance
+    L.circleMarker([p.lat, p.lon], {{
+        radius: 2, color: modeColors[p.mode] || '#7982a9',
+        fillOpacity: 0.5, weight: 0,
+    }}).addTo(map).bindPopup(
+        `<b>${{p.t.toFixed(1)}}s</b><br>Speed: ${{(p.speed/100).toFixed(1)}} m/s<br>` +
+        `Alt: ${{(p.alt/100).toFixed(0)}}m<br>Mode: ${{p.mode}}`
+    );
+}});
+}})();
+</script>
+</section>'''
 
 
 def _generate_nav_perf_html(nav_perf):
@@ -7550,7 +8831,7 @@ flights.forEach((f,i) => {{
     return html
 
 
-def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm_results, config, data, charts, nav_results=None, nav_perf=None, flight_diff=None, prog_data=None, preflight=None):
+def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm_results, config, data, charts, nav_results=None, nav_perf=None, flight_diff=None, prog_data=None, preflight=None, accel_vib=None, recipe=None, power_results=None, propwash_results=None, failsafe_results=None):
     scores = plan["scores"]
     overall = scores["overall"]
     sg = "linear-gradient(90deg, #9ece6a, #73daca)" if overall >= 85 else "linear-gradient(90deg, #e0af68, #ff9e64)" if overall >= 60 else "linear-gradient(90deg, #f7768e, #ff6b6b)"
@@ -7658,9 +8939,10 @@ def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm
     # Nav sections
     nav_perf_html = _generate_nav_perf_html(nav_perf) if nav_perf else ""
     nav_sensors_html = generate_nav_html_section(nav_results) if nav_results else ""
+    map_html = _generate_map_html(data, nav_perf)
     whatif_html = _generate_whatif_html(config, plan, pid_results, noise_results)
     history_html = _generate_history_html(flight_diff, prog_data)
-    has_nav = bool(nav_perf_html or nav_sensors_html)
+    has_nav = bool(nav_perf_html or nav_sensors_html or map_html)
 
     # CLI commands
     cli_html = ""
@@ -7670,6 +8952,147 @@ def generate_html_report(plan, noise_results, pid_results, motor_analysis, dterm
         cli_html = '<div class="cc"><h3>Paste into INAV Configurator CLI tab:</h3><pre style="color:var(--gn);margin:12px 0">'
         cli_html += "\n".join(cli_cmds)
         cli_html += '</pre></div>'
+
+    # Stale data warning
+    stale_html = ""
+    mismatches = config.get("_diff_mismatches", [])
+    if len(mismatches) >= 3:
+        stale_html = '<div class="cc" style="border-left:4px solid var(--yl);background:rgba(224,175,104,.06)">'
+        stale_html += '<h3 style="color:var(--yl)">⚠ Stale Data</h3>'
+        stale_html += f'<p style="color:var(--dm)">FC config has changed since this flight ({len(mismatches)} parameters differ). '
+        stale_html += 'Analysis reflects what was flying, not the current FC config.</p>'
+        stale_html += '<table style="margin-top:8px"><tr><th>Parameter</th><th>In Flight</th><th>FC Now</th></tr>'
+        for param, bb_val, diff_val in mismatches[:10]:
+            stale_html += f'<tr><td style="color:var(--bl)">{param}</td><td>{bb_val}</td><td class="warn">{diff_val}</td></tr>'
+        stale_html += '</table></div>'
+
+    # Info notes (wind buffeting, etc.)
+    info_html = ""
+    info_items = plan.get("info", [])
+    if info_items:
+        info_html = '<div class="cc"><h3>Notes</h3>'
+        for item in info_items:
+            info_html += f'<div style="margin:6px 0;color:var(--dm)">ℹ {item["text"]}</div>'
+            if item.get("detail"):
+                info_html += f'<div style="margin-left:16px;color:var(--dm);font-size:.8rem">{item["detail"]}</div>'
+        info_html += '</div>'
+
+    # Noise sources summary
+    noise_summary_html = ""
+    noise_fp = plan.get("noise_fingerprint")
+    if noise_fp and noise_fp.get("peaks") and noise_fp.get("summary"):
+        noise_summary_html = '<div class="cc"><h3>Noise Sources</h3>'
+        sources = {}
+        for pk in noise_fp["peaks"]:
+            src = pk.get("source", "unknown")
+            sources.setdefault(src, []).append(pk)
+        for src, peaks in sources.items():
+            src_label = src.replace("_", " ").capitalize()
+            freq_range = f'{min(p["freq_hz"] for p in peaks):.0f}-{max(p["freq_hz"] for p in peaks):.0f}Hz' if len(peaks) > 1 else f'{peaks[0]["freq_hz"]:.0f}Hz'
+            axes = ", ".join(sorted(set(a for p in peaks for a in (p.get("axes") or []))))
+            noise_summary_html += f'<div style="margin:4px 0">• <strong>{src_label}</strong> at {freq_range}'
+            if axes:
+                noise_summary_html += f' on {axes}'
+            noise_summary_html += '</div>'
+        noise_summary_html += '</div>'
+
+    # Compact measurements table
+    meas_html = '<div class="cc"><h3>Measurements</h3>'
+    # Hover oscillation
+    hover_osc = plan["scores"].get("hover_osc", [])
+    if hover_osc:
+        meas_html += '<table><tr><th>Axis</th><th>Hover</th><th>RMS</th><th>P2P</th><th>Freq</th></tr>'
+        for osc in hover_osc:
+            sev = osc["severity"]
+            sc2 = "bad" if sev == "severe" else "warn" if sev in ("moderate", "mild") else "good"
+            freq_str = f'{osc["dominant_freq_hz"]:.0f}Hz' if osc.get("dominant_freq_hz") else "—"
+            meas_html += f'<tr><td class="ax-{osc["axis"].lower()}">{osc["axis"]}</td>'
+            meas_html += f'<td class="{sc2}">{sev}</td>'
+            meas_html += f'<td>{osc["gyro_rms"]:.1f}°/s</td><td>{osc["gyro_p2p"]:.0f}°/s</td>'
+            meas_html += f'<td>{freq_str}</td></tr>'
+        meas_html += '</table>'
+
+    # PID response
+    meas_html += '<table style="margin-top:12px"><tr><th>Axis</th><th>Overshoot</th><th>Delay</th><th>RMS Error</th></tr>'
+    for pid in pid_results:
+        if pid is None:
+            continue
+        _os = pid["avg_overshoot_pct"]
+        _dl = pid["tracking_delay_ms"]
+        oc = ("bad" if _os > BAD_OVERSHOOT else "warn" if _os > OK_OVERSHOOT else "good") if _os is not None else ""
+        dc = ("bad" if _dl > BAD_DELAY_MS else "warn" if _dl > OK_DELAY_MS else "good") if _dl is not None else ""
+        os_str = f"{_os:.1f}%" if _os is not None else "N/A"
+        dl_str = f"{_dl:.1f}ms" if _dl is not None else "N/A"
+        meas_html += f'<tr><td class="ax-{pid["axis"].lower()}">{pid["axis"]}</td>'
+        meas_html += f'<td class="{oc}">{os_str}</td><td class="{dc}">{dl_str}</td>'
+        meas_html += f'<td>{pid["rms_error"]:.1f}</td></tr>'
+    meas_html += '</table>'
+
+    # Motor balance
+    if motor_analysis and not motor_analysis.get("idle_detected"):
+        meas_html += '<table style="margin-top:12px"><tr><th>Motor</th><th>Avg</th><th>Saturation</th></tr>'
+        for m in motor_analysis["motors"]:
+            sc2 = "bad" if m["saturation_pct"] > MOTOR_SAT_WARN else "good"
+            meas_html += f'<tr><td>M{m["motor"]}</td><td>{m["avg_pct"]:.1f}%</td>'
+            meas_html += f'<td class="{sc2}">{m["saturation_pct"]:.1f}%</td></tr>'
+        meas_html += '</table>'
+    meas_html += '</div>'
+
+    # Tuning recipe HTML
+    recipe_html = ""
+    if recipe:
+        recipe_html = f'<div class="cc" style="border-left:4px solid var(--pp)"><h3 style="color:var(--pp)">Tuning Recipe: {recipe["recipe_name"]}</h3>'
+        recipe_html += f'<p style="color:var(--dm);margin:8px 0">{recipe["description"]}</p>'
+        recipe_html += '<pre style="color:var(--gn);margin:8px 0">'
+        recipe_html += "\n".join(recipe["cli_commands"])
+        recipe_html += '</pre><div style="margin-top:8px">'
+        for r in recipe["reasoning"]:
+            recipe_html += f'<div style="color:var(--dm);font-size:.8rem">• {r}</div>'
+        recipe_html += '</div></div>'
+
+    # Power HTML
+    power_html = ""
+    if power_results and power_results.get("avg_cell_v") is not None:
+        p = power_results
+        vc = "good" if p["min_cell_v"] > 3.5 else "warn" if p["min_cell_v"] > 3.3 else "bad"
+        power_html = '<div class="cc"><h3>Power & Battery</h3><table>'
+        power_html += f'<tr><td>Cell voltage (avg)</td><td>{p["avg_cell_v"]:.2f}V</td></tr>'
+        power_html += f'<tr><td>Cell voltage (min)</td><td class="{vc}">{p["min_cell_v"]:.2f}V</td></tr>'
+        power_html += f'<tr><td>Voltage sag</td><td>{p["sag_v"]:.2f}V</td></tr>'
+        if p.get("avg_current_a") is not None:
+            power_html += f'<tr><td>Average current</td><td>{p["avg_current_a"]:.1f}A</td></tr>'
+            power_html += f'<tr><td>Average power</td><td>{p["avg_power_w"]:.0f}W</td></tr>'
+            power_html += f'<tr><td>Consumed</td><td>{p["total_mah"]:.0f}mAh ({p["total_wh"]:.1f}Wh)</td></tr>'
+        power_html += '</table>'
+        for f in p.get("findings", []):
+            fc = "warning" if f["level"] == "WARNING" else "info"
+            power_html += f'<div class="nav-findings"><div class="finding {fc}">{f["text"]}</div></div>'
+        power_html += '</div>'
+
+    # Propwash HTML
+    propwash_html = ""
+    if propwash_results and propwash_results.get("events"):
+        pw = propwash_results
+        sc = "good" if pw["score"] >= 85 else "warn" if pw["score"] >= 60 else "bad"
+        propwash_html = f'<section><h2>Propwash Analysis</h2>'
+        propwash_html += f'<div class="cc"><span class="{sc}">Propwash Score: {pw["score"]}/100</span>'
+        propwash_html += f' — {len(pw["events"])} events, worst on {pw.get("worst_axis", "?")}'
+        for f in pw.get("findings", []):
+            fc = "warning" if f["level"] == "WARNING" else "info"
+            propwash_html += f'<div class="nav-findings"><div class="finding {fc}">{f["text"]}</div></div>'
+        propwash_html += '</div></section>'
+
+    # Failsafe HTML
+    failsafe_html = ""
+    if failsafe_results and failsafe_results.get("events"):
+        fs = failsafe_results
+        failsafe_html = '<div class="cc" style="border-left:4px solid var(--yl)"><h3 style="color:var(--yl)">Flight Events</h3>'
+        failsafe_html += f'<table><tr><th>Type</th><th>Start</th><th>Duration</th><th>Recovered</th></tr>'
+        for ev in fs["events"]:
+            rc = "good" if ev["recovered"] else "bad"
+            failsafe_html += f'<tr><td>{ev["type"]}</td><td>{ev["start_s"]:.1f}s</td>'
+            failsafe_html += f'<td>{ev["duration_s"]:.1f}s</td><td class="{rc}">{"Yes" if ev["recovered"] else "No"}</td></tr>'
+        failsafe_html += '</table></div>'
 
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>INAV Tuning Report — {config.get('craft_name','')}</title><style>
@@ -7731,6 +9154,7 @@ footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-
 <div class="tab" data-tab="motors">Motors</div>
 {'<div class="tab" data-tab="navperf">Nav Performance</div>' if nav_perf_html else ''}
 {'<div class="tab" data-tab="navsensors">Nav Sensors</div>' if nav_sensors_html else ''}
+{'<div class="tab" data-tab="map">Map</div>' if map_html else ''}
 {'<div class="tab" data-tab="history">History</div>' if history_html else ''}
 <div class="tab" data-tab="whatif">What-If</div>
 </div>
@@ -7742,9 +9166,16 @@ footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-
 <div class="ss"><div class="sb"><div class="sf"></div></div>
 <div class="sd">{'<span>Noise:'+f'{scores["noise"]:.0f}'+'</span>' if scores["noise"] is not None else ''}{'<span>PID:'+f'{scores["pid"]:.0f}'+'</span>' if scores["pid"] is not None else ''}<span>Motors:{scores['motor']:.0f}</span></div></div>
 <div class="vd {vc}">▸ {plan['verdict_text']}</div>
+{stale_html}
 {pf_html}
+{info_html}
+{noise_summary_html}
 <section><h2>Actions</h2>{ah}</section>
 {cli_html}
+{recipe_html}
+{meas_html}
+{power_html}
+{failsafe_html}
 {ch}
 </div>
 
@@ -7760,6 +9191,8 @@ footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-
 <div class="tab-panel" id="tab-noise">
 <section><h2>Noise Spectrum</h2><div class="cc">{ci("noise")}</div></section>
 {'<section><h2>D-Term Noise</h2><div class="cc">'+ci("dterm")+'</div></section>' if charts.get("dterm") else ''}
+{_generate_vibration_html(accel_vib) if accel_vib and accel_vib.get("axes") else ''}
+{propwash_html}
 </div>
 
 <!-- MOTORS TAB -->
@@ -7772,6 +9205,9 @@ footer{{text-align:center;color:var(--dm);font-size:.7rem;padding:24px 0;border-
 
 <!-- NAV SENSORS TAB -->
 {'<div class="tab-panel" id="tab-navsensors">' + nav_sensors_html + '</div>' if nav_sensors_html else ''}
+
+<!-- MAP TAB -->
+{'<div class="tab-panel" id="tab-map">' + map_html + '</div>' if map_html else ''}
 
 <!-- HISTORY TAB -->
 {'<div class="tab-panel" id="tab-history">' + history_html + '</div>' if history_html else ''}
@@ -7791,6 +9227,10 @@ document.querySelectorAll('.tab').forEach(tab => {{
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
     tab.classList.add('active');
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+    // Leaflet needs resize trigger when map tab becomes visible
+    if (tab.dataset.tab === 'map' && window._flightMap) {{
+      setTimeout(() => window._flightMap.invalidateSize(), 100);
+    }}
   }});
 }});
 </script>
@@ -8715,7 +10155,7 @@ def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_fil
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.3.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.4.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -10861,6 +12301,13 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
     motor_analysis = analyze_motors(data, sr, config)
     dterm_results = analyze_dterm_noise(data, sr)
 
+    # ── Accelerometer vibration analysis ──
+    accel_vib = analyze_accel_vibration(data, sr, prop_harmonics)
+    if not summary_only and accel_vib and accel_vib.get("axes"):
+        vib_score = accel_vib.get("score", 100)
+        if vib_score < 85:
+            print(f"  Vibration: {vib_score}/100 ({accel_vib['overall_rms_g']:.2f}g RMS)")
+
     # ── Motor response time ──
     motor_response = analyze_motor_response(data, sr)
     if not summary_only and motor_response and motor_response["motor_response_ms"] > 1:
@@ -10877,6 +12324,20 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         for action in plan["actions"]:
             if action.get("category") == "Filter" and "noise" in action.get("reason", "").lower():
                 action["reason"] += f". Sources: {fp_summary}"
+
+    # ── Tuning recipe ──
+    recipe = generate_tuning_recipe(noise_results, noise_fp, config, profile, accel_vib)
+    if not summary_only:
+        print(f"  Recipe: {recipe['recipe_name']}")
+
+    # ── Power/efficiency analysis ──
+    power_results = analyze_power(data, sr, config)
+
+    # ── Propwash scoring ──
+    propwash_results = analyze_propwash(data, sr, profile)
+
+    # ── Failsafe event reconstruction ──
+    failsafe_results = analyze_failsafe_events(data, sr)
 
     # ── Auto-detect and run nav analysis if fields are present ──
     nav_perf = None
@@ -10945,6 +12406,20 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
                 _print_section_nav(nav_perf)
             if nav_results:
                 _print_section_nav_sensors(nav_results)
+            if accel_vib and accel_vib.get("axes"):
+                _print_section_vibration(accel_vib)
+            if propwash_results and propwash_results.get("events"):
+                _print_section_propwash(propwash_results)
+            if power_results and power_results.get("avg_cell_v") is not None:
+                _print_section_power(power_results)
+            if recipe:
+                _print_section_recipe(recipe)
+            if failsafe_results and failsafe_results.get("events"):
+                R2, B2, C2, G2, Y2, RED2, DIM2 = _colors()
+                print(f"\n  {B2}{'─'*66}{R2}")
+                print(f"  {B2}FAILSAFE EVENTS:{R2}")
+                for f in failsafe_results["findings"]:
+                    print(f"  {DIM2}ℹ {f['text']}{R2}")
             if config_review_text:
                 print(config_review_text, end="")
 
@@ -11032,7 +12507,10 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
                                      dterm_results, config, data, charts,
                                      nav_results=nav_results, nav_perf=nav_perf,
                                      flight_diff=flight_diff, prog_data=prog_data,
-                                     preflight=pf_data)
+                                     preflight=pf_data, accel_vib=accel_vib,
+                                     recipe=recipe, power_results=power_results,
+                                     propwash_results=propwash_results,
+                                     failsafe_results=failsafe_results)
         on = args.output or os.path.splitext(os.path.basename(logfile))[0] + "_report.html"
         op = os.path.join(os.path.dirname(logfile) or ".", on)
         with open(op, "w", encoding="utf-8") as f: f.write(html)
@@ -11062,7 +12540,19 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
                           profile, config_review_text, progression_text,
                           nav_perf=nav_perf, nav_results=nav_results,
-                          flight_diff=flight_diff, prog_data=prog_data)
+                          flight_diff=flight_diff, prog_data=prog_data,
+                          accel_vib=accel_vib)
+
+        # ── Auto-apply offer (device mode only) ──
+        if hasattr(args, 'device') and args.device:
+            active_actions = [a for a in plan["actions"] if not a.get("deferred")]
+            cli_cmds = generate_cli_commands(active_actions)
+            # Add nav PID commands
+            if nav_perf and nav_perf.get("nav_actions"):
+                for a in nav_perf["nav_actions"]:
+                    cli_cmds.insert(-1, a["cli"])  # before 'save'
+            if cli_cmds and len(cli_cmds) > 1:  # more than just 'save'
+                _offer_auto_apply(cli_cmds, args)
     else:
         print()
 
