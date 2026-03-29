@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.4.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.4.1
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.4.0"
+REPORT_VERSION = "2.4.1"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -5972,12 +5972,13 @@ def analyze_propwash(data, sr, profile=None):
     avg_rms = np.mean([e["rms"] for e in events])
 
     if n_severe > 0:
+        frame_note = f"On {frame_inches}-inch, this is mostly aerodynamic — avoid aggressive descents. " if frame_inches >= 8 else ""
         results["findings"].append({
             "level": "WARNING",
             "text": f"Propwash: {len(events)} events ({n_severe} severe), "
                     f"worst on {worst} at {avg_freq:.0f}Hz, {avg_rms:.1f}°/s RMS",
             "detail": f"Propwash oscillation during throttle reversals and descents. "
-                      f"{'On ' + str(frame_inches) + '\"-inch, this is mostly aerodynamic — avoid aggressive descents. ' if frame_inches >= 8 else ''}"
+                      f"{frame_note}"
                       f"RPM filter and lower D-term LPF can help. Smoother flying style reduces it.",
         })
     else:
@@ -10155,7 +10156,7 @@ def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_fil
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.4.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.4.1 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
