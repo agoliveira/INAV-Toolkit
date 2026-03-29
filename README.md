@@ -1,10 +1,16 @@
 # INAV Toolkit
 
-A Python toolkit for analyzing blackbox logs, validating configurations, and tuning INAV flight controllers. Plug in your FC via USB - it pulls the config, downloads the blackbox, tells you exactly what to change, and gives you the CLI commands to paste.
+A Python toolkit for analyzing blackbox logs, validating configurations, and tuning INAV flight controllers. Plug in your FC via USB - it pulls the config, downloads the blackbox, analyzes PID tuning and navigation performance, tells you exactly what to change, and gives you the CLI commands to paste.
 
 Built for the INAV long-range community. Tested on 7" to 15" multirotors with GPS navigation, INAV 9.0.x.
 
 ## Install / Update
+
+```bash
+pip install inav-toolkit
+```
+
+Or from source:
 
 ```bash
 git clone https://github.com/agoliveira/INAV-Toolkit.git
@@ -12,7 +18,6 @@ cd INAV-Toolkit
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python3 -m inav_toolkit.blackbox_analyzer --device auto
 ```
 
 Or on Debian/Ubuntu, system packages:
@@ -29,56 +34,43 @@ Python 3.8+. `pyserial` only needed for direct FC connection.
 python3 -m inav_toolkit.blackbox_analyzer --device auto
 ```
 
-That's it. The tool will auto-detect your FC, pull the current config, download the blackbox, split multi-flight logs, detect config changes between sessions, and run full analysis on the best flight.
-
-### Output
+That's it. The tool will auto-detect your FC, pull the full config dump, download the blackbox, split multi-flight logs, run PID tuning and navigation analysis, clean up log files, and erase flash. Results are presented in an interactive menu:
 
 ```
-  INAV Blackbox Analyzer v2.16.0
-  Connected: NAZGUL 10 - INAV 9.0.1
-  Pulling configuration (diff all)... 89 settings
-  Downloading 2236KB ... 204KB/s
-  Found 3 flights - analyzing best from latest config
+  TUNE QUALITY: █████████░░░░░░░░░░░ 46/100
+    Noise:94 | PID:26 | Motors:53
 
-  TUNE QUALITY: █████████████░░░░░░░ 65/100
-    Noise:95 | PID:N/A | Motors:94
+  [1] PID Tuning        R:62%OS  P:ok  Y:N/A
+  [2] Noise Analysis    94/100 - 2 sources
+  [3] Hover & Stability R:moderate  P:wind  Y:wind
+  [4] Nav Performance   45/100 - 4 decel events, CEP 1271cm
+  [5] Nav Sensors       Com:70  GPS:100  Bar:70
+  [6] Config Review     1 critical, 2 warnings
+  [7] Flight History    available
+  [C] CLI Commands      2 changes
+  [A] Show All
+  [Q] Quit
 
-  CONFIG:
-    Roll   P= 32  I= 82  D= 32  (FC now: P->35, I->75, D->28)
-    Pitch  P= 35  I= 90  D= 35  (FC now: P->38, I->82, D->31)
-
-  NOISE SOURCES:
-    50Hz motor imbalance on Roll/Yaw [medium]
-    128Hz motor noise on Pitch/Yaw [low]
-    187-437Hz (6 peaks) electrical on Pitch/Roll/Yaw [medium]
-
-  DO THIS - 2 changes:
-    1. Lower dynamic_gyro_notch_min_hz: 50 -> 40
-    2. Consider enabling RPM filter
-
-  INAV CLI - paste into Configurator CLI tab:
-    set dynamic_gyro_notch_min_hz = 40
-    save
-
-  CONFIG REVIEW:
-    [CRITICAL] Critical beeper warnings disabled - BAT_CRIT_LOW, RX_LOST
+  Section (1-7, C, A, Q):
 ```
+
+Each section shows a one-line status at a glance. Select a number to drill into details. The CLI Commands section gives you paste-ready commands for INAV Configurator.
 
 ## Tools
 
 ### Blackbox Analyzer
 
-Decodes `.bbl` / `.bfl` blackbox logs natively in Python (no `blackbox_decode` needed) and produces actionable tuning recommendations.
+Decodes `.bbl` / `.bfl` blackbox logs natively in Python (no `blackbox_decode` needed) and produces actionable tuning and navigation recommendations.
 
 ```bash
-# Connect to FC - pull config + download + analyze
+# Connect to FC - pull config + download + analyze + cleanup + erase
 python3 -m inav_toolkit.blackbox_analyzer --device auto
 
 # Analyze an existing log file
 python3 -m inav_toolkit.blackbox_analyzer flight.bbl
 
-# With a saved diff for config comparison
-python3 -m inav_toolkit.blackbox_analyzer flight.bbl --diff my_diff.txt
+# With a saved dump/diff for config comparison
+python3 -m inav_toolkit.blackbox_analyzer flight.bbl --config my_dump.txt
 
 # Specify frame size for tailored thresholds
 python3 -m inav_toolkit.blackbox_analyzer flight.bbl --frame 10
@@ -86,43 +78,70 @@ python3 -m inav_toolkit.blackbox_analyzer flight.bbl --frame 10
 # Download only, analyze later
 python3 -m inav_toolkit.blackbox_analyzer --device auto --download-only
 
+# Keep raw log files (skip auto-cleanup)
+python3 -m inav_toolkit.blackbox_analyzer --device auto --keep-logs
+
+# Don't erase flash after download
+python3 -m inav_toolkit.blackbox_analyzer --device auto --no-erase
+
+# Archive analyzed flight (compress to blackbox/archive/)
+python3 -m inav_toolkit.blackbox_analyzer --device auto --archive
+
+# Skip nav analysis even if nav fields are present
+python3 -m inav_toolkit.blackbox_analyzer flight.bbl --no-nav
+
 # Flight progression history
 python3 -m inav_toolkit.blackbox_analyzer flight.bbl --history
 ```
 
-**What it measures:**
-- PID step response - overshoot %, tracking delay, settling time per axis
-- Noise spectrum - identifies peak frequencies, classifies sources (propwash, electrical, motor imbalance), groups and ranks by severity
-- Hover oscillation - RMS and peak-to-peak gyro during centered stick
+**What it analyzes (auto-detected from available data):**
+
+PID tuning:
+- Step response - overshoot %, tracking delay, settling time per axis
+- FeedForward-aware - attributes overshoot between FF and P, recommends FF reduction before P cuts
+- Hover oscillation - RMS and peak-to-peak gyro, wind buffeting vs P oscillation on large frames
+- Noise spectrum - peak frequencies, source classification (propwash, electrical, motor imbalance)
+- Filter recommendations - phase-lag-aware, won't recommend destructive LPF cuts on 10"+ frames
 - Motor balance - average load and saturation per motor
-- Filter phase lag - total delay through the gyro/D-term filter chain
-- Config mismatch - detects when the FC config has changed since the flight being analyzed
+
+Navigation performance (when nav fields are present):
+- Deceleration overshoot - measures position error when stopping, oscillation count, settling time
+- Position hold quality - CEP, RMS error, max drift, toilet-bowl pattern detection
+- Altitude hold quality - vertical error RMS, oscillation detection
+- Controller saturation - detects when nav demands exceed platform capability
+- Wind vs tuning - correlates position error with wind estimates to separate environmental drift from PID problems
+
+Navigation sensors:
+- Compass health - heading jitter, magnetic interference, drift rate
+- GPS quality - fix type, satellite count, HDOP, position jumps
+- Barometer - noise level, spike detection, throttle correlation
+- Position estimator - GPS vs estimator divergence
 
 **What it outputs:**
-- Terminal report with score, noise sources, specific CLI commands to paste
+- Interactive terminal menu (with `--device auto`) or sequential report
 - HTML report with interactive charts (noise spectrum, PID response, motor traces)
 - `state.json` for cross-referencing with the parameter analyzer
 - SQLite flight database for progression tracking across sessions
 
 ### Parameter Analyzer
 
-Validates an INAV `diff all` export for configuration issues. Catches problems that blackbox data alone can't detect.
+Validates an INAV config for issues. Accepts `dump all` or `diff all` output. Catches problems that blackbox data alone can't detect.
 
 ```bash
 # Check existing config
-python3 -m inav_toolkit.param_analyzer my_diff.txt --frame 10
+python3 -m inav_toolkit.param_analyzer my_dump.txt --frame 10
 
 # Generate starting PIDs for a new build
 python3 -m inav_toolkit.param_analyzer --setup 10 --voltage 6S
 
 # Compare starting PIDs with current config
-python3 -m inav_toolkit.param_analyzer --setup 10 --voltage 6S my_diff.txt
+python3 -m inav_toolkit.param_analyzer --setup 10 --voltage 6S my_dump.txt
 
 # Cross-reference with blackbox results
-python3 -m inav_toolkit.param_analyzer my_diff.txt --blackbox state.json
+python3 -m inav_toolkit.param_analyzer my_dump.txt --blackbox state.json
 ```
 
-**What it checks:** safety (beepers, failsafe, battery limits), motors (protocol, RPM filter, ESC telemetry), filters (frame-appropriate LPF, dynamic notch), PIDs (cross-profile consistency, antigravity), navigation (RTH altitude, position PIDs, safehome), GPS (constellations, compass cal), blackbox (logging rate, essential fields).
+**What it checks:** safety (beepers, failsafe, battery limits), motors (protocol, RPM filter, ESC telemetry), filters (frame-appropriate LPF, dynamic notch), PIDs (cross-profile consistency, FF, antigravity), navigation (frame-aware nav PID thresholds, RTH altitude, deceleration time, position PIDs, safehome), GPS (constellations, compass cal), blackbox (logging rate, essential fields).
 
 **Setup mode** generates conservative starting PIDs for 7/10/12/15" frames at 4S/6S/8S/12S.
 
@@ -131,7 +150,7 @@ python3 -m inav_toolkit.param_analyzer my_diff.txt --blackbox state.json
 Validates INAV VTOL configurations using mixer_profile switching.
 
 ```bash
-python3 -m inav_toolkit.vtol_configurator vtol_diff.txt
+python3 -m inav_toolkit.vtol_configurator vtol_config.txt
 ```
 
 Checks MC/FW mixer profiles, tilt servo rules, motor role inference, yaw authority, FW control surfaces, mode assignments, automated RTH transition, and airmode conflicts.
@@ -155,30 +174,33 @@ Direct serial communication with INAV flight controllers. Used internally by the
 python3 -m inav_toolkit.msp --device auto
 ```
 
-Handles MSP v2 framing, pipelined dataflash download (4-deep), CLI command/batch, auto-reconnection after USB VCP reset.
+Handles MSP v2 framing, pipelined dataflash download (4-deep), CLI command/batch, `dump all`/`diff all` config pull, auto-reconnection after USB VCP reset.
 
 ## Tuning Workflow
 
 ```
 1. NEW BUILD
    python3 -m inav_toolkit.param_analyzer --setup 10 --voltage 6S
-   -> Conservative starting PIDs and filter settings
+   -> Conservative starting PIDs, filters, and nav settings
    -> Paste CLI commands into INAV Configurator
 
 2. SAFETY CHECK
-   python3 -m inav_toolkit.param_analyzer my_diff.txt --frame 10
+   python3 -m inav_toolkit.param_analyzer my_dump.txt --frame 10
    -> Catches disabled beepers, failsafe issues, battery limits
+   -> Flags nav PIDs that are INAV defaults (tuned for 5") on larger frames
    -> Fix before flying
 
 3. FLY
    -> Enable blackbox logging (GYRO_RAW, MOTORS, RC_COMMAND)
    -> Hover for 10s, then do deliberate roll/pitch/yaw sweeps
-   -> The analyzer needs stick inputs to measure PID response
+   -> Engage POSHOLD and RTH for nav analysis data
 
 4. ANALYZE
    python3 -m inav_toolkit.blackbox_analyzer --device auto
-   -> Downloads log, pulls current config, runs full analysis
+   -> Downloads log, pulls full config dump, runs all analysis
+   -> Interactive menu with PID, noise, nav, config review sections
    -> Shows exactly what to change with CLI commands
+   -> Auto-cleans log files and erases flash when done
 
 5. APPLY + REPEAT
    -> Paste CLI commands, fly again
@@ -205,7 +227,7 @@ Higher voltage (6S/8S/12S) scales P and D down proportionally.
 INAV-Toolkit/
 ├── inav_toolkit/
 │   ├── __init__.py              # Package version
-│   ├── blackbox_analyzer.py     # Blackbox log analyzer
+│   ├── blackbox_analyzer.py     # Blackbox log analyzer + nav performance
 │   ├── msp.py                   # MSP v2 serial communication
 │   ├── flight_db.py             # SQLite flight history
 │   ├── param_analyzer.py        # Config validator + setup generator
@@ -228,7 +250,7 @@ Developed and tested against **INAV 9.0.x**. The blackbox binary decoder handles
 
 ## Contributing
 
-This is an active project. Planned: autonomous tuning loop (Pi Zero 2W or ESP32 strapped to the quad), expanded nav analysis, and web-based report viewer.
+This is an active project. Planned: autonomous tuning loop (Pi Zero 2W or ESP32 strapped to the quad) and web-based report viewer.
 
 ## License
 

@@ -21,7 +21,7 @@ import sys
 import textwrap
 from datetime import datetime
 
-VERSION = "2.20.0"
+VERSION = "2.20.1"
 
 
 def _enable_ansi_colors():

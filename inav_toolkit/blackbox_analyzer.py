@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.20.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.20.1
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.20.0"
+REPORT_VERSION = "2.20.1"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -7480,7 +7480,7 @@ def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_fil
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.20.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.20.1 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
