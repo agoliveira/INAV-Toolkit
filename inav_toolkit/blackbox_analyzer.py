@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.19.0
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.20.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -20,7 +20,7 @@ import re
 import argparse
 import warnings
 from datetime import datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 import base64
 
 import numpy as np
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.19.0"
+REPORT_VERSION = "2.20.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -1595,6 +1595,15 @@ class BlackboxDecoder:
             "rc_roll": ["rcData[0]"], "rc_pitch": ["rcData[1]"],
             "rc_yaw": ["rcData[2]"], "rc_throttle": ["rcData[3]"],
             "mc_pos_p_0": ["mcPosAxisP[0]"], "mc_pos_p_1": ["mcPosAxisP[1]"],
+            "mc_pos_p_2": ["mcPosAxisP[2]"],
+            "mc_vel_p_0": ["mcVelAxisP[0]"], "mc_vel_p_1": ["mcVelAxisP[1]"], "mc_vel_p_2": ["mcVelAxisP[2]"],
+            "mc_vel_i_0": ["mcVelAxisI[0]"], "mc_vel_i_1": ["mcVelAxisI[1]"], "mc_vel_i_2": ["mcVelAxisI[2]"],
+            "mc_vel_d_0": ["mcVelAxisD[0]"], "mc_vel_d_1": ["mcVelAxisD[1]"], "mc_vel_d_2": ["mcVelAxisD[2]"],
+            "mc_vel_ff_0": ["mcVelAxisFF[0]"], "mc_vel_ff_1": ["mcVelAxisFF[1]"], "mc_vel_ff_2": ["mcVelAxisFF[2]"],
+            "mc_vel_out_0": ["mcVelAxisOut[0]"], "mc_vel_out_1": ["mcVelAxisOut[1]"], "mc_vel_out_2": ["mcVelAxisOut[2]"],
+            "mc_surf_p": ["mcSurfaceP"], "mc_surf_i": ["mcSurfaceI"],
+            "mc_surf_d": ["mcSurfaceD"], "mc_surf_out": ["mcSurfaceOut"],
+            "nav_tgt_hdg": ["navTgtHdg"],
             "vbat": ["vbat", "vbatLatest"],
             "amperage": ["amperage", "amperageLatest"],
             "rssi": ["rssi"],
@@ -1748,6 +1757,15 @@ def parse_csv_log(csv_path):
         "rc_roll": ["rcdata[0]"], "rc_pitch": ["rcdata[1]"],
         "rc_yaw": ["rcdata[2]"], "rc_throttle": ["rcdata[3]"],
         "mc_pos_p_0": ["mcposaxisp[0]"], "mc_pos_p_1": ["mcposaxisp[1]"],
+        "mc_pos_p_2": ["mcposaxisp[2]"],
+        "mc_vel_p_0": ["mcvelaxisp[0]"], "mc_vel_p_1": ["mcvelaxisp[1]"], "mc_vel_p_2": ["mcvelaxisp[2]"],
+        "mc_vel_i_0": ["mcvelaxisi[0]"], "mc_vel_i_1": ["mcvelaxisi[1]"], "mc_vel_i_2": ["mcvelaxisi[2]"],
+        "mc_vel_d_0": ["mcvelaxisd[0]"], "mc_vel_d_1": ["mcvelaxisd[1]"], "mc_vel_d_2": ["mcvelaxisd[2]"],
+        "mc_vel_ff_0": ["mcvelaxisff[0]"], "mc_vel_ff_1": ["mcvelaxisff[1]"], "mc_vel_ff_2": ["mcvelaxisff[2]"],
+        "mc_vel_out_0": ["mcvelaxisout[0]"], "mc_vel_out_1": ["mcvelaxisout[1]"], "mc_vel_out_2": ["mcvelaxisout[2]"],
+        "mc_surf_p": ["mcsurfacep"], "mc_surf_i": ["mcsurfacei"],
+        "mc_surf_d": ["mcsurfaced"], "mc_surf_out": ["mcsurfaceout"],
+        "nav_tgt_hdg": ["navtgthdg"],
         "vbat": ["vbat", "vbatlatest"],
         "amperage": ["amperage", "amperagelatest"],
         "rssi": ["rssi"],
@@ -3807,6 +3825,506 @@ def analyze_estimator_health(data, sr):
     return results
 
 
+# ─── Nav Controller Performance Analysis ─────────────────────────────────────
+
+def _get_nav_mode_mask(data, sr, mode_bit):
+    """Build a boolean mask at I-frame rate for a specific nav mode.
+
+    Uses slow frame flight mode flags to determine when a mode was active.
+    Returns np.ndarray of bools with same length as data arrays.
+    """
+    slow_frames = data.get("_slow_frames", [])
+    n_rows = data.get("n_rows", len(data.get("time_s", [])))
+    mask = np.zeros(n_rows, dtype=bool)
+
+    if not slow_frames:
+        return mask
+
+    # Build transitions from slow frames
+    transitions = []
+    for frame_idx, fields in slow_frames:
+        mode_flags = fields.get("flightModeFlags", None)
+        if mode_flags is None:
+            for k in fields:
+                if "flight" in k.lower() and "mode" in k.lower():
+                    mode_flags = fields[k]
+                    break
+        if mode_flags is not None:
+            try:
+                flags = int(mode_flags)
+                active = bool(flags & (1 << mode_bit))
+                transitions.append((min(frame_idx, n_rows - 1), active))
+            except (ValueError, TypeError):
+                pass
+
+    # Fill mask between transitions
+    for i, (idx, active) in enumerate(transitions):
+        next_idx = transitions[i + 1][0] if i + 1 < len(transitions) else n_rows
+        if active:
+            mask[idx:next_idx] = True
+
+    return mask
+
+
+# INAV flight mode bits (from src/main/fc/runtime_config.h)
+NAV_MODE_ALTHOLD = 3
+NAV_MODE_RTH = 7
+NAV_MODE_POSHOLD = 8
+NAV_MODE_CRUISE = 28
+
+
+def analyze_nav_performance(data, sr, config=None, profile=None):
+    """Analyze navigation controller performance from blackbox data.
+
+    Examines the nav PID stack internals to detect:
+    - Deceleration overshoot (velocity controller too aggressive)
+    - Position hold quality (position controller tuning)
+    - Altitude hold quality (vertical controller tuning)
+    - Controller saturation (nav demanding more than platform can deliver)
+    - Wind vs tuning separation (I-term vs environmental drift)
+
+    Returns dict with findings, metrics, and specific nav PID recommendations.
+    """
+    if profile is None:
+        profile = get_frame_profile(5)
+    frame_inches = profile.get("frame_inches", 5)
+
+    results = {
+        "deceleration": [],
+        "poshold": None,
+        "althold": None,
+        "saturation": None,
+        "wind_correlation": None,
+        "findings": [],
+        "nav_actions": [],
+        "score": None,
+    }
+
+    has_pos = "nav_pos_n" in data and "nav_pos_e" in data
+    has_vel = "nav_vel_n" in data and "nav_vel_e" in data
+    has_tgt = "nav_tgt_n" in data and "nav_tgt_e" in data
+    has_tgt_vel = "nav_tgt_vel_n" in data and "nav_tgt_vel_e" in data
+    has_vel_ctrl = "mc_vel_out_0" in data
+
+    if not (has_pos and has_vel):
+        return results
+
+    # Get nav mode masks
+    poshold_mask = _get_nav_mode_mask(data, sr, NAV_MODE_POSHOLD)
+    althold_mask = _get_nav_mode_mask(data, sr, NAV_MODE_ALTHOLD) | poshold_mask
+    rth_mask = _get_nav_mode_mask(data, sr, NAV_MODE_RTH)
+    any_nav_mask = poshold_mask | althold_mask | rth_mask
+
+    score = 100
+    findings = []
+    nav_actions = []
+
+    # ═══ 1. DECELERATION OVERSHOOT ═══
+    if has_tgt_vel and has_tgt:
+        tgt_vel_n = data["nav_tgt_vel_n"].copy()
+        tgt_vel_e = data["nav_tgt_vel_e"].copy()
+        pos_n = data["nav_pos_n"].copy()
+        pos_e = data["nav_pos_e"].copy()
+        tgt_n = data["nav_tgt_n"].copy()
+        tgt_e = data["nav_tgt_e"].copy()
+
+        # Replace NaN with 0 for velocity
+        tgt_vel_n = np.nan_to_num(tgt_vel_n, 0)
+        tgt_vel_e = np.nan_to_num(tgt_vel_e, 0)
+
+        tgt_speed = np.sqrt(tgt_vel_n**2 + tgt_vel_e**2)  # cm/s
+
+        # Find deceleration events: target speed drops from >100cm/s to <30cm/s
+        min_speed = 100  # cm/s = 1 m/s
+        stop_speed = 30  # cm/s = 0.3 m/s
+
+        decel_events = []
+        in_fast = False
+        fast_start = 0
+
+        for i in range(len(tgt_speed)):
+            if not in_fast and tgt_speed[i] > min_speed:
+                in_fast = True
+                fast_start = i
+            elif in_fast and tgt_speed[i] < stop_speed:
+                in_fast = False
+                stop_idx = i
+                # Analyze the post-stop settling
+                # Look at position error for 5 seconds after stop
+                settle_window = min(int(sr * 5), len(pos_n) - stop_idx)
+                if settle_window < int(sr * 0.5):
+                    continue  # too short to analyze
+
+                window_end = stop_idx + settle_window
+                err_n = pos_n[stop_idx:window_end] - tgt_n[stop_idx:window_end]
+                err_e = pos_e[stop_idx:window_end] - tgt_e[stop_idx:window_end]
+
+                # Filter NaN
+                valid = ~(np.isnan(err_n) | np.isnan(err_e))
+                if np.sum(valid) < int(sr * 0.3):
+                    continue
+
+                err_n = err_n[valid]
+                err_e = err_e[valid]
+                err_dist = np.sqrt(err_n**2 + err_e**2)
+
+                # Metrics
+                peak_error = float(np.max(err_dist))  # cm
+                mean_error = float(np.mean(err_dist))
+
+                # Count oscillations (zero-crossings in err_n or err_e)
+                # Use the axis with more variation
+                err_axis = err_n if np.std(err_n) > np.std(err_e) else err_e
+                err_centered = err_axis - np.mean(err_axis)
+                zero_crossings = int(np.sum(np.abs(np.diff(np.sign(err_centered))) > 0))
+                oscillation_count = zero_crossings // 2
+
+                # Settling time: when error stays within 100cm (1m)
+                settle_threshold = 100  # cm
+                settled_idx = None
+                for j in range(len(err_dist) - 1, -1, -1):
+                    if err_dist[j] > settle_threshold:
+                        settled_idx = j
+                        break
+                settling_time = (settled_idx + 1) / sr if settled_idx is not None else 0
+
+                time_s = float(data["time_s"][stop_idx]) if "time_s" in data else stop_idx / sr
+
+                decel_events.append({
+                    "time_s": time_s,
+                    "peak_error_cm": peak_error,
+                    "mean_error_cm": mean_error,
+                    "oscillation_count": oscillation_count,
+                    "settling_time_s": settling_time,
+                    "duration_fast_s": (stop_idx - fast_start) / sr,
+                })
+
+        results["deceleration"] = decel_events
+
+        if decel_events:
+            worst = max(decel_events, key=lambda e: e["peak_error_cm"])
+            avg_peak = np.mean([e["peak_error_cm"] for e in decel_events])
+            avg_osc = np.mean([e["oscillation_count"] for e in decel_events])
+            avg_settle = np.mean([e["settling_time_s"] for e in decel_events])
+
+            # Frame-scaled thresholds
+            ok_overshoot = 150 * (frame_inches / 7)  # cm
+            bad_overshoot = 300 * (frame_inches / 7)
+            ok_oscillations = 2
+            bad_oscillations = 4
+
+            if avg_peak > bad_overshoot or avg_osc > bad_oscillations:
+                score -= 30
+                findings.append({
+                    "level": "WARNING",
+                    "text": f"Deceleration overshoot: {avg_peak:.0f}cm avg peak error, "
+                            f"{avg_osc:.1f} oscillations avg, {avg_settle:.1f}s to settle "
+                            f"({len(decel_events)} events)",
+                    "detail": f"Worst: {worst['peak_error_cm']:.0f}cm at {worst['time_s']:.1f}s. "
+                              f"The quad overshoots its target position when stopping."
+                })
+
+                vel_p = config.get("nav_vel_xy_p") if config else None
+                decel_time = config.get("nav_decel_time") if config else None
+
+                if vel_p and vel_p > 20:
+                    new_vel_p = max(15, int(vel_p * 0.7))
+                    nav_actions.append({
+                        "action": f"Reduce nav velocity P: {vel_p} -> {new_vel_p}",
+                        "reason": f"Deceleration overshoot {avg_peak:.0f}cm with {avg_osc:.0f} oscillations. "
+                                  f"Velocity controller brakes too hard for {frame_inches}-inch momentum.",
+                        "cli": f"set nav_mc_vel_xy_p = {new_vel_p}",
+                    })
+                if decel_time and decel_time < 200:
+                    new_decel = min(400, int(decel_time * 1.5))
+                    nav_actions.append({
+                        "action": f"Increase deceleration time: {decel_time} -> {new_decel} ({new_decel/100:.1f}s)",
+                        "reason": f"Quad needs more distance to bleed speed on {frame_inches}-inch frame.",
+                        "cli": f"set nav_mc_pos_deceleration_time = {new_decel}",
+                    })
+
+            elif avg_peak > ok_overshoot:
+                score -= 10
+                findings.append({
+                    "level": "INFO",
+                    "text": f"Mild deceleration overshoot: {avg_peak:.0f}cm avg, "
+                            f"{avg_settle:.1f}s settling ({len(decel_events)} events)",
+                    "detail": "Acceptable but could be tighter with lower velocity P."
+                })
+
+    # ═══ 2. POSITION HOLD QUALITY ═══
+    if has_tgt and np.any(poshold_mask):
+        pos_n = data["nav_pos_n"].copy()
+        pos_e = data["nav_pos_e"].copy()
+        tgt_n = data["nav_tgt_n"].copy()
+        tgt_e = data["nav_tgt_e"].copy()
+
+        # Isolate poshold segments
+        ph_pos_n = pos_n[poshold_mask]
+        ph_pos_e = pos_e[poshold_mask]
+        ph_tgt_n = tgt_n[poshold_mask]
+        ph_tgt_e = tgt_e[poshold_mask]
+
+        valid = ~(np.isnan(ph_pos_n) | np.isnan(ph_pos_e) |
+                  np.isnan(ph_tgt_n) | np.isnan(ph_tgt_e))
+
+        if np.sum(valid) > sr * 2:  # at least 2 seconds of poshold
+            err_n = ph_pos_n[valid] - ph_tgt_n[valid]
+            err_e = ph_pos_e[valid] - ph_tgt_e[valid]
+            err_dist = np.sqrt(err_n**2 + err_e**2)
+
+            cep = float(np.percentile(err_dist, 50))
+            max_drift = float(np.max(err_dist))
+            rms_error = float(np.sqrt(np.mean(err_dist**2)))
+            hold_duration = np.sum(valid) / sr
+
+            # Toilet bowl detection (circular oscillation from compass issues)
+            toilet_bowl = False
+            tb_period = None
+            if len(err_n) > sr * 3:
+                from scipy.fft import rfft, rfftfreq
+                freqs_n = rfftfreq(len(err_n), 1.0 / sr)
+                spec_n = np.abs(rfft(err_n - np.mean(err_n)))
+                spec_e = np.abs(rfft(err_e - np.mean(err_e)))
+
+                # Look for matching peaks in both axes (0.1-2Hz range)
+                band = (freqs_n >= 0.1) & (freqs_n <= 2.0)
+                if np.any(band):
+                    peak_n = freqs_n[band][np.argmax(spec_n[band])]
+                    peak_e = freqs_n[band][np.argmax(spec_e[band])]
+                    # Peaks within 20% of each other = likely toilet bowl
+                    if abs(peak_n - peak_e) < max(peak_n, peak_e) * 0.2:
+                        # Check if both axes have significant oscillation
+                        n_power = spec_n[band][np.argmax(spec_n[band])]
+                        e_power = spec_e[band][np.argmax(spec_e[band])]
+                        n_mean = np.mean(spec_n[band])
+                        e_mean = np.mean(spec_e[band])
+                        if n_power > n_mean * 4 and e_power > e_mean * 4:
+                            toilet_bowl = True
+                            tb_period = 1.0 / ((peak_n + peak_e) / 2)
+
+            results["poshold"] = {
+                "cep_cm": round(cep, 1),
+                "max_drift_cm": round(max_drift, 1),
+                "rms_error_cm": round(rms_error, 1),
+                "hold_duration_s": round(hold_duration, 1),
+                "toilet_bowl": toilet_bowl,
+                "tb_period_s": round(tb_period, 1) if tb_period else None,
+            }
+
+            # Thresholds scaled by frame (larger frames drift more)
+            ok_cep = 150 * (frame_inches / 7)
+            bad_cep = 400 * (frame_inches / 7)
+
+            if toilet_bowl:
+                score -= 25
+                findings.append({
+                    "level": "WARNING",
+                    "text": f"Toilet bowl pattern detected (period {tb_period:.1f}s, CEP {cep:.0f}cm)",
+                    "detail": "Circular drift pattern indicates compass heading error. "
+                              "Check compass calibration, reduce magnetic interference, "
+                              "or raise the GPS mast."
+                })
+            elif cep > bad_cep:
+                score -= 20
+                findings.append({
+                    "level": "WARNING",
+                    "text": f"Large position hold drift: CEP {cep:.0f}cm, max {max_drift:.0f}cm "
+                            f"({hold_duration:.0f}s hold)",
+                    "detail": "Position hold is loose. May need higher pos_xy_p or vel_xy_i for wind."
+                })
+                pos_p_val = config.get("nav_pos_p") if config else None
+                if pos_p_val and pos_p_val < 50:
+                    new_pos_p = min(65, int(pos_p_val * 1.3))
+                    nav_actions.append({
+                        "action": f"Increase nav position P: {pos_p_val} -> {new_pos_p}",
+                        "reason": f"Position hold CEP {cep:.0f}cm — too loose, needs stronger correction.",
+                        "cli": f"set nav_mc_pos_xy_p = {new_pos_p}",
+                    })
+            elif cep > ok_cep:
+                score -= 5
+                findings.append({
+                    "level": "INFO",
+                    "text": f"Position hold: CEP {cep:.0f}cm, max {max_drift:.0f}cm "
+                            f"({hold_duration:.0f}s hold)",
+                    "detail": "Acceptable. Wind and GPS accuracy are likely the limiting factors."
+                })
+            else:
+                findings.append({
+                    "level": "OK",
+                    "text": f"Position hold: CEP {cep:.0f}cm, max {max_drift:.0f}cm — good",
+                    "detail": ""
+                })
+
+    # ═══ 3. ALTITUDE HOLD QUALITY ═══
+    if "nav_pos_u" in data and "nav_tgt_u" in data and np.any(althold_mask):
+        pos_z = data["nav_pos_u"].copy()
+        tgt_z = data["nav_tgt_u"].copy()
+
+        ah_pos_z = pos_z[althold_mask]
+        ah_tgt_z = tgt_z[althold_mask]
+
+        valid = ~(np.isnan(ah_pos_z) | np.isnan(ah_tgt_z))
+        if np.sum(valid) > sr * 2:
+            err_z = ah_pos_z[valid] - ah_tgt_z[valid]
+            rms_z = float(np.sqrt(np.mean(err_z**2)))
+            max_z = float(np.max(np.abs(err_z)))
+            hold_dur = np.sum(valid) / sr
+
+            # Oscillation detection in Z
+            z_osc = False
+            z_osc_freq = None
+            if len(err_z) > sr * 2:
+                from scipy.fft import rfft, rfftfreq
+                freqs = rfftfreq(len(err_z), 1.0 / sr)
+                spec = np.abs(rfft(err_z - np.mean(err_z)))
+                band = (freqs >= 0.1) & (freqs <= 5.0)
+                if np.any(band):
+                    peak_idx = np.argmax(spec[band])
+                    peak_power = spec[band][peak_idx]
+                    mean_power = np.mean(spec[band])
+                    if peak_power > mean_power * 5:
+                        z_osc = True
+                        z_osc_freq = float(freqs[band][peak_idx])
+
+            results["althold"] = {
+                "rms_error_cm": round(rms_z, 1),
+                "max_error_cm": round(max_z, 1),
+                "hold_duration_s": round(hold_dur, 1),
+                "oscillation": z_osc,
+                "osc_freq_hz": round(z_osc_freq, 2) if z_osc_freq else None,
+            }
+
+            if z_osc:
+                score -= 20
+                findings.append({
+                    "level": "WARNING",
+                    "text": f"Altitude oscillation at {z_osc_freq:.1f}Hz "
+                            f"(RMS {rms_z:.0f}cm, max {max_z:.0f}cm)",
+                    "detail": "Altitude is bobbing. Reduce nav_mc_vel_z_p or nav_mc_pos_z_p."
+                })
+            elif max_z > 200:
+                score -= 10
+                findings.append({
+                    "level": "INFO",
+                    "text": f"Altitude hold: RMS {rms_z:.0f}cm, max {max_z:.0f}cm ({hold_dur:.0f}s)",
+                    "detail": "Some altitude wander. Check baro seal and nav Z gains."
+                })
+            else:
+                findings.append({
+                    "level": "OK",
+                    "text": f"Altitude hold: RMS {rms_z:.0f}cm, max {max_z:.0f}cm — good",
+                    "detail": ""
+                })
+
+    # ═══ 4. VELOCITY CONTROLLER SATURATION ═══
+    if has_vel_ctrl and np.any(any_nav_mask):
+        vel_out_0 = data["mc_vel_out_0"][any_nav_mask]
+        vel_out_1 = data["mc_vel_out_1"][any_nav_mask]
+        valid = ~(np.isnan(vel_out_0) | np.isnan(vel_out_1))
+
+        if np.sum(valid) > sr:
+            v0 = vel_out_0[valid]
+            v1 = vel_out_1[valid]
+
+            # Saturation: output hitting limits (typically +/-500 for tilt angle)
+            # Look for values near the extremes
+            output_max = max(np.percentile(np.abs(v0), 99.5),
+                           np.percentile(np.abs(v1), 99.5))
+            sat_threshold = output_max * 0.95
+            sat_pct_0 = float(np.sum(np.abs(v0) > sat_threshold) / len(v0) * 100)
+            sat_pct_1 = float(np.sum(np.abs(v1) > sat_threshold) / len(v1) * 100)
+            max_sat = max(sat_pct_0, sat_pct_1)
+
+            results["saturation"] = {
+                "sat_pct_n": round(sat_pct_0, 1),
+                "sat_pct_e": round(sat_pct_1, 1),
+                "output_max": round(output_max, 0),
+            }
+
+            if max_sat > 10:
+                score -= 15
+                findings.append({
+                    "level": "WARNING",
+                    "text": f"Nav velocity controller saturating {max_sat:.0f}% of the time",
+                    "detail": "Nav is demanding more tilt than the platform can deliver. "
+                              "Reduce nav_mc_vel_xy_p or increase nav_mc_max_bank_angle."
+                })
+
+    # ═══ 5. WIND VS TUNING (from S-frame wind estimates) ═══
+    if has_pos and has_tgt:
+        slow_frames = data.get("_slow_frames", [])
+        wind_data = []
+        for frame_idx, fields in slow_frames:
+            w0 = fields.get("wind[0]")
+            w1 = fields.get("wind[1]")
+            if w0 is not None and w1 is not None:
+                try:
+                    wind_data.append((frame_idx, float(w0), float(w1)))
+                except (ValueError, TypeError):
+                    pass
+
+        if len(wind_data) > 10 and np.any(poshold_mask):
+            # Interpolate wind to I-frame rate during poshold
+            wind_idxs = np.array([w[0] for w in wind_data])
+            wind_n = np.array([w[1] for w in wind_data])
+            wind_e = np.array([w[2] for w in wind_data])
+
+            pos_n = data["nav_pos_n"].copy()
+            pos_e = data["nav_pos_e"].copy()
+            tgt_n = data["nav_tgt_n"].copy()
+            tgt_e = data["nav_tgt_e"].copy()
+
+            # Simple: correlate wind speed with position error magnitude during poshold
+            ph_indices = np.where(poshold_mask)[0]
+            if len(ph_indices) > sr * 2:
+                err_n = pos_n[ph_indices] - tgt_n[ph_indices]
+                err_e = pos_e[ph_indices] - tgt_e[ph_indices]
+                err_mag = np.sqrt(err_n**2 + err_e**2)
+
+                # Interpolate wind to poshold indices
+                wind_interp_n = np.interp(ph_indices, wind_idxs, wind_n)
+                wind_interp_e = np.interp(ph_indices, wind_idxs, wind_e)
+                wind_mag = np.sqrt(wind_interp_n**2 + wind_interp_e**2)
+
+                valid = ~(np.isnan(err_mag) | np.isnan(wind_mag))
+                if np.sum(valid) > 100 and np.std(wind_mag[valid]) > 1.0:
+                    correlation = float(np.corrcoef(err_mag[valid], wind_mag[valid])[0, 1])
+                    if np.isnan(correlation):
+                        correlation = 0.0
+                    avg_wind = float(np.mean(wind_mag[valid]))
+
+                    results["wind_correlation"] = {
+                        "correlation": round(correlation, 2),
+                        "avg_wind_cms": round(avg_wind, 0),
+                    }
+
+                    if correlation > 0.5 and avg_wind > 50:
+                        findings.append({
+                            "level": "INFO",
+                            "text": f"Position error correlates with wind ({correlation:.0%}, "
+                                    f"avg wind {avg_wind/100:.1f}m/s)",
+                            "detail": "Drift is wind-driven, not a PID tuning problem. "
+                                      "Increase nav_mc_vel_xy_i for better wind holding."
+                        })
+                        vel_i = config.get("nav_vel_xy_i") if config else None
+                        if vel_i and vel_i < 30:
+                            new_vel_i = min(50, int(vel_i * 1.5))
+                            nav_actions.append({
+                                "action": f"Increase nav velocity I: {vel_i} -> {new_vel_i}",
+                                "reason": f"Position error is {correlation:.0%} correlated with wind. "
+                                          f"Higher I-term compensates for sustained wind forces.",
+                                "cli": f"set nav_mc_vel_xy_i = {new_vel_i}",
+                            })
+
+    # ═══ SCORING ═══
+    results["score"] = max(0, score)
+    results["findings"] = findings
+    results["nav_actions"] = nav_actions
+
+    return results
+
+
 def run_nav_analysis(data, sr, config=None):
     """Main entry point for navigation analysis.
 
@@ -5208,6 +5726,588 @@ def print_terminal_report(plan, noise_results, pid_results, motor_analysis, conf
     print(f"\n{B}{C}{'═'*70}{R}\n")
 
 
+# ─── Interactive Report Menu ──────────────────────────────────────────────────
+
+def _capture(fn, *args, **kwargs):
+    """Capture stdout from a function call, return as string."""
+    old_stdout = sys.stdout
+    sys.stdout = buf = StringIO()
+    try:
+        fn(*args, **kwargs)
+    finally:
+        sys.stdout = old_stdout
+    return buf.getvalue()
+
+
+def _print_score_bar(plan, config, data):
+    """Print the always-visible score bar and verdict."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    scores = plan["scores"]
+    overall = scores["overall"]
+
+    print(f"  {DIM}{datetime.now().strftime('%Y-%m-%d %H:%M')} | {data['time_s'][-1]:.1f}s | "
+          f"{data['sample_rate']:.0f}Hz | {data['n_rows']:,} rows{R}")
+    if config.get("craft_name"):
+        print(f"  {DIM}Craft: {config['craft_name']}{R}")
+
+    if plan["verdict"] == "GROUND_ONLY":
+        print(f"\n  {DIM}{'░' * 20} - /100{R}")
+        print(f"  {DIM}  Noise:- | PID:- | Motors:-{R}")
+        print(f"\n  {Y}▸ {plan['verdict_text']}{R}")
+        return
+
+    sc = G if overall >= 85 else Y if overall >= 60 else RED
+    print(f"\n  {B}TUNE QUALITY: {sc}{'█'*int(overall/5)}{'░'*(20-int(overall/5))} {overall:.0f}/100{R}")
+    parts = []
+    if scores["noise"] is not None:
+        parts.append(f"Noise:{scores['noise']:.0f}")
+    if scores["pid"] is not None:
+        parts.append(f"PID:{scores['pid']:.0f}")
+    elif not scores.get("pid_measurable", True):
+        parts.append(f"PID:N/A")
+    motor_str = "N/A" if scores.get("motor") is None else f"{scores['motor']:.0f}"
+    parts.append(f"Motors:{motor_str}")
+    print(f"  {DIM}  {' | '.join(parts)}{R}")
+
+    vc = {"DIALED_IN": G, "NEARLY_THERE": G, "GETTING_BETTER": Y,
+          "NEEDS_WORK": Y, "ROUGH": RED, "NEED_DATA": Y, "GROUND_ONLY": DIM}
+    print(f"\n  {vc.get(plan['verdict'], C)}▸ {plan['verdict_text']}{R}")
+
+
+def _print_section_pid(plan, pid_results, config, profile):
+    """Print PID tuning section."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}PID RESPONSE:{R}")
+
+    # Config display
+    if config_has_pid(config):
+        for ax in ["roll", "pitch", "yaw"]:
+            ff = config.get(f"{ax}_ff")
+            ff_str = f"  FF={ff:>3}" if ff is not None else ""
+            print(f"    {ax.capitalize():6s} P={config.get(f'{ax}_p', '?'):>3}  "
+                  f"I={config.get(f'{ax}_i', '?'):>3}  D={config.get(f'{ax}_d', '?'):>3}{ff_str}")
+
+    # Step response measurements
+    for pid in pid_results:
+        if pid is None:
+            continue
+        _os = pid["avg_overshoot_pct"]
+        _dl = pid["tracking_delay_ms"]
+        n_steps = pid.get("n_steps", 0)
+        if _os is not None:
+            oc = RED if _os > BAD_OVERSHOOT else Y if _os > OK_OVERSHOOT else G
+            os_str = f"{oc}{_os:5.1f}%{R}"
+        else:
+            os_str = f"{DIM}  N/A{R}"
+        if _dl is not None:
+            dc = RED if _dl > BAD_DELAY_MS else Y if _dl > OK_DELAY_MS else G
+            dl_str = f"{dc}{_dl:5.1f}ms{R}"
+        else:
+            dl_str = f"{DIM}  N/A{R}"
+        step_hint = f"  {DIM}({n_steps} steps){R}" if n_steps < 5 and (_os is None or _dl is None) else ""
+        print(f"    {pid['axis']:6s}  OS:{os_str}  Delay:{dl_str}  Err:{pid['rms_error']:.1f}{step_hint}")
+
+    # PID-related actions
+    actions = plan["actions"]
+    pid_actions = [a for a in actions if a.get("category") == "PID" and not a.get("deferred")]
+    osc_actions = [a for a in actions if a.get("category") == "Oscillation" and not a.get("deferred")]
+    deferred = [a for a in actions if a.get("category") == "PID" and a.get("deferred")]
+
+    if osc_actions:
+        print(f"\n  {B}Oscillation actions:{R}")
+        for a in osc_actions:
+            us = f" {RED}[!!]{R}" if a["urgency"] == "CRITICAL" else f" {Y}[!]{R}" if a["urgency"] == "IMPORTANT" else ""
+            print(f"    {a['action']}{us}")
+    if pid_actions:
+        print(f"\n  {B}PID actions:{R}")
+        for a in pid_actions:
+            print(f"    {a['action']}")
+    if deferred:
+        print(f"\n  {DIM}Deferred (fix filters first):{R}")
+        for a in deferred:
+            orig = a.get("original_action", a["action"])
+            print(f"    {DIM}⏸ {orig}{R}")
+
+
+def _print_section_noise(plan, noise_fp):
+    """Print noise analysis section."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}NOISE ANALYSIS:{R}")
+
+    if noise_fp and noise_fp["peaks"]:
+        fp_text = format_noise_fingerprint_terminal(noise_fp, (R, B, C, G, Y, RED, DIM))
+        print(fp_text)
+    else:
+        print(f"  {G}  No significant noise sources detected.{R}")
+
+    # Filter actions
+    actions = plan["actions"]
+    filter_actions = [a for a in actions if a.get("category") == "Filter" and not a.get("deferred")]
+    if filter_actions:
+        print(f"\n  {B}Filter actions:{R}")
+        for a in filter_actions:
+            us = f" {RED}[!!]{R}" if a["urgency"] == "CRITICAL" else f" {Y}[!]{R}" if a["urgency"] == "IMPORTANT" else ""
+            print(f"    {a['action']}{us}")
+            print(f"    {DIM}{a['reason']}{R}")
+
+
+def _print_section_hover(plan, motor_analysis):
+    """Print hover stability and motor section."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}HOVER & STABILITY:{R}")
+
+    # Hover oscillation
+    hover_osc_data = plan["scores"].get("hover_osc", [])
+    if hover_osc_data:
+        for osc in hover_osc_data:
+            sev = osc["severity"]
+            rms = osc["gyro_rms"]
+            p2p = osc["gyro_p2p"]
+            freq = osc["dominant_freq_hz"]
+            cause = osc.get("cause", "")
+            freq_str = f"  @{freq:.0f}Hz" if freq else ""
+            cause_str = f"  [{cause.replace('_', ' ')}]" if cause else ""
+            if sev == "severe":
+                sev_str = f"{RED}{B}SEVERE{R}"
+            elif sev == "moderate":
+                sev_str = f"{Y}MODERATE{R}"
+            elif sev == "mild":
+                sev_str = f"{Y}mild{R}"
+            else:
+                sev_str = f"{G}stable{R}"
+            print(f"    {osc['axis']:6s}  {sev_str}  RMS:{rms:5.1f} deg/s  P2P:{p2p:5.0f} deg/s{freq_str}{DIM}{cause_str}{R}")
+        any_osc = any(o["severity"] != "none" for o in hover_osc_data)
+        if any_osc:
+            print(f"    {DIM}(measured during {hover_osc_data[0]['hover_seconds']:.1f}s centered stick){R}")
+    else:
+        print(f"  {DIM}  No hover data available (need centered-stick segments).{R}")
+
+    # Info items (wind buffeting notes)
+    info_items = plan.get("info", [])
+    if info_items:
+        print()
+        for item in info_items:
+            print(f"  {DIM}ℹ {item['text']}{R}")
+            print(f"    {DIM}{item['detail']}{R}")
+
+    # Motors
+    print()
+    if motor_analysis:
+        if motor_analysis.get("idle_detected", False):
+            print(f"  {B}Motors:{R} {DIM}idle/ground{R}")
+        else:
+            print(f"  {B}Motor balance:{R}")
+            for m in motor_analysis["motors"]:
+                sc2 = RED if m["saturation_pct"] > MOTOR_SAT_WARN else G
+                print(f"    Motor {m['motor']}  Avg:{m['avg_pct']:5.1f}%  Sat:{sc2}{m['saturation_pct']:4.1f}%{R}")
+            sp = motor_analysis.get("balance_spread_pct", 0)
+            if sp > 5:
+                wm = motor_analysis.get("worst_motor")
+                print(f"    {Y}Imbalance: {sp:.1f}% — Motor {wm} is the outlier{R}")
+
+    # Mechanical actions
+    mech_actions = [a for a in plan["actions"]
+                    if a.get("category") in ("Mechanical", "Motor") and not a.get("deferred")]
+    if mech_actions:
+        print(f"\n  {B}Mechanical:{R}")
+        for a in mech_actions:
+            print(f"    {a['action']}")
+
+
+def _print_section_nav(nav_perf):
+    """Print nav controller performance section."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}NAV PERFORMANCE:{R}")
+
+    if not nav_perf or not nav_perf.get("findings"):
+        print(f"  {DIM}  No nav performance data (need POSHOLD/RTH flight segments).{R}")
+        return
+
+    # Score
+    nav_score = nav_perf.get("score")
+    if nav_score is not None:
+        sc = G if nav_score >= 85 else Y if nav_score >= 60 else RED
+        print(f"  {sc}  Nav score: {nav_score:.0f}/100{R}")
+
+    # Deceleration events
+    decel = nav_perf.get("deceleration", [])
+    if decel:
+        avg_peak = np.mean([e["peak_error_cm"] for e in decel])
+        avg_osc = np.mean([e["oscillation_count"] for e in decel])
+        avg_settle = np.mean([e["settling_time_s"] for e in decel])
+        print(f"\n  {B}Deceleration ({len(decel)} events):{R}")
+        print(f"    Avg overshoot: {avg_peak:.0f}cm | Oscillations: {avg_osc:.1f} | Settling: {avg_settle:.1f}s")
+        worst = max(decel, key=lambda e: e["peak_error_cm"])
+        print(f"    Worst: {worst['peak_error_cm']:.0f}cm at {worst['time_s']:.1f}s")
+
+    # Position hold
+    ph = nav_perf.get("poshold")
+    if ph:
+        cep_c = G if ph["cep_cm"] < 150 else Y if ph["cep_cm"] < 400 else RED
+        print(f"\n  {B}Position hold ({ph['hold_duration_s']:.0f}s):{R}")
+        print(f"    CEP: {cep_c}{ph['cep_cm']:.0f}cm{R}  Max drift: {ph['max_drift_cm']:.0f}cm  "
+              f"RMS: {ph['rms_error_cm']:.0f}cm")
+        if ph.get("toilet_bowl"):
+            print(f"    {RED}Toilet bowl detected (period {ph['tb_period_s']:.1f}s) — check compass{R}")
+
+    # Altitude hold
+    ah = nav_perf.get("althold")
+    if ah:
+        alt_c = G if ah["rms_error_cm"] < 50 else Y if ah["rms_error_cm"] < 150 else RED
+        print(f"\n  {B}Altitude hold ({ah['hold_duration_s']:.0f}s):{R}")
+        print(f"    RMS: {alt_c}{ah['rms_error_cm']:.0f}cm{R}  Max: {ah['max_error_cm']:.0f}cm")
+        if ah.get("oscillation"):
+            print(f"    {Y}Oscillation at {ah['osc_freq_hz']:.1f}Hz{R}")
+
+    # Saturation
+    sat = nav_perf.get("saturation")
+    if sat and max(sat["sat_pct_n"], sat["sat_pct_e"]) > 5:
+        print(f"\n  {Y}Nav controller saturating: N={sat['sat_pct_n']:.0f}% E={sat['sat_pct_e']:.0f}%{R}")
+
+    # Wind correlation
+    wind = nav_perf.get("wind_correlation")
+    if wind and not np.isnan(wind.get("correlation", float("nan"))):
+        print(f"\n  {DIM}Wind: avg {wind['avg_wind_cms']/100:.1f}m/s, "
+              f"error correlation {wind['correlation']:.0%}{R}")
+
+    # Findings
+    for f in nav_perf.get("findings", []):
+        if f["level"] == "WARNING":
+            print(f"\n  {Y}⚠ {f['text']}{R}")
+        elif f["level"] == "INFO":
+            print(f"\n  {DIM}ℹ {f['text']}{R}")
+        elif f["level"] == "OK":
+            print(f"\n  {G}✓ {f['text']}{R}")
+        if f.get("detail"):
+            print(f"    {DIM}{f['detail']}{R}")
+
+    # Nav actions
+    nav_actions = nav_perf.get("nav_actions", [])
+    if nav_actions:
+        print(f"\n  {B}Nav PID recommendations:{R}")
+        for a in nav_actions:
+            print(f"    {a['action']}")
+            print(f"    {DIM}{a['reason']}{R}")
+            print(f"    {G}{a['cli']}{R}")
+
+
+def _print_section_nav_sensors(nav_results):
+    """Print nav sensor health section."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    print(f"\n  {B}{'─'*66}{R}")
+    print(f"  {B}NAV SENSORS:{R}")
+
+    if not nav_results:
+        print(f"  {DIM}  No nav sensor data available.{R}")
+        return
+
+    for section_name in ["compass", "gps", "baro", "estimator"]:
+        section = nav_results.get(section_name)
+        if not section:
+            continue
+        score = section.get("score")
+        sc = G if (score or 0) >= 80 else Y if (score or 0) >= 50 else RED
+        print(f"\n  {B}{section_name.capitalize()}: {sc}{score}/100{R}")
+        for f in section.get("findings", []):
+            level, text = f if isinstance(f, tuple) else (f.get("level", "INFO"), f.get("text", ""))
+            if level == "WARNING":
+                print(f"    {Y}⚠ {text}{R}")
+            elif level == "CRITICAL":
+                print(f"    {RED}✗ {text}{R}")
+            elif level == "OK":
+                print(f"    {G}✓ {text}{R}")
+            else:
+                print(f"    {DIM}ℹ {text}{R}")
+
+
+def _print_section_cli(plan):
+    """Print CLI commands section."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    active_actions = [a for a in plan["actions"] if not a.get("deferred")]
+    cli_cmds = generate_cli_commands(active_actions)
+
+    print(f"\n  {B}{'─'*66}{R}")
+    if cli_cmds:
+        print(f"  {B}INAV CLI — paste into Configurator CLI tab:{R}")
+        print()
+        for cmd in cli_cmds:
+            print(f"    {G}{cmd}{R}")
+        print()
+
+        # GUI hints
+        gui_hints = []
+        for a in active_actions:
+            if "sub_actions" in a and a["sub_actions"]:
+                for sa in a["sub_actions"]:
+                    param = sa.get("param", "")
+                    if param in INAV_GUI_MAP:
+                        tab, field = INAV_GUI_MAP[param]
+                        gui_hints.append(f"  {tab} tab -> {field} -> {sa['new']}")
+            else:
+                param = a.get("param", "")
+                if param in INAV_GUI_MAP:
+                    tab, field = INAV_GUI_MAP[param]
+                    new_val = a.get("new")
+                    if new_val is not None and new_val not in ("see action",):
+                        gui_hints.append(f"  {tab} tab -> {field} -> {new_val}")
+        if gui_hints:
+            print(f"  {DIM}Or apply in Configurator:{R}")
+            for h in gui_hints:
+                print(f"    {DIM}{h}{R}")
+    else:
+        print(f"  {G}  No changes needed — nothing to paste.{R}")
+
+
+def _build_section_statuses(plan, pid_results, noise_fp, motor_analysis,
+                            config_review_text, progression_text,
+                            nav_perf=None, nav_results=None):
+    """Build one-line status per section for the menu display."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    statuses = {}
+
+    # PID status
+    pid_parts = []
+    for pid in pid_results:
+        if pid is None:
+            continue
+        _os = pid["avg_overshoot_pct"]
+        _dl = pid["tracking_delay_ms"]
+        ax = pid["axis"][:1]
+        if _os is not None and _os > BAD_OVERSHOOT:
+            pid_parts.append(f"{RED}{ax}:{_os:.0f}%OS{R}")
+        elif _dl is not None and _dl > BAD_DELAY_MS:
+            pid_parts.append(f"{Y}{ax}:{_dl:.0f}ms{R}")
+        elif _os is not None or _dl is not None:
+            pid_parts.append(f"{G}{ax}:ok{R}")
+        else:
+            pid_parts.append(f"{DIM}{ax}:N/A{R}")
+    statuses["pid"] = "  ".join(pid_parts) if pid_parts else f"{DIM}no data{R}"
+
+    # Noise status
+    n_sources = len(noise_fp["peaks"]) if noise_fp and noise_fp.get("peaks") else 0
+    n_filter_actions = len([a for a in plan["actions"]
+                           if a.get("category") == "Filter" and not a.get("deferred")])
+    noise_score = plan["scores"].get("noise")
+    if noise_score is not None:
+        nc = G if noise_score >= 85 else Y if noise_score >= 60 else RED
+        statuses["noise"] = f"{nc}{noise_score:.0f}/100{R} — {n_sources} source{'s' if n_sources != 1 else ''}"
+        if n_filter_actions:
+            statuses["noise"] += f", {Y}{n_filter_actions} filter change{'s' if n_filter_actions != 1 else ''}{R}"
+    else:
+        statuses["noise"] = f"{DIM}no data{R}"
+
+    # Hover status
+    hover_osc = plan["scores"].get("hover_osc", [])
+    hover_parts = []
+    for osc in hover_osc:
+        ax = osc["axis"][:1]
+        sev = osc["severity"]
+        cause = osc.get("cause", "")
+        if sev == "none":
+            hover_parts.append(f"{G}{ax}:stable{R}")
+        elif cause == "wind_buffeting":
+            hover_parts.append(f"{DIM}{ax}:wind{R}")
+        elif sev == "severe":
+            hover_parts.append(f"{RED}{ax}:severe{R}")
+        elif sev == "moderate":
+            hover_parts.append(f"{Y}{ax}:moderate{R}")
+        else:
+            hover_parts.append(f"{Y}{ax}:mild{R}")
+    statuses["hover"] = "  ".join(hover_parts) if hover_parts else f"{DIM}no hover data{R}"
+
+    # Config review status
+    if config_review_text and config_review_text.strip():
+        n_crit = config_review_text.count("[CRITICAL]") + config_review_text.count("✗") + config_review_text.count("✖")
+        n_warn = config_review_text.count("[WARNING]") + config_review_text.count("⚠")
+        if n_crit:
+            statuses["config"] = f"{RED}{n_crit} critical{R}"
+            if n_warn:
+                statuses["config"] += f", {Y}{n_warn} warnings{R}"
+        elif n_warn:
+            statuses["config"] = f"{Y}{n_warn} warnings{R}"
+        else:
+            statuses["config"] = f"{G}all good{R}"
+    else:
+        statuses["config"] = f"{DIM}no config loaded{R}"
+
+    # History status
+    if progression_text and progression_text.strip():
+        statuses["history"] = f"available"
+    else:
+        statuses["history"] = f"{DIM}no history{R}"
+
+    # CLI status
+    n_actions = len([a for a in plan["actions"] if not a.get("deferred")])
+    cli_cmds = generate_cli_commands([a for a in plan["actions"] if not a.get("deferred")])
+    if cli_cmds:
+        statuses["cli"] = f"{Y}{len(cli_cmds) - 1} changes{R}"  # -1 for 'save'
+    else:
+        statuses["cli"] = f"{G}no changes needed{R}"
+
+    # Nav performance status
+    if nav_perf and nav_perf.get("score") is not None:
+        ns = nav_perf["score"]
+        nc = G if ns >= 85 else Y if ns >= 60 else RED
+        parts = []
+        decel = nav_perf.get("deceleration", [])
+        if decel:
+            avg_peak = np.mean([e["peak_error_cm"] for e in decel])
+            parts.append(f"{len(decel)} decel events ({avg_peak:.0f}cm)")
+        ph = nav_perf.get("poshold")
+        if ph:
+            parts.append(f"CEP {ph['cep_cm']:.0f}cm")
+        ah = nav_perf.get("althold")
+        if ah:
+            parts.append(f"alt RMS {ah['rms_error_cm']:.0f}cm")
+        statuses["nav_perf"] = f"{nc}{ns}/100{R} — {', '.join(parts)}" if parts else f"{nc}{ns}/100{R}"
+    else:
+        statuses["nav_perf"] = f"{DIM}no nav data{R}"
+
+    # Nav sensors status
+    if nav_results:
+        sensor_parts = []
+        for name in ["compass", "gps", "baro"]:
+            sec = nav_results.get(name)
+            if sec and sec.get("score") is not None:
+                s = sec["score"]
+                c = G if s >= 80 else Y if s >= 50 else RED
+                sensor_parts.append(f"{c}{name[:3].capitalize()}:{s}{R}")
+        statuses["nav_sensors"] = "  ".join(sensor_parts) if sensor_parts else f"{DIM}no sensor data{R}"
+    else:
+        statuses["nav_sensors"] = f"{DIM}no sensor data{R}"
+
+    return statuses
+
+
+def _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
+                      profile, config_review_text, progression_text,
+                      nav_perf=None, nav_results=None):
+    """Run interactive menu loop for exploring analysis results."""
+    R, B, C, G, Y, RED, DIM = _colors()
+
+    statuses = _build_section_statuses(plan, pid_results, noise_fp, motor_analysis,
+                                        config_review_text, progression_text,
+                                        nav_perf=nav_perf, nav_results=nav_results)
+
+    sections = {
+        "1": ("PID Tuning", statuses["pid"]),
+        "2": ("Noise Analysis", statuses["noise"]),
+        "3": ("Hover & Stability", statuses["hover"]),
+        "4": ("Nav Performance", statuses["nav_perf"]),
+        "5": ("Nav Sensors", statuses["nav_sensors"]),
+        "6": ("Config Review", statuses["config"]),
+        "7": ("Flight History", statuses["history"]),
+        "c": ("CLI Commands", statuses["cli"]),
+        "a": ("Show All", ""),
+        "q": ("Quit", ""),
+    }
+
+    while True:
+        # Clear screen and show score bar
+        print("\033[2J\033[H", end="")
+        _print_score_bar(plan, config, data)
+
+        # Menu
+        print(f"\n  {B}{'─'*66}{R}")
+        for key, (name, status) in sections.items():
+            if key in ("a", "q"):
+                print(f"  {B}[{key.upper()}]{R} {name}")
+            else:
+                print(f"  {B}[{key}]{R} {name:20s} {status}")
+        print(f"  {B}{'─'*66}{R}")
+
+        try:
+            choice = input(f"\n  {B}Section (1-7, C, A, Q): {R}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if choice == "q" or choice == "":
+            break
+        elif choice == "1":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            _print_section_pid(plan, pid_results, config, profile)
+            _wait_for_enter()
+        elif choice == "2":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            _print_section_noise(plan, noise_fp)
+            _wait_for_enter()
+        elif choice == "3":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            _print_section_hover(plan, motor_analysis)
+            _wait_for_enter()
+        elif choice == "4":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            _print_section_nav(nav_perf)
+            _wait_for_enter()
+        elif choice == "5":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            _print_section_nav_sensors(nav_results)
+            _wait_for_enter()
+        elif choice == "6":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            if config_review_text and config_review_text.strip():
+                print(config_review_text)
+            else:
+                print(f"\n  {DIM}No config review available (no dump/diff loaded).{R}")
+            _wait_for_enter()
+        elif choice == "7":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            if progression_text and progression_text.strip():
+                print(progression_text)
+            else:
+                print(f"\n  {DIM}No flight history available.{R}")
+            _wait_for_enter()
+        elif choice == "c":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            _print_section_cli(plan)
+            # Also show nav CLI commands if any
+            if nav_perf and nav_perf.get("nav_actions"):
+                print(f"\n  {B}Nav PID commands:{R}")
+                for a in nav_perf["nav_actions"]:
+                    print(f"    {G}{a['cli']}{R}")
+            _wait_for_enter()
+        elif choice == "a":
+            print("\033[2J\033[H", end="")
+            _print_score_bar(plan, config, data)
+            _print_section_pid(plan, pid_results, config, profile)
+            _print_section_noise(plan, noise_fp)
+            _print_section_hover(plan, motor_analysis)
+            _print_section_nav(nav_perf)
+            _print_section_nav_sensors(nav_results)
+            if config_review_text and config_review_text.strip():
+                print(config_review_text)
+            _print_section_cli(plan)
+            if nav_perf and nav_perf.get("nav_actions"):
+                print(f"\n  {B}Nav PID commands:{R}")
+                for a in nav_perf["nav_actions"]:
+                    print(f"    {G}{a['cli']}{R}")
+            if progression_text and progression_text.strip():
+                print(progression_text)
+            _wait_for_enter()
+
+
+def _wait_for_enter():
+    """Wait for Enter key to return to menu."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    try:
+        input(f"\n  {DIM}Press Enter to return to menu...{R}")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 # ─── HTML Report ──────────────────────────────────────────────────────────────
 
 def _create_nav_charts(nav_results, data, sr):
@@ -6098,6 +7198,200 @@ def count_blackbox_logs(filepath):
     return max(1, count)
 
 
+# ─── Blackbox Readiness Check ─────────────────────────────────────────────────
+
+# Required fields per analysis mode
+_FIELDS_PID_TUNING = {
+    "required": ["gyroADC[0]", "axisP[0]", "motor[0]", "rcCommand[0]"],
+    "recommended": ["gyroRaw[0]", "axisD[0]", "axisF[0]", "axisI[0]"],
+}
+_FIELDS_NAV_ANALYSIS = {
+    "required": ["navPos[0]", "navTgtPos[0]", "navVel[0]", "mcVelAxisP[0]"],
+    "recommended": ["mcPosAxisP[0]", "mcVelAxisOut[0]", "navState", "navFlags",
+                     "mcVelAxisI[0]", "mcVelAxisD[0]", "mcVelAxisFF[0]",
+                     "navTgtVel[0]", "navTgtHdg", "navEPH"],
+}
+_FIELDS_NAV_GPS = {
+    "required": ["GPS_coord[0]", "GPS_fixType", "GPS_numSat"],
+    "recommended": ["GPS_speed", "GPS_hdop", "GPS_velned[0]"],
+}
+_FIELDS_NAV_SLOW = {
+    "required": ["flightModeFlags"],
+    "recommended": ["wind[0]", "activeFlightModeFlags"],
+}
+
+
+def check_blackbox_readiness_from_dump(config_text):
+    """Check blackbox configuration from FC dump/diff output (pre-download).
+
+    Returns dict with:
+        ok (bool): True if blackbox is enabled and configured
+        items (list of dicts): [{level, text, fix}] — INFO/WARNING/CRITICAL items
+        has_gps (bool): GPS feature enabled
+        has_blackbox (bool): Blackbox feature enabled
+        bb_device (str): Blackbox device type
+        bb_rate (str): Logging rate fraction
+    """
+    items = []
+    has_blackbox = False
+    has_gps = False
+    bb_device = "unknown"
+    bb_rate = "1/1"
+
+    if not config_text:
+        return {"ok": False, "items": [{"level": "CRITICAL",
+                "text": "No config available", "fix": None}],
+                "has_gps": False, "has_blackbox": False,
+                "bb_device": "unknown", "bb_rate": "unknown"}
+
+    # Parse features
+    features = []
+    settings = {}
+    for line in config_text.splitlines():
+        line = line.strip()
+        if line.startswith("feature ") and not line.startswith("feature -"):
+            features.append(line[8:].strip())
+        elif line.startswith("set "):
+            m = re.match(r"set\s+(\S+)\s*=\s*(.*)", line)
+            if m:
+                settings[m.group(1).strip()] = m.group(2).strip()
+
+    # Check blackbox feature
+    has_blackbox = "BLACKBOX" in features
+    if not has_blackbox:
+        items.append({"level": "CRITICAL",
+            "text": "Blackbox feature not enabled — nothing is being logged",
+            "fix": "feature BLACKBOX"})
+
+    # Check blackbox device
+    bb_dev = settings.get("blackbox_device", "").upper()
+    if bb_dev:
+        bb_device = bb_dev
+    if has_blackbox and bb_dev in ("NONE", ""):
+        items.append({"level": "CRITICAL",
+            "text": "Blackbox device is NONE — no storage target configured",
+            "fix": "set blackbox_device = SPIFLASH"})
+
+    # Check logging rate
+    rate_num = settings.get("blackbox_rate_num", "1")
+    rate_den = settings.get("blackbox_rate_denom", "1")
+    bb_rate = f"{rate_num}/{rate_den}"
+    try:
+        if int(rate_den) > 1:
+            items.append({"level": "INFO",
+                "text": f"Logging at {bb_rate} rate — full rate (1/1) gives best PID analysis data",
+                "fix": "set blackbox_rate_num = 1\n    set blackbox_rate_denom = 1"})
+    except ValueError:
+        pass
+
+    # Check GPS
+    has_gps = "GPS" in features
+    if not has_gps:
+        items.append({"level": "INFO",
+            "text": "GPS not enabled — nav analysis (--nav) won't have position data",
+            "fix": "set feature GPS"})
+
+    ok = has_blackbox and bb_dev not in ("NONE", "")
+    return {"ok": ok, "items": items, "has_gps": has_gps,
+            "has_blackbox": has_blackbox, "bb_device": bb_device, "bb_rate": bb_rate}
+
+
+def check_blackbox_readiness_from_headers(raw_params, nav_mode=False):
+    """Check field availability from BBL headers (pre-analysis).
+
+    Args:
+        raw_params: dict from parse_headers_from_bbl()
+        nav_mode: True if --nav was requested
+
+    Returns dict with:
+        ok (bool): True if minimum fields present for the requested mode
+        items (list of dicts): [{level, text}]
+        has_pid_fields (bool): PID tuning fields present
+        has_nav_fields (bool): Nav analysis fields present
+        has_gps_fields (bool): GPS G-frame fields present
+        missing_pid (list): Missing required PID fields
+        missing_nav (list): Missing required nav fields
+    """
+    items = []
+
+    # Parse I-frame fields
+    i_fields_str = raw_params.get("Field I name", "")
+    i_fields = [f.strip() for f in i_fields_str.split(",")] if i_fields_str else []
+    i_fields_lower = [f.lower() for f in i_fields]
+
+    # Parse G-frame fields
+    g_fields_str = raw_params.get("Field G name", "")
+    g_fields = [f.strip() for f in g_fields_str.split(",")] if g_fields_str else []
+
+    # Parse S-frame fields
+    s_fields_str = raw_params.get("Field S name", "")
+    s_fields = [f.strip() for f in s_fields_str.split(",")] if s_fields_str else []
+
+    def _has_field(name, field_list):
+        """Check if field exists (case-insensitive)."""
+        name_l = name.lower()
+        return any(name_l == f.lower() for f in field_list)
+
+    # Check PID tuning fields
+    missing_pid = [f for f in _FIELDS_PID_TUNING["required"] if not _has_field(f, i_fields)]
+    missing_pid_rec = [f for f in _FIELDS_PID_TUNING["recommended"] if not _has_field(f, i_fields)]
+    has_pid_fields = len(missing_pid) == 0
+
+    if missing_pid:
+        items.append({"level": "WARNING",
+            "text": f"PID tuning fields missing: {', '.join(missing_pid)}. "
+                    f"PID analysis will be limited."})
+
+    # Check nav fields
+    missing_nav = [f for f in _FIELDS_NAV_ANALYSIS["required"] if not _has_field(f, i_fields)]
+    missing_nav_gps = [f for f in _FIELDS_NAV_GPS["required"] if not _has_field(f, g_fields)]
+    missing_nav_slow = [f for f in _FIELDS_NAV_SLOW["required"] if not _has_field(f, s_fields)]
+    has_nav_fields = len(missing_nav) == 0
+    has_gps_fields = len(missing_nav_gps) == 0
+
+    if nav_mode:
+        if missing_nav:
+            items.append({"level": "WARNING",
+                "text": f"Nav analysis fields missing from I-frames: {', '.join(missing_nav)}. "
+                        f"Enable GPS and fly with nav modes for full nav data."})
+        if missing_nav_gps:
+            items.append({"level": "WARNING",
+                "text": f"GPS fields missing from G-frames: {', '.join(missing_nav_gps)}. "
+                        f"GPS may not have been enabled during this flight."})
+        if missing_nav_slow:
+            items.append({"level": "INFO",
+                "text": f"Flight mode fields missing from S-frames: {', '.join(missing_nav_slow)}. "
+                        f"Mode transition analysis won't work."})
+        if not missing_nav and not missing_nav_gps:
+            items.append({"level": "OK",
+                "text": "All nav analysis fields present"})
+    else:
+        # Not in nav mode — just note availability
+        if has_nav_fields and has_gps_fields:
+            items.append({"level": "OK",
+                "text": "Nav fields present — nav analysis will run automatically"})
+
+    ok = has_pid_fields if not nav_mode else (has_pid_fields and has_nav_fields)
+    return {"ok": ok, "items": items,
+            "has_pid_fields": has_pid_fields, "has_nav_fields": has_nav_fields,
+            "has_gps_fields": has_gps_fields,
+            "missing_pid": missing_pid, "missing_nav": missing_nav}
+
+
+def _print_readiness(check_result, source="config"):
+    """Print readiness check results to terminal."""
+    R, B, C, G, Y, RED, DIM = _colors()
+    icons = {"CRITICAL": f"{RED}✗", "WARNING": f"{Y}⚠", "INFO": f"{DIM}ℹ", "OK": f"{G}✓"}
+
+    for item in check_result.get("items", []):
+        level = item["level"]
+        icon = icons.get(level, "?")
+        print(f"  {icon} {item['text']}{R}")
+        if item.get("fix"):
+            for fix_line in item["fix"].split("\n"):
+                print(f"  {DIM}  Fix: {fix_line.strip()}{R}")
+
+
 # ─── Post-Analysis Cleanup ────────────────────────────────────────────────────
 
 def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_file,
@@ -6186,7 +7480,7 @@ def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_fil
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.19.0 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.20.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -6238,8 +7532,9 @@ def main():
                              "Not needed with --device (config is pulled automatically). "
                              "Also auto-discovered if a *_dump.txt or *_diff.txt file sits next to the BBL.")
     parser.add_argument("--nav", action="store_true",
-                        help="Enable navigation health analysis (compass, GPS, baro, "
-                             "estimator). Works on any flight with nav fields in the log.")
+                        help="(deprecated, nav analysis now runs automatically when data is available)")
+    parser.add_argument("--no-nav", action="store_true",
+                        help="Skip navigation analysis even if nav fields are present in the log.")
     parser.add_argument("--no-db", action="store_true",
                         help="Skip storing results in flight database.")
     parser.add_argument("--db-path", default="./inav_flights.db",
@@ -6364,6 +7659,15 @@ def main():
             else:
                 print(" no response (FC may not support CLI over MSP)")
 
+            # Check blackbox readiness from dump
+            if config_raw:
+                readiness = check_blackbox_readiness_from_dump(config_raw)
+                if not readiness["ok"]:
+                    _print_readiness(readiness)
+                    sys.exit(1)
+                if readiness["items"]:
+                    _print_readiness(readiness)
+
             if summary['used_size'] == 0:
                 print("  No blackbox data to download.")
                 sys.exit(0)
@@ -6373,6 +7677,24 @@ def main():
                 output_dir=args.blackbox_dir,
                 erase_after=False,  # erase happens after successful analysis
             )
+
+            if not filepath:
+                # First attempt failed (often stale serial after CLI exit)
+                # Reconnect and retry once
+                print("  Retrying download...")
+                try:
+                    fc.close()
+                except Exception:
+                    pass
+                import time as _time2
+                _time2.sleep(1.0)
+                fc = INAVDevice(fc.port_path)
+                fc.open()
+                fc.get_info()
+                filepath = fc.download_blackbox(
+                    output_dir=args.blackbox_dir,
+                    erase_after=False,
+                )
 
             if not filepath:
                 print("  ERROR: Download failed.")
@@ -6707,34 +8029,6 @@ def _process_multi_log(log_files, args, config_raw):
     # ── Phase 5: Full analysis on the selected flight ──
     print(f"{'═' * 70}")
     _analyze_single_log(log_files[best_idx], args, config_raw)
-
-    # ── Phase 6: Show cross-session progression ──
-    if not args.no_db:
-        try:
-            try:
-                from inav_toolkit.flight_db import FlightDB
-            except ImportError:
-                from inav_flight_db import FlightDB
-            db = FlightDB(args.db_path)
-            rp = parse_headers_from_bbl(log_files[0])
-            cfg = extract_fc_config(rp)
-            craft = cfg.get("craft_name", "unknown")
-            prog = db.get_progression(craft)
-            if prog["flights"] and len(prog["flights"]) >= 2:
-                print(f"\n{B}{C}{'═' * 70}{R}")
-                print(f"  {B}FLIGHT PROGRESSION ({craft}):{R}")
-                trend_icon = {"improving": f"{G}↗ Improving",
-                              "degrading": f"{RED}↘ Degrading",
-                              "stable": f"{Y}→ Stable"
-                              }.get(prog["trend"],
-                                    f"{DIM}? Insufficient data")
-                print(f"  Trend: {trend_icon}{R}")
-                for ch in prog["changes"]:
-                    print(f"    {ch}")
-                print(f"{B}{C}{'═' * 70}{R}\n")
-            db.close()
-        except Exception:
-            pass
 
     return log_files[best_idx]
 
@@ -8092,12 +9386,9 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
             pass
 
     # ── Show comprehensive banner ──
-    nav_mode = getattr(args, 'nav', False)
+    nav_mode = getattr(args, 'nav', False)  # kept for backward compat, ignored
     if not summary_only:
-        if nav_mode:
-            print(f"\n  ▲ {t('banner.nav_analyzer')} v{REPORT_VERSION}")
-        else:
-            print(f"\n  ▲ {t('banner.analyzer')} v{REPORT_VERSION}")
+        print(f"\n  ▲ {t('banner.analyzer')} v{REPORT_VERSION}")
         print(f"  {t('banner.loading', file=logfile)}")
 
         fw_rev = config.get("firmware_revision", "")
@@ -8114,15 +9405,14 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
             print(f"  {t('banner.firmware')}:  {fw_str}")
         print(f"  {t('banner.platform')}:  {platform_type} ({n_motors} motors{f', {n_servos} servos' if n_servos else ''})")
 
-        if not nav_mode:
-            frame_str = f"{frame_inches}\"" if frame_inches else "5\" (default)"
-            prop_str = f"{prop_inches}\"×{n_blades}-blade" if prop_inches else f"5\"×{n_blades}-blade (default)"
-            if frame_source == "auto":
-                frame_str += f" (detected from craft name)"
-            elif frame_source == "conflict":
-                frame_str += f" (user override)"
-            print(f"  {t('banner.frame')}:     {frame_str}")
-            print(f"  {t('banner.props')}:     {prop_str}")
+        frame_str = f"{frame_inches}\"" if frame_inches else "5\" (default)"
+        prop_str = f"{prop_inches}\"×{n_blades}-blade" if prop_inches else f"5\"×{n_blades}-blade (default)"
+        if frame_source == "auto":
+            frame_str += f" (detected from craft name)"
+        elif frame_source == "conflict":
+            frame_str += f" (user override)"
+        print(f"  {t('banner.frame')}:     {frame_str}")
+        print(f"  {t('banner.props')}:     {prop_str}")
 
         if detected_cells:
             cell_str = f"{detected_cells}S"
@@ -8130,15 +9420,14 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
                 cell_str += f" (detected from vbatref={int(vbatref)/100:.1f}V)"
             print(f"  {t('banner.battery')}:   {cell_str}")
 
-        if not nav_mode:
-            if args.kv:
-                print(f"  Motors:    {args.kv}KV")
+        if args.kv:
+            print(f"  Motors:    {args.kv}KV")
 
-            # Profile and thresholds
-            print(f"  Profile:   {profile['name']} ({profile['class']} class)")
-            if (frame_inches or 5) >= 8:
-                print(f"    Delay: <{profile['ok_delay_ms']}ms | OS: <{profile['ok_overshoot']}% | "
-                      f"Filters: {profile['gyro_lpf_range'][0]}-{profile['gyro_lpf_range'][1]}Hz")
+        # Profile and thresholds
+        print(f"  Profile:   {profile['name']} ({profile['class']} class)")
+        if (frame_inches or 5) >= 8:
+            print(f"    Delay: <{profile['ok_delay_ms']}ms | OS: <{profile['ok_overshoot']}% | "
+                  f"Filters: {profile['gyro_lpf_range'][0]}-{profile['gyro_lpf_range'][1]}Hz")
 
             # Warnings
             if frame_source == "conflict":
@@ -8155,6 +9444,19 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
                     print(f"    Specify --frame N for accurate thresholds.")
 
         print(f"  {'─'*66}")
+
+    # ── Check field readiness ──
+    if raw_params and not summary_only:
+        field_check = check_blackbox_readiness_from_headers(raw_params, nav_mode=False)
+        if not field_check["ok"]:
+            _print_readiness(field_check, source="headers")
+        elif field_check["items"]:
+            R2, B2, C2, G2, Y2, RED2, DIM2 = _colors()
+            for item in field_check["items"]:
+                if item["level"] == "OK":
+                    print(f"  {G2}✓ {item['text']}{R2}")
+                elif item["level"] == "INFO":
+                    print(f"  {DIM2}ℹ {item['text']}{R2}")
 
     # ── Decode data ──
     if is_blackbox:
@@ -8190,24 +9492,24 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
             return {"verdict": "UNUSABLE", "score": 0, "duration": dur,
                     "idle": False, "config_key": ""}
 
-    if not summary_only and nav_mode:
-        # Show nav field summary instead of PID/filter info
-        nav_fields = [k for k in data if k.startswith("nav_") or k.startswith("att_") or k == "baro_alt"]
-        gps_count = len(data.get("_gps_frames", []))
-        slow_count = len(data.get("_slow_frames", []))
-        parts = []
-        if nav_fields:
-            parts.append(f"{len(nav_fields)} nav fields")
-        if gps_count:
-            parts.append(f"{gps_count} GPS frames")
-        if slow_count:
-            parts.append(f"{slow_count} slow frames")
-        if parts:
-            print(f"  Nav data: {', '.join(parts)}")
-        else:
-            print(f"  {t('terminal.no_nav_fields')}")
+    if not summary_only:
+        # Show nav field summary if nav data is present
+        avail_check = detect_nav_fields(data)
+        if avail_check.get("has_any"):
+            nav_fields = [k for k in data if k.startswith("nav_") or k.startswith("att_") or k == "baro_alt"]
+            gps_count = len(data.get("_gps_frames", []))
+            slow_count = len(data.get("_slow_frames", []))
+            parts = []
+            if nav_fields:
+                parts.append(f"{len(nav_fields)} nav fields")
+            if gps_count:
+                parts.append(f"{gps_count} GPS frames")
+            if slow_count:
+                parts.append(f"{slow_count} slow frames")
+            if parts:
+                print(f"  Nav data: {', '.join(parts)}")
 
-    if not summary_only and not nav_mode:
+    if not summary_only:
         if config_has_pid(config):
             for ax in ["roll","pitch","yaw"]:
                 ff = config.get(f'{ax}_ff', '')
@@ -8216,7 +9518,7 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         else:
             print(f"  {t('terminal.no_pid_values')}")
 
-    if not summary_only and not nav_mode and config_has_filters(config):
+    if not summary_only and config_has_filters(config):
         filt_parts = []
         for k, l in [("gyro_lowpass_hz","Gyro LPF"),("dterm_lpf_hz","D-term LPF"),("yaw_lpf_hz","Yaw LPF")]:
             v = config.get(k)
@@ -8235,7 +9537,7 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         if filt_parts:
             print(f"  Filters: {', '.join(filt_parts)}")
 
-    if not summary_only and not nav_mode and config.get("_diff_merged"):
+    if not summary_only and config.get("_diff_merged"):
         diff_extras = []
         if config.get("motor_poles"):
             diff_extras.append(f"MotorPoles={config['motor_poles']}")
@@ -8256,64 +9558,28 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
     rpm_range = None
     prop_harmonics = None
     phase_lag = None
-    if not nav_mode:
-        rpm_range = estimate_rpm_range(args.kv, detected_cells or args.cells)
-        if rpm_range:
-            cells_used = detected_cells or args.cells
-            if not summary_only:
-                print(f"  RPM estimate: {rpm_range[0]:,}-{rpm_range[1]:,} ({args.kv}KV x {cells_used}S)")
-            prop_harmonics = estimate_prop_harmonics(rpm_range, n_blades)
-            if not summary_only:
-                for h in prop_harmonics:
-                    print(f"    {h['label']}: {h['min_hz']:.0f}-{h['max_hz']:.0f} Hz ({n_blades}-blade)")
+    rpm_range = estimate_rpm_range(args.kv, detected_cells or args.cells)
+    if rpm_range:
+        cells_used = detected_cells or args.cells
+        if not summary_only:
+            print(f"  RPM estimate: {rpm_range[0]:,}-{rpm_range[1]:,} ({args.kv}KV x {cells_used}S)")
+        prop_harmonics = estimate_prop_harmonics(rpm_range, n_blades)
+        if not summary_only:
+            for h in prop_harmonics:
+                print(f"    {h['label']}: {h['min_hz']:.0f}-{h['max_hz']:.0f} Hz ({n_blades}-blade)")
 
-        # ── Phase lag estimation ──
-        if config_has_filters(config):
-            # Estimate at a frequency relevant to this frame class
-            sig_freq = (profile["noise_band_mid"][0] + profile["noise_band_mid"][1]) / 4
-            phase_lag = estimate_total_phase_lag(config, profile, sig_freq)
-            if not summary_only and phase_lag["total_degrees"] > 20:
-                print(f"  Filter phase lag: {phase_lag['total_degrees']:.0f}deg ({phase_lag['total_ms']:.1f}ms) at {sig_freq:.0f}Hz")
+    # ── Phase lag estimation ──
+    if config_has_filters(config):
+        # Estimate at a frequency relevant to this frame class
+        sig_freq = (profile["noise_band_mid"][0] + profile["noise_band_mid"][1]) / 4
+        phase_lag = estimate_total_phase_lag(config, profile, sig_freq)
+        if not summary_only and phase_lag["total_degrees"] > 20:
+            print(f"  Filter phase lag: {phase_lag['total_degrees']:.0f}deg ({phase_lag['total_ms']:.1f}ms) at {sig_freq:.0f}Hz")
 
     if not summary_only:
         print("  Analyzing...")
 
-    # ── NAV-ONLY MODE: skip tuning, run navigation health analysis ──
-    if nav_mode:
-        # Quick oscillation check - warn if PID tuning is polluting nav readings
-        hover_osc = detect_hover_oscillation(data, sr, profile)
-        osc_severe = [h for h in hover_osc
-                      if h["severity"] in ("moderate", "severe") and h.get("cause") != "wind_buffeting"]
-        tune_warning = False
-        if osc_severe:
-            tune_warning = True
-            worst = max(osc_severe, key=lambda h: h["gyro_rms"])
-            R, _B, _C, _G, Y, _RED, DIM = _colors()
-            print(f"\n  {Y}! PID tuning incomplete - {worst['severity']} oscillation detected "
-                  f"({worst['axis']} {worst['gyro_rms']:.0f} deg/s RMS){R}")
-            print(f"  {DIM}  Nav readings (especially baro and compass) are affected by vibration.{R}")
-            print(f"  {DIM}  Run without --nav first to fix PIDs, then re-check nav health.{R}")
-
-        nav_results = run_nav_analysis(data, sr, config)
-        if nav_results:
-            if tune_warning:
-                nav_results["_tune_warning"] = True
-            nav_report = format_nav_report(nav_results)
-            if nav_report:
-                print(nav_report)
-            # Generate nav-only HTML report
-            if not args.no_html:
-                nav_html = _generate_nav_only_html(nav_results, config, data)
-                on = args.output or os.path.splitext(os.path.basename(logfile))[0] + "_nav_report.html"
-                op = os.path.join(os.path.dirname(logfile) or ".", on)
-                with open(op, "w", encoding="utf-8") as f:
-                    f.write(nav_html)
-                print(f"\n  ✓ Nav report: {op}")
-        else:
-            print(f"\n  {t('terminal.no_nav_fields')}")
-            print("  Enable NAV_POS, NAV_ACC, and Attitude in blackbox settings.")
-        return None
-
+    # ── Always run core analysis (PID, noise, motors) ──
     hover_osc = detect_hover_oscillation(data, sr, profile)
     noise_results = [analyze_noise(data, ax, f"gyro_{ax.lower()}", sr) for ax in AXIS_NAMES]
     noise_fp = fingerprint_noise(noise_results, config, prop_harmonics)
@@ -8337,6 +9603,24 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
         for action in plan["actions"]:
             if action.get("category") == "Filter" and "noise" in action.get("reason", "").lower():
                 action["reason"] += f". Sources: {fp_summary}"
+
+    # ── Auto-detect and run nav analysis if fields are present ──
+    nav_perf = None
+    nav_results = None
+    no_nav = getattr(args, 'no_nav', False)
+    avail = detect_nav_fields(data)
+
+    if avail.get("has_any") and not no_nav:
+        # Nav controller performance analysis (decel overshoot, poshold, althold)
+        if avail.get("has_pos") and avail.get("has_vel"):
+            nav_perf = analyze_nav_performance(data, sr, config, profile)
+            if not summary_only and nav_perf and nav_perf.get("findings"):
+                n_findings = len(nav_perf["findings"])
+                nav_score = nav_perf.get("score", 0)
+                print(f"  Nav performance: {nav_score}/100 ({n_findings} findings)")
+
+        # Nav sensor health analysis (compass, GPS, baro, estimator)
+        nav_results = run_nav_analysis(data, sr, config)
 
     # ── Summary-only mode: store in DB and return summary ──
     if summary_only:
@@ -8368,17 +9652,28 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
                 pass
         return summary
 
-    if not args.no_terminal:
-        print_terminal_report(plan, noise_results, pid_results, motor_analysis, config, data,
-                              show_narrative=not args.no_narrative, profile=profile, noise_fp=noise_fp)
+    # ── Determine if interactive mode ──
+    interactive = (sys.stdout.isatty() and hasattr(args, 'device') and args.device
+                   and not args.no_terminal and plan["verdict"] != "GROUND_ONLY")
 
-    # ── Config review from diff (if available) ──
-    # Runs parameter analyzer checks on the FC's current config.
-    # Catches safety, nav, motor protocol issues that flight data alone can't detect.
-    if config_raw and not args.no_terminal and plan["verdict"] != "GROUND_ONLY":
-        _print_config_review(config_raw, config, frame_inches, plan)
+    # ── Capture config review text (needed for both modes) ──
+    config_review_text = ""
+    if config_raw and plan["verdict"] != "GROUND_ONLY":
+        config_review_text = _capture(_print_config_review, config_raw, config, frame_inches, plan)
 
-    nav_results = None  # nav analysis only runs in --nav mode
+    if not interactive:
+        # Sequential output (piped, no device, or --no-terminal)
+        if not args.no_terminal:
+            print_terminal_report(plan, noise_results, pid_results, motor_analysis, config, data,
+                                  show_narrative=not args.no_narrative, profile=profile, noise_fp=noise_fp)
+            # Nav sections (auto-detected)
+            if nav_perf and nav_perf.get("findings"):
+                _print_section_nav(nav_perf)
+            if nav_results:
+                _print_section_nav_sensors(nav_results)
+            if config_review_text:
+                print(config_review_text, end="")
+
     if not args.no_html and plan["verdict"] != "GROUND_ONLY":
         print("  Generating report...")
         charts = {}
@@ -8409,6 +9704,7 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
     print(f"  ✓ {t('report.state_saved', path=sp)}")
 
     # ── Store in flight database ──
+    progression_text = ""
     if not args.no_db:
         try:
             try:
@@ -8426,16 +9722,19 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
             else:
                 print(f"  ✓ Database: already stored as flight #{flight_id} (skipped duplicate)")
 
-            # Show progression if we have history
+            # Capture progression for interactive menu
             if n_flights >= 2:
                 prog = db.get_progression(craft)
                 if prog["changes"]:
                     R, B, C, G, Y, RED, DIM = _colors()
                     trend_icon = {"improving": f"{G}↗ Improving", "degrading": f"{RED}↘ Degrading",
                                   "stable": f"{Y}→ Stable"}.get(prog["trend"], "")
-                    print(f"\n  {B}Progression:{R} {trend_icon}{R}")
+                    prog_lines = [f"\n  {B}Progression:{R} {trend_icon}{R}"]
                     for ch in prog["changes"]:
-                        print(f"    {ch}")
+                        prog_lines.append(f"    {ch}")
+                    progression_text = "\n".join(prog_lines)
+                    if not interactive:
+                        print(progression_text)
 
             db.close()
         except Exception as e:
@@ -8451,7 +9750,14 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
             f.write(md)
         print(f"  ✓ {t('report.markdown_saved', path=md_path)}")
 
-    print()
+    # ── Interactive menu (device mode only) ──
+    if interactive:
+        print()
+        _interactive_menu(plan, pid_results, noise_fp, motor_analysis, config, data,
+                          profile, config_review_text, progression_text,
+                          nav_perf=nav_perf, nav_results=nav_results)
+    else:
+        print()
 
 if __name__ == "__main__":
     main()

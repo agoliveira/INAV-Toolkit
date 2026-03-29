@@ -10,7 +10,7 @@ Usage:
 
     db = FlightDB("./inav_flights.db")
     flight_id = db.store_flight(plan, config, data, hover_osc, motor_analysis,
-                                pid_results, noise_results, diff_raw=None)
+                                pid_results, noise_results, config_raw=None)
 
     # Get progression for a craft
     history = db.get_craft_history("NAZGUL 10", limit=10)
@@ -21,7 +21,7 @@ import json
 import os
 from datetime import datetime
 
-VERSION = "2.19.0"
+VERSION = "2.20.0"
 
 SCHEMA_VERSION = 1
 
@@ -152,7 +152,7 @@ class FlightDB:
 
     def store_flight(self, plan, config, data, hover_osc=None,
                      motor_analysis=None, pid_results=None,
-                     noise_results=None, log_file=None, diff_raw=None):
+                     noise_results=None, log_file=None, config_raw=None):
         """Store a complete flight analysis.
 
         Args:
@@ -164,7 +164,7 @@ class FlightDB:
             pid_results: PID analysis results list
             noise_results: Noise analysis results list
             log_file: Path to the log file
-            diff_raw: Raw CLI diff output string
+            config_raw: Raw CLI dump/diff output string
 
         Returns:
             flight_id (int), or existing flight_id if duplicate detected
@@ -211,7 +211,7 @@ class FlightDB:
             scores.get("gyro_oscillation"),
             plan.get("verdict"),
             plan.get("verdict_text"),
-            diff_raw,
+            config_raw,  # stored as diff_raw column
         ))
         flight_id = cur.lastrowid
 
@@ -287,8 +287,8 @@ class FlightDB:
                 """, (flight_id, param, str(val)))
 
         # Store diff config if available
-        if diff_raw:
-            diff_config = parse_diff_output(diff_raw)
+        if config_raw:
+            diff_config = parse_diff_output(config_raw)
             for param, val in diff_config.items():
                 # Avoid duplicates with blackbox config
                 if param not in config_params:

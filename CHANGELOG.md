@@ -2,6 +2,74 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-03-29] - v2.20.0
+
+### Added
+- **Nav controller performance analysis**: New `analyze_nav_performance()` with five modules: deceleration overshoot detection (peak error, oscillation count, settling time), position hold quality (CEP, RMS, max drift, toilet-bowl detection via FFT), altitude hold quality (RMS error, Z oscillation detection), velocity controller saturation detection, and wind-vs-tuning correlation using INAV's wind estimates from S-frames.
+- **Interactive terminal menu**: `--device auto` now presents results in a 7-section interactive menu (PID Tuning, Noise Analysis, Hover & Stability, Nav Performance, Nav Sensors, Config Review, Flight History, CLI Commands). One-line status per section, drill into any section, score bar always visible. Sequential output preserved for piped/non-interactive use.
+- **Auto-cleanup**: After successful analysis, deletes raw download `.bbl`, all split `_logN.bbl` files, and stale files from previous sessions. `--archive` compresses the analyzed flight to `blackbox/archive/`. `--keep-logs` skips all cleanup.
+- **Auto-erase**: FC flash erased automatically after successful pipeline. `--no-erase` to opt out. Replaces the old `--erase` flag.
+- **Blackbox readiness checks**: Pre-download check from FC dump (blackbox feature, device, logging rate, GPS). Pre-analysis check from log headers (required fields per analysis mode).
+- **Download auto-retry**: If download fails after dump all CLI exit, automatically reconnects and retries once.
+- **Velocity controller field mappings**: `mcVelAxisP/I/D/FF/Out[0-2]`, `mcPosAxisP[2]`, `mcSurfaceP/I/D/Out`, `navTgtHdg` added to both native and CSV decoders.
+- **`--no-nav` flag**: Opt out of nav analysis even when nav fields are present.
+
+### Changed
+- **Unified analysis pipeline**: Removed the `--nav` gate. PID, noise, motor, nav performance, and nav sensor analysis all run automatically based on available data. `--nav` kept for backward compat but ignored.
+- **`--erase` replaced by `--no-erase`**: Flash erase is now the default after successful download + analysis.
+- **`dump all` handler**: Dedicated `get_dump_all()` with 3-second post-exit wait and 8 reconnection retries (vs 1s/5 for diff all).
+- **Download probe**: Serial buffer flush and MSP identity check before starting pipeline download.
+- **Banner always shows all info**: Frame size, props, profile, filters, PID values shown regardless of analysis mode.
+
+### Fixed
+- **Duplicate progression block**: Removed from `_process_multi_log()` — `_analyze_single_log()` already handles it.
+- **DB `config_raw` parameter**: `flight_db.py` renamed `diff_raw` to `config_raw` in Python API, SQL column kept for backward compat.
+- **Wind correlation NaN**: Guard for zero-variance wind data.
+- **RPM prediction indentation**: Fixed after removing `nav_mode` gate.
+
+## [2026-03-28] - v2.19.0
+
+### Added
+- **Auto-cleanup and auto-erase**: Post-analysis cleanup deletes raw downloads and splits, erases FC flash. New flags: `--archive` (compress to `blackbox/archive/`), `--keep-logs` (skip cleanup), `--no-erase` (skip flash erase).
+- **`dump all` config pull**: FC connection now pulls `dump all` instead of `diff all`. Complete parameter visibility including unchanged defaults. Saved as `{craft}_dump.txt`.
+- **`get_dump_all()` in MSP module**: 30s timeout, same reconnection handling as `get_diff_all()`.
+- **Frame-aware nav PID checks**: `check_navigation()` in param_analyzer validates position P, velocity P, and deceleration time against frame-specific thresholds (7/10/12/15"). Labels unchanged defaults with "(INAV default - tuned for 5-inch)".
+
+### Changed
+- **`--diff` renamed to `--config`**: Accepts either `dump all` or `diff all` files. Auto-discovery prefers `_dump.txt` over `_diff.txt`.
+- **Single config source**: `config_raw` replaces separate `diff_raw`/`dump_raw` throughout. One CLI pull, one reconnection.
+- **Config review uses dump**: `_print_config_review()` receives the full dump for complete parameter visibility.
+
+## [2026-03-28] - v2.18.0
+
+### Added
+- **Frame-aware nav PID checks**: `check_navigation()` now accepts `frame_inches` and validates position P, velocity P, and deceleration time against frame-specific thresholds. Uses INAV defaults as fallback for parameters not in `diff all`.
+- **`dump all` pull**: FC connection pulls `dump all` alongside `diff all` for complete parameter visibility.
+
+## [2026-03-28] - v2.17.0
+
+### Added
+- **FeedForward-aware PID recommendations**: `compute_recommended_pid()` now accepts `current_ff`. When FF>40 and overshoot is detected, attributes blame between FF and P (up to 60% on FF), recommends reducing FF before aggressive P cuts. Generates CLI commands for `mc_cd_roll`/`mc_cd_pitch`/`mc_cd_yaw`. Added FF to `INAV_CLI_MAP` and `INAV_GUI_MAP`.
+- **Wind buffeting detection**: New `wind_buffeting` cause in `detect_hover_oscillation()`. On 10"+ frames, low-frequency broadband gyro wobble (1-5Hz, low FFT peak prominence) is classified as wind rather than P oscillation. Generates an INFO note instead of a CRITICAL P-reduction action.
+- **Frame-size-scaled oscillation thresholds**: Hover oscillation severity thresholds scale by `frame_inches / 7.0`. A 10-inch at 7 deg/s RMS is "mild" (was "moderate").
+
+### Changed
+- **Phase lag guard on filter recommendations**: `compute_recommended_filter()` rejects LPF changes adding >5ms lag on 10"+ frames (>8ms on 7", >3ms on 15").
+- **Relative change cap**: LPF reduction capped at 30% per iteration on 10"+ frames (40% on 7", 50% on 5").
+- **Propwash guard**: Sub-80Hz noise on 10"+ recognized as aerodynamic, not fixable with LPF. Recommends notch/RPM filters instead.
+- **High-frequency noise guard**: If all noise peaks >2x current LPF cutoff, no LPF change recommended.
+- **Oscillation scoring**: Wind buffeting gets a soft penalty (floor at 60) instead of tanking the score.
+- **Narrative**: Filters wind buffeting from "CRITICAL oscillation" messaging.
+
+### Fixed
+- **`info_items` initialization**: Moved before oscillation section. Wind buffeting INFO notes no longer crash with `UnboundLocalError`.
+
+## [2026-03-27] - v2.16.1
+
+### Fixed
+- **PyPI version conflict**: v2.16.0 partially uploaded, bumped to v2.16.1 for clean publish.
+- **Version strings**: Fixed `pyproject.toml` and all module VERSION strings missed by initial `sed` pass.
+
 ## [2026-03-27] - v2.16.0
 
 ### Added

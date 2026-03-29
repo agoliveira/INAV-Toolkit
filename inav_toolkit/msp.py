@@ -33,7 +33,7 @@ try:
 except ImportError:
     serial = None  # Checked in open()
 
-VERSION = "2.19.0"
+VERSION = "2.20.0"
 
 # ─── MSP Command IDs ─────────────────────────────────────────────────────────
 
@@ -611,7 +611,34 @@ class INAVDevice:
         # Start with a single request to probe actual response size.
         # The FC returns MIN(requested, buffer_space, remaining_data).
         # Typical: 2048 on F4, 4096 on F7/H7 targets.
+
+        # Flush any stale data (critical after CLI mode reconnection —
+        # dump all leaves residual bytes that corrupt the first read)
+        time.sleep(0.1)
+        if self._ser.in_waiting:
+            self._ser.read(self._ser.in_waiting)
+        self._rxbuf = b""
+
+        # Verify connection is alive before starting download
+        try:
+            identity = self._request(MSP_FC_VARIANT, timeout=1.0)
+            if not identity:
+                raise Exception("no response")
+        except Exception:
+            # Connection stale — flush harder and retry
+            time.sleep(0.5)
+            if self._ser.in_waiting:
+                self._ser.read(self._ser.in_waiting)
+            self._rxbuf = b""
+
         probe = self.read_dataflash_chunk(0, 4096)
+        if probe is None:
+            # Retry with flush — likely stale data from CLI reconnection
+            time.sleep(0.3)
+            if self._ser.in_waiting:
+                self._ser.read(self._ser.in_waiting)
+            self._rxbuf = b""
+            probe = self.read_dataflash_chunk(0, 4096)
         if probe is None:
             # Fall back to smaller chunk
             probe = self.read_dataflash_chunk(0, 1024)
@@ -1009,12 +1036,68 @@ class INAVDevice:
         """Pull the full 'dump all' configuration from the FC.
 
         This is a complete backup of every parameter — much larger output
-        than 'diff all' which only shows non-defaults.
+        than 'diff all' which only shows non-defaults. The larger output
+        means the USB reset after CLI exit can take longer.
 
         Returns:
             Raw dump output string, or None on error
         """
-        return self.cli_command("dump all", timeout=timeout)
+        ser = self._ser
+
+        # Flush any pending data
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+
+        # Enter CLI mode
+        ser.write(b"#")
+        time.sleep(0.3)
+        if ser.in_waiting:
+            ser.read(ser.in_waiting)
+
+        # Send command
+        ser.write(b"dump all\n")
+        time.sleep(0.1)
+
+        # Read response — dump all is large, needs full timeout
+        buf = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if ser.in_waiting:
+                buf += ser.read(ser.in_waiting)
+                if buf.rstrip().endswith(b"#") or buf.endswith(b"# "):
+                    break
+            else:
+                time.sleep(0.01)
+
+        # Exit CLI mode — give extra time for large output to finish flushing
+        try:
+            ser.write(b"exit\n")
+        except OSError:
+            pass
+        time.sleep(3.0)  # longer wait for dump all (vs 1.0s for diff all)
+
+        self._recover_after_cli(max_retries=8)
+
+        if not buf:
+            return None
+
+        try:
+            text = buf.decode("ascii", errors="replace")
+        except Exception:
+            return None
+
+        lines = text.splitlines()
+        result_lines = []
+        for line in lines:
+            line = line.rstrip()
+            if line == "dump all":
+                continue
+            if line == "#" or line == "# ":
+                continue
+            result_lines.append(line)
+
+        result = "\n".join(result_lines).strip()
+        return result if result else None
 
     def cli_batch(self, commands, timeout=5.0, save=True):
         """Send multiple CLI commands in a single CLI session.
