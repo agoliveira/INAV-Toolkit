@@ -2,6 +2,27 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-03-29] - v2.3.0
+
+### Added
+- **Tabbed HTML report**: Report restructured into 7 tabs — Overview (score, actions, CLI commands, config, pre-flight warnings), PID Tuning, Noise & Filters, Motors, Nav Performance, Nav Sensors, What-If, History. Sticky header with score, sticky tab bar. Nav and History tabs auto-hidden when no data.
+- **What-If simulation tab**: Interactive PID sliders (P/I/D/FF per axis) with three-column layout (Current / Recommended / Your Scenario). Predicted overshoot and delay update live using gain/damping model fitted to actual measurements. Gyro spectrum canvas with LPF cutoff slider showing raw vs filtered spectrum overlay with phase lag readout. "Copy CLI Commands" button generates `set` commands from slider positions.
+- **Flight-to-flight diff**: New `FlightDB.get_flight_diff()` compares current flight with previous — score delta, per-axis metric changes (overshoot, delay, hover RMS), config changes with percentages. `_generate_diff_verdict()` correlates config changes with metric movements (e.g. "P increase caused more overshoot; LPF change let more noise through"). Terminal section `[8] vs Previous` in interactive menu. History tab in HTML report with diff table, score progression chart, and flight table.
+- **Pre-flight safety checklist**: `preflight_checklist()` runs automatically during `--device auto` after dump pull, before download. Checks: disabled safety beepers (BAT_CRIT_LOW, RX_LOST, HW_FAILURE), failsafe set to DROP, failsafe throttle too low with SET-THR, battery voltage limits, legacy motor protocol, GPS arming safety disabled, RTH altitude too low, D-term LPF too high for frame, logging rate. Stern warnings with CLI fix commands, no blocking. Also shown in HTML report Overview tab.
+- **Trend sparklines**: ASCII sparkline renderer using Unicode block characters (`▁▂▃▄▅▆▇█`). Flight History terminal section shows score/noise/PID/motor sparklines, flight table with scores, and progression changes. Menu status line shows inline sparkline: `7 flights ▃▅▇█▇▅`.
+- **Config backup vault**: Every `dump all` from `--device auto` auto-archived to `blackbox/config_vault/{craft}_{timestamp}.txt`. New `--config-history` lists archived configs (date, settings count, age). New `--config-diff N M` compares any two archived configs showing changed/added/removed parameters with percentage deltas.
+- **Browser auto-open**: HTML report opens in default browser after generation. `--no-browser` flag to suppress.
+- **Yaw FeedForward in setup profiles**: `mc_cd_yaw` added to all five frame profiles — 5"/7": 60, 10": 45, 12": 35, 15": 25.
+- **Nav Performance HTML section**: Deceleration overshoot table, position hold metrics (CEP, toilet bowl), altitude hold quality, nav PID recommendations rendered in report Nav Performance tab.
+
+### Changed
+- **Report header**: Shows firmware revision (e.g. "INAV 9.0.1") instead of blackbox product string ("Cleanflight"). Duration and sample rate labeled. Score displayed in header corner.
+- **Interactive menu**: 8 sections (added `[8] vs Previous`). Section 7 (Flight History) now shows sparklines and flight table instead of plain text progression.
+- **Sequential output**: Flight history uses enhanced `_print_section_history()` with sparklines in non-interactive mode too.
+
+### Fixed
+- **Firmware type in HTML**: Used `firmware_revision` instead of `firmware_type` which inherited the "Cleanflight" product string from blackbox headers.
+
 ## [2026-03-29] - v2.20.0
 
 ### Added
