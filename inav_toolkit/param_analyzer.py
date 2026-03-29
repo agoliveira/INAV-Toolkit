@@ -21,7 +21,7 @@ import sys
 import textwrap
 from datetime import datetime
 
-VERSION = "2.20.1"
+VERSION = "2.21.0"
 
 
 def _enable_ansi_colors():
@@ -140,6 +140,7 @@ FRAME_PROFILES = {
             "mc_p_roll": 40, "mc_i_roll": 60, "mc_d_roll": 26,
             "mc_cd_roll": 60,
             "mc_p_yaw": 45, "mc_i_yaw": 80, "mc_d_yaw": 0,
+            "mc_cd_yaw": 60,
         },
         "filters": {
             "gyro_main_lpf_hz": 110,
@@ -188,6 +189,7 @@ FRAME_PROFILES = {
             "mc_p_roll": 40, "mc_i_roll": 60, "mc_d_roll": 23,
             "mc_cd_roll": 60,
             "mc_p_yaw": 45, "mc_i_yaw": 80, "mc_d_yaw": 0,
+            "mc_cd_yaw": 60,
         },
         "filters": {
             "gyro_main_lpf_hz": 90,
@@ -238,6 +240,7 @@ FRAME_PROFILES = {
             "mc_p_roll": 38, "mc_i_roll": 55, "mc_d_roll": 28,
             "mc_cd_roll": 40,
             "mc_p_yaw": 40, "mc_i_yaw": 60, "mc_d_yaw": 0,
+            "mc_cd_yaw": 45,
         },
         "filters": {
             "gyro_main_lpf_hz": 70,
@@ -290,6 +293,7 @@ FRAME_PROFILES = {
             "mc_p_roll": 30, "mc_i_roll": 45, "mc_d_roll": 23,
             "mc_cd_roll": 30,
             "mc_p_yaw": 35, "mc_i_yaw": 50, "mc_d_yaw": 0,
+            "mc_cd_yaw": 35,
         },
         "filters": {
             "gyro_main_lpf_hz": 55,
@@ -342,6 +346,7 @@ FRAME_PROFILES = {
             "mc_p_roll": 26, "mc_i_roll": 40, "mc_d_roll": 20,
             "mc_cd_roll": 20,
             "mc_p_yaw": 30, "mc_i_yaw": 40, "mc_d_yaw": 0,
+            "mc_cd_yaw": 25,
         },
         "filters": {
             "gyro_main_lpf_hz": 45,
