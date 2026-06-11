@@ -11,7 +11,6 @@ Usage:
     inav-toolkit --device /dev/ttyACM0    # Specify port
 """
 
-import glob
 import json
 import os
 import re
@@ -22,7 +21,7 @@ import time
 try:
     from inav_toolkit import __version__ as VERSION
 except ImportError:
-    VERSION = "2.22.0"
+    VERSION = "2.22.1"
 
 # Module paths for subprocess invocation (package-aware)
 ANALYZER_MODULE = "inav_toolkit.blackbox_analyzer"

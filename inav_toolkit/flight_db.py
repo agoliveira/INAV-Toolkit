@@ -17,11 +17,9 @@ Usage:
 """
 
 import sqlite3
-import json
-import os
 from datetime import datetime
 
-VERSION = "2.22.0"
+VERSION = "2.22.1"
 
 SCHEMA_VERSION = 1
 

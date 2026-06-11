@@ -2,6 +2,27 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-06-11] - v2.22.1
+
+### Fixed
+- **Baro/throttle correlation never ran**: `sosfilt` was called but only `sosfiltfilt` was imported — a `NameError` silently swallowed by a broad `except` meant the nav-sensor baro analysis always skipped throttle correlation. Import fixed.
+- **Duplicate dict keys in `INAV_PARAM_MAP`**: `rollPID`/`pitchPID`/`yawPID` were defined twice; the first mapping was silently overwritten, which also made the "Betaflight/older format" PID fallback parser unreachable. Duplicates and the dead fallback removed.
+- **MSP receive buffer growth**: valid frames with a non-matching command were skipped but never consumed from `_rxbuf`, so unsolicited frames accumulated forever during long sessions. Non-matching valid frames are now consumed.
+- **`locale.getdefaultlocale()` deprecation** (removal in Python 3.15): replaced with `locale.getlocale()` in i18n auto-detection.
+- **License metadata**: `pyproject.toml` and README claimed MIT while the LICENSE file is GPL-3.0. All metadata now declares GPL-3.0.
+
+### Changed
+- Minimum Python raised to 3.9 (3.8 is EOL); CI matrix updated.
+- CI now runs a `ruff` lint gate on critical correctness rules (undefined names, redefinitions, suspicious comparisons) — the class of bug that hid the `sosfilt` failure.
+- `publish.yml` gained a version guard: publishing fails if the package version is not strictly greater than the highest version on PyPI (prevents a repeat of the 2.4.x regression).
+- New test asserting locale catalogs (en/pt_BR/es) stay key-synchronized.
+- Removed unused imports; version strings in module docstrings corrected (still read v2.4.1).
+
+## [2026-03-29] - v2.22.0
+
+### Changed
+- **Version realignment — no functional changes.** A release sequence restarted numbering at 2.3.0/2.4.x while building on top of v2.21.0. Since PyPI and Git sort by semantic version, those lower numbers sorted below 2.21.0, so `pip install` kept serving 2.21.0. This release renumbers the same code to continue correctly from v2.21.0. The v2.3.0/v2.4.x entries below describe work done *after* v2.21.0.
+
 ## [2026-03-29] - v2.3.0
 
 ### Added

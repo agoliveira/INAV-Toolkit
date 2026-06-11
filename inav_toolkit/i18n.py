@@ -103,10 +103,10 @@ def detect_locale():
 
     # System locale
     try:
-        sys_locale = _locale_mod.getdefaultlocale()[0] or ""
+        sys_locale = _locale_mod.getlocale()[0] or ""
         if sys_locale:
             return sys_locale.replace("-", "_").split(".")[0]
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         pass
 
     # Fallback to LANG env var directly

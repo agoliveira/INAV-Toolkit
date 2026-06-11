@@ -33,7 +33,7 @@ try:
 except ImportError:
     serial = None  # Checked in open()
 
-VERSION = "2.22.0"
+VERSION = "2.22.1"
 
 # ─── MSP Command IDs ─────────────────────────────────────────────────────────
 
@@ -343,8 +343,14 @@ class INAVDevice:
                         # Consume this frame from the buffer
                         self._rxbuf = self._rxbuf[idx + frame_len:]
                         return result
+                    # Valid frame but not the cmd we want — consume it
+                    # anyway so unsolicited frames can't accumulate in
+                    # the buffer forever (unbounded growth + O(n) rescans).
+                    self._rxbuf = self._rxbuf[:idx] + self._rxbuf[idx + frame_len:]
+                    search_start = idx
+                    continue
 
-                # CRC mismatch or wrong cmd - skip this $X marker
+                # CRC mismatch - skip this $X marker
                 search_start = idx + 1
 
             # If buffer has partial data but no new bytes arrived from

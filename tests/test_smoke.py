@@ -1177,6 +1177,31 @@ class TestI18n:
         assert "pt_BR" in locales
         assert "es" in locales
 
+    def test_locale_catalogs_in_sync(self):
+        """All locale catalogs must have exactly the same keys as en.json.
+
+        A missing key silently falls back to English, so drift is
+        invisible at runtime — this test makes it visible.
+        """
+        import json
+        import os
+        import inav_toolkit
+        locales_dir = os.path.join(os.path.dirname(inav_toolkit.__file__), "locales")
+        catalogs = {}
+        for fname in os.listdir(locales_dir):
+            if fname.endswith(".json"):
+                with open(os.path.join(locales_dir, fname), encoding="utf-8") as f:
+                    catalogs[fname[:-5]] = set(k for k in json.load(f) if k != "_meta")
+        assert "en" in catalogs
+        en_keys = catalogs["en"]
+        for loc, keys in catalogs.items():
+            if loc == "en":
+                continue
+            missing = en_keys - keys
+            extra = keys - en_keys
+            assert not missing, f"{loc} missing keys: {sorted(missing)[:10]}"
+            assert not extra, f"{loc} has extra keys: {sorted(extra)[:10]}"
+
     def test_quality_messages_translated(self):
         """Test that quality scorer messages use t() and translate."""
         from inav_toolkit.blackbox_analyzer import assess_log_quality

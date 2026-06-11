@@ -24,7 +24,7 @@ Or on Debian/Ubuntu, system packages:
 ```bash
 sudo apt install python3-numpy python3-scipy python3-serial
 ```
-Python 3.8+. `pyserial` only needed for direct FC connection.
+Python 3.9+. `pyserial` only needed for direct FC connection.
 
 > **Note:** If using a venv, activate it (`source .venv/bin/activate`) before running any commands below.
 
@@ -304,7 +304,7 @@ INAV-Toolkit/
 ├── tests/
 ├── README.md
 ├── CHANGELOG.md
-├── LICENSE                      # MIT
+├── LICENSE                      # GPL-3.0
 └── requirements.txt
 ```
 
@@ -318,11 +318,11 @@ This is an active project. Planned: autonomous tuning loop (Pi Zero 2W or ESP32 
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+GPL-3.0 License. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
 - The INAV development team and community
 - QuadMeUp (Pawel Spychalski) for filter and RPM analysis research
 - The INAV Fixed Wing Group for modes documentation
-- UAV Tech for the spark that gave me the idea to create this
+- [UAV Tech](https://www.youtube.com/@uavtech) for the spark that gave me the idea to create this

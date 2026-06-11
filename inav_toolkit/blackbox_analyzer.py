@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.4.1
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.22.1
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.22.0"
+REPORT_VERSION = "2.22.1"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -560,7 +560,6 @@ FILTER_ADJUST_FACTOR = 0.3
 # ─── INAV Parameter Extraction ───────────────────────────────────────────────
 
 INAV_PARAM_MAP = {
-    "rollPID": "pid_roll", "pitchPID": "pid_pitch", "yawPID": "pid_yaw",
     "roll_p": "roll_p", "roll_i": "roll_i", "roll_d": "roll_d",
     "pitch_p": "pitch_p", "pitch_i": "pitch_i", "pitch_d": "pitch_d",
     "yaw_p": "yaw_p", "yaw_i": "yaw_i", "yaw_d": "yaw_d",
@@ -643,19 +642,6 @@ def extract_fc_config(raw_params):
                     config[f"{axis}_d"] = int(parts[2].strip())
                 if len(parts) >= 4:
                     config[f"{axis}_ff"] = int(parts[3].strip())
-            except (ValueError, IndexError):
-                pass
-
-    # Also parse "pid_roll" style keys (Betaflight/older format)
-    for axis in ["roll", "pitch", "yaw"]:
-        pid_key = f"pid_{axis}"
-        if pid_key in config and f"{axis}_p" not in config:
-            try:
-                parts = config[pid_key].split(",")
-                if len(parts) >= 3:
-                    config[f"{axis}_p"] = int(parts[0].strip())
-                    config[f"{axis}_i"] = int(parts[1].strip())
-                    config[f"{axis}_d"] = int(parts[2].strip())
             except (ValueError, IndexError):
                 pass
 
@@ -3825,7 +3811,7 @@ def analyze_baro_quality(data, sr):
     # ─── Detrend altitude (remove intentional climbs/descents) ───
     # Use a very low-pass filter to get the trend, then subtract.
     # sosfiltfilt is zero-phase (no startup transient).
-    from scipy.signal import butter, sosfiltfilt
+    from scipy.signal import butter, sosfilt, sosfiltfilt
     try:
         if sr > 2:
             sos = butter(2, 0.5 / (sr / 2), btype='low', output='sos')
@@ -10156,7 +10142,7 @@ def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_fil
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.4.1 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.22.1 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,

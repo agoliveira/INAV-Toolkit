@@ -7,12 +7,27 @@ on:
     branches: [main]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ruff (critical correctness rules)
+        run: |
+          pip install ruff
+          # F821 undefined name, F811 redefinition, F601/F602 suspicious
+          # comparisons, F632 is-comparison with literal, F702 stray continue.
+          # These are the bug classes that hid the sosfilt NameError (v2.22.1).
+          ruff check --select F821,F811,F601,F602,F632,F702 inav_toolkit/ tests/
+
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4

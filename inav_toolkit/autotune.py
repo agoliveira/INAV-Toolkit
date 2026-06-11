@@ -57,7 +57,7 @@ except ImportError:
         get_frame_profile, parse_csv_log, analyze_noise, analyze_pid_response,
         analyze_motors, analyze_dterm_noise, generate_action_plan,
         analyze_motor_response, estimate_rpm_range, estimate_prop_harmonics,
-        estimate_total_phase_lag, config_has_pid, config_has_filters,
+        estimate_total_phase_lag, config_has_filters,
         AXIS_NAMES, REPORT_VERSION,
     )
 
