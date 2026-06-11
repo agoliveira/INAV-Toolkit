@@ -102,6 +102,15 @@ python3 -m inav_toolkit.blackbox_analyzer --device auto --no-browser
 # Skip nav analysis even if nav fields are present
 python3 -m inav_toolkit.blackbox_analyzer flight.bbl --no-nav
 
+# Crash forensics on the final seconds of a log
+python3 -m inav_toolkit.blackbox_analyzer crash.bbl --postmortem
+
+# Anonymize a log for sharing (GPS -> meters-from-home, craft name stripped)
+python3 -m inav_toolkit.blackbox_analyzer flight.bbl --share
+
+# Range projection with battery capacity
+python3 -m inav_toolkit.blackbox_analyzer flight.bbl --capacity 5000
+
 # Flight progression history
 python3 -m inav_toolkit.blackbox_analyzer flight.bbl --history
 

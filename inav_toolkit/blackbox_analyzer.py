@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-INAV Blackbox Analyzer - Multirotor Tuning Tool v2.22.1
+INAV Blackbox Analyzer - Multirotor Tuning Tool v2.23.0
 =====================================================
 Analyzes INAV blackbox logs and tells you EXACTLY what to change.
 
@@ -104,7 +104,7 @@ def _disable_colors():
 AXIS_NAMES = ["Roll", "Pitch", "Yaw"]
 AXIS_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D"]
 MOTOR_COLORS = ["#FF6B6B", "#4ECDC4", "#FFD93D", "#A78BFA"]
-REPORT_VERSION = "2.22.1"
+REPORT_VERSION = "2.23.0"
 
 # ─── Frame and Prop Profiles ─────────────────────────────────────────────────
 # Two separate concerns:
@@ -9227,7 +9227,7 @@ document.querySelectorAll('.tab').forEach(tab => {{
 # ─── Markdown Report ─────────────────────────────────────────────────────────
 
 def generate_markdown_report(plan, config, data, noise_results, pid_results,
-                             motor_analysis, profile, quality=None):
+                             motor_analysis, profile, quality=None, range_results=None):
     """Generate a Markdown report suitable for pasting into forums/Discord.
 
     Returns the markdown string.
@@ -9353,6 +9353,10 @@ def generate_markdown_report(plan, config, data, noise_results, pid_results,
         lines.append(f"")
 
     lines.append(f"---")
+    if range_results:
+        from inav_toolkit.flight_tools import markdown_range_section
+        lines.extend(markdown_range_section(range_results))
+        lines.append("---")
     lines.append(f"*{t('report.generated_by')} [INAV Toolkit v{REPORT_VERSION}]"
                 f"(https://github.com/agoliveira/INAV-Toolkit)*")
 
@@ -10142,7 +10146,7 @@ def _post_analysis_cleanup(blackbox_dir, raw_download, split_files, analyzed_fil
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.22.1 - Prescriptive Tuning",
+    parser = argparse.ArgumentParser(description="INAV Blackbox Analyzer v2.23.0 - Prescriptive Tuning",
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"inav-analyze {REPORT_VERSION}")
     parser.add_argument("logfile", nargs="?", default=None,
@@ -10226,6 +10230,19 @@ def main():
     parser.add_argument("--report", metavar="FORMAT", choices=["md", "markdown"],
                         help="Generate Markdown report alongside HTML. "
                              "Usage: inav-analyze flight.bbl --report md")
+    parser.add_argument("--share", action="store_true",
+                        help="Write an anonymized CSV (GPS converted to meters-from-home, "
+                             "craft name stripped) and exit. Safe to post on forums/Discord.")
+    parser.add_argument("--keep-name", action="store_true",
+                        help="With --share: keep the craft name in the output.")
+    parser.add_argument("--capacity", type=int, metavar="MAH",
+                        help="Battery capacity in mAh for range projection "
+                             "(otherwise read from config dump when available).")
+    parser.add_argument("--postmortem", action="store_true",
+                        help="Crash forensics: analyze the final seconds of the log for "
+                             "failure signatures (motor/ESC, voltage, RX loss, impact) and exit.")
+    parser.add_argument("--postmortem-window", type=float, default=10.0, metavar="S",
+                        help="Seconds of log tail to analyze with --postmortem (default 10).")
     parser.add_argument("--lang", metavar="LANG",
                         help="Language for output (en, pt_BR, es). "
                              "Auto-detects from INAV_LANG env var or system locale.")
@@ -10518,6 +10535,45 @@ def main():
         quality = assess_log_quality(data, config, logfile)
         print_log_quality(quality, verbose=True)
         sys.exit(0 if quality["usable"] else 1)
+
+    # ── Anonymize mode: write shareable CSV ──
+    if getattr(args, 'share', False):
+        if not logfile:
+            parser.error("logfile required for --share")
+        from inav_toolkit.flight_tools import anonymize_log, print_anonymize_summary
+        raw_params = parse_headers_from_bbl(logfile)
+        config = extract_fc_config(raw_params)
+        ext = os.path.splitext(logfile)[1].lower()
+        if ext in (".bbl", ".bfl", ".bbs"):
+            data = decode_blackbox_native(logfile, raw_params, quiet=True)
+        else:
+            data = parse_csv_log(logfile)
+        out = os.path.splitext(logfile)[0] + "_shared.csv"
+        summary = anonymize_log(data, out, keep_name=args.keep_name,
+                                craft_name=config.get("craft_name", ""))
+        print_anonymize_summary(summary)
+        sys.exit(0)
+
+    # ── Postmortem mode: crash forensics on the log tail ──
+    if getattr(args, 'postmortem', False):
+        if not logfile:
+            parser.error("logfile required for --postmortem")
+        from inav_toolkit.flight_tools import analyze_postmortem, print_postmortem_report
+        raw_params = parse_headers_from_bbl(logfile)
+        config = extract_fc_config(raw_params)
+        ext = os.path.splitext(logfile)[1].lower()
+        if ext in (".bbl", ".bfl", ".bbs"):
+            data = decode_blackbox_native(logfile, raw_params, quiet=True)
+        else:
+            data = parse_csv_log(logfile)
+        sr = data.get("sample_rate", 0) or 0
+        pm = analyze_postmortem(data, sr, config, window_s=args.postmortem_window) if sr else None
+        if pm is None:
+            print("\n  Log too short or sample rate unknown — cannot run postmortem.\n")
+            sys.exit(1)
+        _R, _B, _C, _G, _Y, _RED, _DIM = _colors()
+        print_postmortem_report(pm, colors=(_R, _B, _G, _Y, _RED, _DIM))
+        sys.exit(0)
 
     # ── Multi-log detection and splitting ──
     n_logs = count_blackbox_logs(logfile)
@@ -12319,6 +12375,13 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
 
     # ── Power/efficiency analysis ──
     power_results = analyze_power(data, sr, config)
+    try:
+        from inav_toolkit.flight_tools import (analyze_range, print_range_report,
+                                               detect_abrupt_end)
+        range_results = analyze_range(data, sr, config,
+                                      capacity_mah=getattr(args, 'capacity', None))
+    except Exception:
+        range_results = None
 
     # ── Propwash scoring ──
     propwash_results = analyze_propwash(data, sr, profile)
@@ -12399,6 +12462,11 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
                 _print_section_propwash(propwash_results)
             if power_results and power_results.get("avg_cell_v") is not None:
                 _print_section_power(power_results)
+            if range_results:
+                print_range_report(range_results)
+            if detect_abrupt_end(data, sr) and not getattr(args, 'postmortem', False):
+                R3, B3, C3, G3, Y3, RED3, DIM3 = _colors()
+                print(f"\n  {Y3}⚠ {t('pm.suggest')}{R3}")
             if recipe:
                 _print_section_recipe(recipe)
             if failsafe_results and failsafe_results.get("events"):
@@ -12514,7 +12582,8 @@ def _analyze_single_log(logfile, args, config_raw=None, summary_only=False):
     # ── Markdown report ──
     if getattr(args, 'report', None) in ('md', 'markdown') and not summary_only:
         md = generate_markdown_report(plan, config, data, noise_results, pid_results,
-                                      motor_analysis, profile, quality)
+                                      motor_analysis, profile, quality,
+                                      range_results=range_results)
         md_name = os.path.splitext(os.path.basename(logfile))[0] + "_report.md"
         md_path = os.path.join(os.path.dirname(logfile) or ".", md_name)
         with open(md_path, "w", encoding="utf-8") as f:

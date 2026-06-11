@@ -2,6 +2,18 @@
 
 All notable changes to INAV Toolkit.
 
+## [2026-06-11] - v2.23.0
+
+### Added
+- **Crash forensics (`--postmortem`)**: analyzes the final seconds of a log for failure signatures — motor/ESC failure (one output flat while others compensate), battery voltage collapse, RC link loss/failsafe, impact (gyro saturation at log end), and nav estimator divergence. Ranked, evidence-based verdicts. `--postmortem-window N` tunes the analysis window (default 10s). Normal analysis now prints a one-line suggestion when a log appears to end mid-flight. Verdicts reflect the last recorded data; logs often end at power loss.
+- **Log anonymizer (`--share`)**: writes a shareable CSV with GPS converted to meters-from-home, home location and absolute altitude stripped, craft name removed (`--keep-name` to keep it). Flight dynamics and tune data fully preserved; output round-trips through the analyzer. Real coordinates never leave your machine.
+- **Power & Range report**: detects cruise segments (>3 m/s sustained), reports mAh/km and Wh/km, per-segment efficiency spread, and projected range from battery capacity (`--capacity MAH` or read from config dump) with a 30%-reserve figure. Appears in the terminal report and `--report md` when GPS + current data are present.
+- New module `inav_toolkit/flight_tools.py`; 10 new tests (anonymizer round-trip, range math, all postmortem detectors). 22 new i18n keys in en/pt_BR/es.
+
+### Notes
+- Range projection is extrapolated from observed cruise — no RTH or headwind margin.
+- The design's upwind/downwind efficiency split was dropped: no wind-vector estimate exists in the codebase (only buffeting heuristics); per-segment spread is reported instead.
+
 ## [2026-06-11] - v2.22.1
 
 ### Fixed

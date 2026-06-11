@@ -2,10 +2,11 @@
   "_meta": {
     "locale": "pt_BR",
     "name": "Português (Brasil)",
-    "authors": ["INAV Toolkit contributors"],
+    "authors": [
+      "INAV Toolkit contributors"
+    ],
     "note": "Termos técnicos (PID, Hz, Roll/Pitch/Yaw, LPF, comandos CLI) permanecem em inglês."
   },
-
   "banner.analyzer": "INAV Analisador de Blackbox",
   "banner.nav_analyzer": "INAV Analisador de Navegação",
   "banner.replay": "INAV Replay de Voo",
@@ -21,7 +22,6 @@
   "banner.motors": "Motores",
   "banner.profile": "Perfil",
   "banner.filters": "Filtros",
-
   "quality.title": "Qualidade do Log",
   "quality.good": "BOM",
   "quality.marginal": "MARGINAL",
@@ -46,7 +46,6 @@
   "quality.corrupt_warn": "{pct}% dos frames tiveram erros de decodificação",
   "quality.nan_fail": "Gyro {axis} tem {pct}% valores NaN — dados em grande parte ausentes",
   "quality.nan_warn": "Gyro {axis} tem {pct}% valores NaN — algumas lacunas nos dados",
-
   "verdict.dialed_in": "Tune está perfeito. Está pronto — vai voar!",
   "verdict.nearly_there": "Quase lá — apenas ajustes menores restam.",
   "verdict.getting_better": "Progredindo. Aplique as mudanças abaixo e voe novamente.",
@@ -55,7 +54,6 @@
   "verdict.need_data_good": "Ruído e motores parecem bons, mas o desempenho PID não pôde ser medido. Voe com movimentos de stick (rolls, pitches, sweeps de yaw) para dados de tune.",
   "verdict.need_data_bad": "Desempenho PID não pôde ser medido. Voe com movimentos deliberados de stick para dados de tune.",
   "verdict.idle": "Motores ficaram em idle durante todo o log — o quad estava armado mas não voou. Faça hover por 15+ segundos com movimentos suaves de stick para análise significativa.",
-
   "section.scores": "Pontuações",
   "section.overall": "Geral",
   "section.noise": "Ruído",
@@ -76,7 +74,6 @@
   "section.pid_compare": "Comparação de Resposta PID",
   "section.flight_modes": "Modos de Voo",
   "section.spectrogram": "Espectrograma de Ruído (Cascata)",
-
   "compare.improved": "Tune melhorou",
   "compare.degraded": "Tune piorou",
   "compare.same": "Praticamente igual",
@@ -94,7 +91,6 @@
   "compare.metric": "Métrica",
   "compare.spread": "Dispersão",
   "compare.peak_sat": "Saturação Pico",
-
   "replay.synced_zoom": "zoom/pan sincronizado",
   "replay.flight_mode_bar": "barra de modos de voo",
   "replay.webgl": "renderização WebGL",
@@ -103,13 +99,11 @@
   "replay.no_mode_data": "Sem dados de modo de voo (S-frames)",
   "replay.computing_spectrogram": "Calculando espectrograma...",
   "replay.generating": "Gerando replay Plotly.js (WebGL)...",
-
   "report.generated_by": "Gerado por",
   "report.state_saved": "Estado: {path} (use --previous na próxima execução)",
   "report.html_saved": "Relatório: {path}",
   "report.markdown_saved": "Markdown: {path} (cole em fórum/Discord)",
   "report.test_with_props_off": "Teste as mudanças com hélices removidas primeiro",
-
   "label.setting": "Configuração",
   "label.current": "Atual",
   "label.recommended": "Recomendado",
@@ -126,7 +120,6 @@
   "label.confidence": "confiança",
   "label.score": "Pontuação",
   "label.date": "Data",
-
   "terminal.no_changes": "Nenhuma mudança necessária — vai voar!",
   "terminal.need_stick_data": "Necessário dados de voo com movimentos de stick para medir resposta PID.",
   "terminal.progression": "Progressão",
@@ -141,13 +134,11 @@
   "terminal.nav_data": "Dados de navegação",
   "terminal.no_nav_fields": "Aviso: Nenhum campo de navegação encontrado neste log",
   "terminal.no_pid_values": "Aviso: Sem valores PID nos cabeçalhos — use .bbl para recomendações exatas",
-
   "severity.critical": "CRÍTICO",
   "severity.important": "IMPORTANTE",
   "severity.moderate": "MODERADO",
   "severity.minor": "MENOR",
   "severity.info": "INFO",
-
   "finding.osc_p_too_high": "Oscilação em hover — reduza P de {current} para {new}",
   "finding.osc_pd_interaction": "Oscilação: interação P/D — reduza ambos P e D",
   "finding.osc_d_noise": "Amplificação de ruído no D-term causando oscilação",
@@ -158,7 +149,6 @@
   "finding.enable_rpm": "Filtro RPM rastreia ruído dos motores precisamente — requer telemetria ESC ou DSHOT bidirecional",
   "finding.gyro_lpf_adjust": "Filtro lowpass do giroscópio: {direction} de {current}Hz para {new}Hz",
   "finding.dterm_lpf_adjust": "Filtro lowpass do D-term: Reduzir de {current}Hz para {new}Hz",
-
   "sanity.title": "INAV Verificação Pré-Voo",
   "sanity.go": "APROVADO PARA VOO",
   "sanity.no_go": "REPROVADO — Corrija os problemas antes de voar",
@@ -179,9 +169,30 @@
   "sanity.category.vtol": "Configuração VTOL",
   "sanity.category.board": "Configuração de Placa e Portas",
   "sanity.category.misc": "Diversos",
-
   "error.file_not_found": "Arquivo não encontrado: {path}",
   "error.not_inav": "Não é um FC INAV (recebido: {variant})",
   "error.no_logfile": "Nenhum arquivo de log especificado. Use: inav-analyze voo.bbl",
-  "error.compare_not_found": "Arquivo de comparação não encontrado: {path}"
+  "error.compare_not_found": "Arquivo de comparação não encontrado: {path}",
+  "share.title": "Anonimizador de Log",
+  "share.stripped": "Removido",
+  "share.nothing_to_strip": "Nenhum dado identificável encontrado (sem GPS, sem nome da aeronave)",
+  "share.note": "Seguro para compartilhar — dinâmica de voo e dados de tune preservados.",
+  "range.title": "Potência e Alcance",
+  "range.cruise": "Cruzeiro",
+  "range.efficiency": "Eficiência",
+  "range.spread": "variação entre segmentos",
+  "range.projected": "Alcance projetado @ {cap}mAh",
+  "range.with_reserve": "com 30% de reserva",
+  "range.caveat": "Extrapolado do cruzeiro observado — sem margem para RTH/vento contrário.",
+  "pm.title": "Postmortem — Análise Forense de Queda",
+  "pm.window": "Analisando os últimos {w}s do log (termina em t={end}s)",
+  "pm.abrupt": "Log termina abruptamente em pleno voo — momentos finais podem estar ausentes",
+  "pm.clean": "Nenhuma assinatura de falha detectada na janela final",
+  "pm.motor_failure": "Falha de motor/ESC (M{motor})",
+  "pm.voltage_collapse": "Colapso de tensão da bateria",
+  "pm.rx_loss": "Perda de link RC / failsafe",
+  "pm.impact": "Impacto (saturação do gyro no fim do log)",
+  "pm.nav_divergence": "Divergência do estimador de navegação",
+  "pm.disclaimer": "Veredictos refletem os últimos dados gravados; logs frequentemente terminam na perda de energia.",
+  "pm.suggest": "O log parece terminar em pleno voo. Execute com --postmortem para análise forense."
 }

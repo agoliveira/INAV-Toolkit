@@ -19,7 +19,7 @@ Usage:
 import sqlite3
 from datetime import datetime
 
-VERSION = "2.22.1"
+VERSION = "2.23.0"
 
 SCHEMA_VERSION = 1
 

@@ -1244,6 +1244,127 @@ class TestI18n:
         set_locale("en")
 
 
+class TestFlightTools:
+    """Tests for anonymizer, range analysis, and postmortem forensics."""
+
+    def _base_data(self, n=3000, sr=100.0):
+        rng = np.random.default_rng(42)
+        t = np.arange(n) / sr
+        data = {
+            "n_rows": n, "sample_rate": sr, "time_s": t,
+            "gyro_roll": rng.normal(0, 5, n), "gyro_pitch": rng.normal(0, 5, n),
+            "gyro_yaw": rng.normal(0, 5, n),
+            "motor0": 1500 + rng.normal(0, 60, n), "motor1": 1500 + rng.normal(0, 60, n),
+            "motor2": 1500 + rng.normal(0, 60, n), "motor3": 1500 + rng.normal(0, 60, n),
+            "throttle": np.full(n, 1500.0),
+            "rc_roll": 1500 + rng.normal(0, 30, n), "rc_pitch": 1500 + rng.normal(0, 30, n),
+            "rc_yaw": 1500 + rng.normal(0, 30, n),
+            "vbat": np.full(n, 1660.0),                 # 16.6V (4S), 0.01V units
+            "amperage": np.full(n, 1000.0),             # 10A, 0.01A units
+            "_slow_frames": [], "_gps_frames": [],
+        }
+        return data
+
+    def _add_gps(self, data, sr, speed_ms=10.0, hz=1.0):
+        """Northbound cruise at speed_ms; one fix per 1/hz seconds."""
+        n = data["n_rows"]
+        frames = []
+        lat0, lon0 = 47.0, 8.0
+        step = int(sr / hz)
+        for i in range(0, n, step):
+            t = i / sr
+            lat = lat0 + (speed_ms * t) / 111320.0
+            frames.append((i, {"GPS_coord[0]": lat * 1e7, "GPS_coord[1]": lon0 * 1e7,
+                               "GPS_speed": speed_ms * 100, "GPS_altitude": 120.0,
+                               "GPS_numSat": 14}))
+        data["_gps_frames"] = frames
+        return data
+
+    def test_anonymize_strips_gps_and_name(self, tmp_path):
+        from inav_toolkit.flight_tools import anonymize_log
+        data = self._add_gps(self._base_data(), 100.0)
+        out = str(tmp_path / "shared.csv")
+        s = anonymize_log(data, out, craft_name="MyQuad")
+        assert os.path.isfile(out)
+        text = open(out).read()
+        assert "GPS_coord" not in text and "470000000" not in text
+        header_line = next(l for l in text.splitlines() if not l.startswith("#"))
+        cols = [c.strip().lower() for c in header_line.split(",")]
+        assert not any(c.startswith("gps_coord") or c in ("gps_lat", "gps_lon") for c in cols)
+        assert "MyQuad" not in text
+        assert "pos_north_m" in text and "gyroADC[0]" in text
+        assert any("GPS" in x for x in s["stripped"])
+        assert any("craft" in x for x in s["stripped"])
+
+    def test_anonymize_roundtrip_parses(self, tmp_path):
+        from inav_toolkit.flight_tools import anonymize_log
+        from inav_toolkit.blackbox_analyzer import parse_csv_log
+        data = self._base_data(n=1500)
+        out = str(tmp_path / "rt.csv")
+        anonymize_log(data, out)
+        parsed = parse_csv_log(out)
+        assert "gyro_roll" in parsed and parsed["n_rows"] == 1500
+
+    def test_range_basic(self):
+        from inav_toolkit.flight_tools import analyze_range
+        sr = 100.0
+        data = self._add_gps(self._base_data(n=6000, sr=sr), sr, speed_ms=10.0)
+        r = analyze_range(data, sr, config={}, capacity_mah=5000)
+        assert r is not None
+        # 10A at 36 km/h → 10000mA / 36km/h ≈ 278 mAh/km
+        assert 230 <= r["mah_per_km"] <= 330, r["mah_per_km"]
+        assert r["projected_range_km"] and 15 <= r["projected_range_km"] <= 22
+        assert r["projected_range_70_km"] < r["projected_range_km"]
+
+    def test_range_no_gps_returns_none(self):
+        from inav_toolkit.flight_tools import analyze_range
+        assert analyze_range(self._base_data(), 100.0) is None
+
+    def test_postmortem_motor_failure(self):
+        from inav_toolkit.flight_tools import analyze_postmortem
+        sr = 100.0
+        data = self._base_data(n=3000, sr=sr)
+        data["motor2"][-800:] = 1050.0          # M2 flatlines for last 8s
+        data["motor0"][-800:] += 250            # others compensate
+        pm = analyze_postmortem(data, sr, window_s=10)
+        causes = [v["cause"] for v in pm["verdicts"]]
+        assert "motor_esc_failure" in causes
+        v = next(v for v in pm["verdicts"] if v["cause"] == "motor_esc_failure")
+        assert "M2" in " ".join(v["evidence"])
+
+    def test_postmortem_voltage_collapse(self):
+        from inav_toolkit.flight_tools import analyze_postmortem
+        sr = 100.0
+        data = self._base_data(n=3000, sr=sr)
+        data["vbat"][-1000:] = np.linspace(1660, 1050, 1000)   # 6.1V drop in 10s
+        pm = analyze_postmortem(data, sr, window_s=10)
+        assert "voltage_collapse" in [v["cause"] for v in pm["verdicts"]]
+
+    def test_postmortem_rx_loss(self):
+        from inav_toolkit.flight_tools import analyze_postmortem
+        sr = 100.0
+        data = self._base_data(n=3000, sr=sr)
+        for k in ("rc_roll", "rc_pitch", "rc_yaw"):
+            data[k][-600:] = 1500.0                            # frozen 6s
+        pm = analyze_postmortem(data, sr, window_s=10)
+        assert "rx_loss" in [v["cause"] for v in pm["verdicts"]]
+
+    def test_postmortem_clean_log(self):
+        from inav_toolkit.flight_tools import analyze_postmortem
+        data = self._base_data()
+        data["throttle"][-50:] = 1000.0                        # normal wind-down
+        pm = analyze_postmortem(data, 100.0, window_s=10)
+        assert pm["verdicts"] == []
+        assert pm["abrupt_end"] is False
+
+    def test_abrupt_end_detection(self):
+        from inav_toolkit.flight_tools import detect_abrupt_end
+        data = self._base_data()
+        assert detect_abrupt_end(data, 100.0) is True          # throttle 1500 at end
+        data["throttle"][-50:] = 1000.0
+        assert detect_abrupt_end(data, 100.0) is False
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Standalone runner (works without pytest)
 # ═════════════════════════════════════════════════════════════════════════════
