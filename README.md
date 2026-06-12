@@ -52,9 +52,9 @@ Results are presented in an interactive terminal menu:
     Noise:94 | PID:26 | Motors:53
 
   [1] PID Tuning        R:62%OS  P:ok  Y:N/A
-  [2] Noise Analysis    94/100 — 2 sources
+  [2] Noise Analysis    94/100 - 2 sources
   [3] Hover & Stability R:moderate  P:wind  Y:wind
-  [4] Nav Performance   45/100 — 4 decel events, CEP 1271cm
+  [4] Nav Performance   45/100 - 4 decel events, CEP 1271cm
   [5] Nav Sensors       Com:70  GPS:100  Bar:70
   [6] Config Review     1 critical, 2 warnings
   [7] Flight History    3 flights ▃▅▇
@@ -75,7 +75,7 @@ Each section shows a one-line status at a glance. Select a number to drill into 
 Decodes `.bbl` / `.bfl` blackbox logs natively in Python (no `blackbox_decode` needed) and produces actionable tuning and navigation recommendations.
 
 ```bash
-# Connect to FC — full pipeline (safety check + download + analyze + cleanup + erase)
+# Connect to FC - full pipeline (safety check + download + analyze + cleanup + erase)
 python3 -m inav_toolkit.blackbox_analyzer --device auto
 
 # Analyze an existing log file
@@ -124,25 +124,25 @@ python3 -m inav_toolkit.blackbox_analyzer --config-diff 1 3
 **What it analyzes (auto-detected from available data):**
 
 PID tuning:
-- Step response — overshoot %, tracking delay, settling time per axis
-- FeedForward-aware — attributes overshoot between FF and P, recommends FF reduction before P cuts
-- Hover oscillation — RMS and peak-to-peak gyro, wind buffeting vs P oscillation on large frames
-- Noise spectrum — peak frequencies, source classification (propwash, electrical, motor imbalance)
-- Filter recommendations — phase-lag-aware, won't recommend destructive LPF cuts on 10"+ frames
-- Motor balance — average load and saturation per motor
+- Step response - overshoot %, tracking delay, settling time per axis
+- FeedForward-aware - attributes overshoot between FF and P, recommends FF reduction before P cuts
+- Hover oscillation - RMS and peak-to-peak gyro, wind buffeting vs P oscillation on large frames
+- Noise spectrum - peak frequencies, source classification (propwash, electrical, motor imbalance)
+- Filter recommendations - phase-lag-aware, won't recommend destructive LPF cuts on 10"+ frames
+- Motor balance - average load and saturation per motor
 
 Navigation performance (when nav fields are present):
-- Deceleration overshoot — measures position error when stopping, oscillation count, settling time
-- Position hold quality — CEP, RMS error, max drift, toilet-bowl pattern detection
-- Altitude hold quality — vertical error RMS, oscillation detection
-- Controller saturation — detects when nav demands exceed platform capability
-- Wind vs tuning — correlates position error with wind estimates to separate environmental drift from PID problems
+- Deceleration overshoot - measures position error when stopping, oscillation count, settling time
+- Position hold quality - CEP, RMS error, max drift, toilet-bowl pattern detection
+- Altitude hold quality - vertical error RMS, oscillation detection
+- Controller saturation - detects when nav demands exceed platform capability
+- Wind vs tuning - correlates position error with wind estimates to separate environmental drift from PID problems
 
 Navigation sensors:
-- Compass health — heading jitter, magnetic interference, drift rate
-- GPS quality — fix type, satellite count, HDOP, position jumps
-- Barometer — noise level, spike detection, throttle correlation
-- Position estimator — GPS vs estimator divergence
+- Compass health - heading jitter, magnetic interference, drift rate
+- GPS quality - fix type, satellite count, HDOP, position jumps
+- Barometer - noise level, spike detection, throttle correlation
+- Position estimator - GPS vs estimator divergence
 
 **What it outputs:**
 
@@ -153,14 +153,14 @@ Terminal:
 - Trend sparklines showing score progression across sessions
 
 HTML report (tabbed, auto-opens in browser):
-- **Overview** — score, actions, CLI commands, pre-flight warnings, config
-- **PID Tuning** — step response table and chart
-- **Noise & Filters** — gyro spectrum and D-term noise charts
-- **Motors** — balance table and chart
-- **Nav Performance** — deceleration, poshold, althold metrics
-- **Nav Sensors** — compass, GPS, baro, estimator health
-- **What-If** — interactive PID/filter simulation with predicted effects
-- **History** — flight diff, score progression chart, flight table
+- **Overview** - score, actions, CLI commands, pre-flight warnings, config
+- **PID Tuning** - step response table and chart
+- **Noise & Filters** - gyro spectrum and D-term noise charts
+- **Motors** - balance table and chart
+- **Nav Performance** - deceleration, poshold, althold metrics
+- **Nav Sensors** - compass, GPS, baro, estimator health
+- **What-If** - interactive PID/filter simulation with predicted effects
+- **History** - flight diff, score progression chart, flight table
 
 Other:
 - `state.json` for cross-referencing with the parameter analyzer
@@ -319,7 +319,7 @@ INAV-Toolkit/
 
 ## INAV Version Support
 
-Developed and tested against **INAV 9.0.x**. The blackbox binary decoder handles the Cleanflight/INAV encoding format natively in Python — no external `blackbox_decode` tool needed. Parameter names are INAV-specific; Betaflight is not currently supported.
+Developed and tested against **INAV 9.0.x**. The blackbox binary decoder handles the Cleanflight/INAV encoding format natively in Python - no external `blackbox_decode` tool needed. Parameter names are INAV-specific; Betaflight is not currently supported.
 
 ## Contributing
 
