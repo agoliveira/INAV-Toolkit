@@ -1,6 +1,6 @@
 # INAV Toolkit
 
-A Python toolkit for analyzing blackbox logs, validating configurations, and tuning INAV flight controllers. Plug in your FC via USB — it runs a pre-flight safety check, pulls the config, downloads the blackbox, analyzes PID tuning and navigation performance, compares with your previous flight, tells you exactly what to change, and gives you the CLI commands to paste. Every config is archived automatically so you can diff any two sessions.
+A Python toolkit for analyzing blackbox logs, validating configurations, and tuning INAV flight controllers. Plug in your FC via USB - it runs a pre-flight safety check, pulls the config, downloads the blackbox, analyzes PID tuning and navigation performance, compares with your previous flight, tells you exactly what to change, and gives you the CLI commands to paste. Every config is archived automatically so you can diff any two sessions.
 
 Built for the INAV long-range community. Tested on 7" to 15" multirotors with GPS navigation, INAV 9.0.x.
 
